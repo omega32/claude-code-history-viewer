@@ -17,6 +17,7 @@ use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
+use crate::models::ClaudeSession;
 
 /// Minimal executor for the sync-bodied futures in the load path. They resolve
 /// on the first poll; the `Pending` arm is defensive and never expected here.
@@ -30,6 +31,32 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => return output,
             Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Serialize `value` as pretty JSON. With `--output <file>` it is written there
+/// (so the caller reads clean JSON regardless of anything else on stdout, e.g.
+/// upstream debug logs); otherwise it goes to stdout. Returns the exit code.
+fn emit_json<T: serde::Serialize>(args: &[String], value: &T) -> i32 {
+    let json = match serde_json::to_string_pretty(value) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Failed to serialize JSON: {e}");
+            return 1;
+        }
+    };
+    match extract_flag_value(args, "--output") {
+        Some(path) => match std::fs::write(&path, json.as_bytes()) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("Failed to write {path}: {e}");
+                1
+            }
+        },
+        None => {
+            println!("{json}");
+            0
         }
     }
 }
@@ -125,28 +152,60 @@ pub fn run_dump_session(args: &[String]) -> i32 {
             return 1;
         }
     };
+    emit_json(args, &messages)
+}
 
-    let json = match serde_json::to_string_pretty(&messages) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Failed to serialize JSON: {e}");
-            return 1;
+const LIST_USAGE: &str = "Usage: --list-sessions [--provider <name>] [--project <path>] [--format json] [--output <file>]\n\n\
+List a provider's sessions as JSON (Vec<ClaudeSession> with summary/title,\n\
+timestamps, message_count, ids). With --project <path> only that project's\n\
+sessions are listed (path is the provider storage dir, e.g. a folder under\n\
+~/.claude/projects); otherwise sessions across all of the provider's projects\n\
+are returned. --provider defaults to 'claude'.";
+
+/// List sessions for `provider`, optionally limited to one project storage path.
+async fn list_sessions(provider: &str, project: Option<&str>) -> Result<Vec<ClaudeSession>, String> {
+    if let Some(path) = project {
+        // A non-existent project dir (e.g. no sessions for this cwd) is not an
+        // error — it just yields an empty list.
+        if !std::path::Path::new(path).exists() {
+            return Ok(Vec::new());
         }
-    };
+        return load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await;
+    }
 
-    // `--output` writes to a file so the caller reads clean JSON regardless of
-    // anything else this process prints to stdout (e.g. upstream debug logs).
-    match extract_flag_value(args, "--output") {
-        Some(path) => match std::fs::write(&path, json.as_bytes()) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("Failed to write {path}: {e}");
-                1
-            }
-        },
-        None => {
-            println!("{json}");
-            0
+    let projects =
+        scan_all_projects(None, Some(vec![provider.to_string()]), None, None, None).await?;
+    let mut all: Vec<ClaudeSession> = Vec::new();
+    for proj in projects {
+        // Skip a project that fails to load rather than aborting the whole list.
+        if let Ok(mut sessions) =
+            load_provider_sessions(provider.to_string(), proj.path.clone(), Some(true)).await
+        {
+            all.append(&mut sessions);
+        }
+    }
+    Ok(all)
+}
+
+/// Handle the `--list-sessions` CLI flag. Returns the process exit code.
+pub fn run_list_sessions(args: &[String]) -> i32 {
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("{LIST_USAGE}");
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    let project = extract_flag_value(args, "--project");
+
+    let result: Result<Vec<ClaudeSession>, String> =
+        block_on(async { list_sessions(&provider, project.as_deref()).await });
+
+    match result {
+        Ok(sessions) => emit_json(args, &sessions),
+        Err(e) => {
+            eprintln!("{e}");
+            1
         }
     }
 }

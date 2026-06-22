@@ -102,6 +102,14 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_dump_session(&args));
         }
+        // Headless session listing (`--list-sessions [--provider <name>]
+        // [--project <path>]`), used to search/select a session by title.
+        if args
+            .iter()
+            .any(|a| a == "--list-sessions" || a.starts_with("--list-sessions="))
+        {
+            std::process::exit(headless_dump::run_list_sessions(&args));
+        }
     }
 
     // Check for --serve flag (WebUI server mode)
