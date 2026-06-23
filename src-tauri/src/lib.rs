@@ -110,6 +110,11 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_sessions(&args));
         }
+        // Headless capability/version probe (`--capabilities`), so callers can
+        // confirm this build speaks the headless protocol before relying on it.
+        if args.iter().any(|a| a == "--capabilities") {
+            std::process::exit(headless_dump::run_capabilities(&args));
+        }
     }
 
     // Check for --serve flag (WebUI server mode)

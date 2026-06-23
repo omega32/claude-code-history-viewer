@@ -12,12 +12,21 @@
 //! scaffolding — their bodies do synchronous std work and merely `.await` each
 //! other, never a reactor — so a trivial inline `block_on` drives them with no
 //! Tokio dependency and no GUI/webview.
+//!
+//! Two companion commands share this file: `--list-sessions` (which also stamps
+//! each session with its decoded project directory, so callers can match the cwd
+//! without reproducing Claude's storage-path encoding) and `--capabilities` (a
+//! tiny version/feature probe so callers can fail fast on an incompatible build).
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::ClaudeSession;
+
+/// Contract version of the headless JSON surface. Bump on a breaking change to
+/// the commands or their output shapes so callers can assert compatibility.
+const HEADLESS_API_VERSION: u32 = 1;
 
 /// Minimal executor for the sync-bodied futures in the load path. They resolve
 /// on the first poll; the `Pending` arm is defensive and never expected here.
@@ -59,6 +68,29 @@ fn emit_json<T: serde::Serialize>(args: &[String], value: &T) -> i32 {
             0
         }
     }
+}
+
+/// Version/feature probe emitted by `--capabilities`. Lets a caller (e.g. ccmsg)
+/// confirm the binary speaks the headless protocol it needs, and which version,
+/// rather than inferring it from a failed call.
+#[derive(serde::Serialize)]
+struct Capabilities {
+    api_version: u32,
+    /// The base app version (crate version), for diagnostics.
+    version: &'static str,
+    /// Headless commands this build supports (flag names without the `--`).
+    commands: Vec<&'static str>,
+}
+
+/// Handle the `--capabilities` CLI flag. Prints the headless protocol version and
+/// supported commands as JSON. Returns the process exit code.
+pub fn run_capabilities(args: &[String]) -> i32 {
+    let caps = Capabilities {
+        api_version: HEADLESS_API_VERSION,
+        version: env!("CARGO_PKG_VERSION"),
+        commands: vec!["dump-session", "list-sessions", "capabilities"],
+    };
+    emit_json(args, &caps)
 }
 
 const USAGE: &str = "Usage: --dump-session <session-id|session-path> [--provider <name>] [--format json] [--output <file>]\n\n\
@@ -160,28 +192,56 @@ List a provider's sessions as JSON (Vec<ClaudeSession> with summary/title,\n\
 timestamps, message_count, ids). With --project <path> only that project's\n\
 sessions are listed (path is the provider storage dir, e.g. a folder under\n\
 ~/.claude/projects); otherwise sessions across all of the provider's projects\n\
-are returned. --provider defaults to 'claude'.";
+are returned. Each session is also stamped with `project_path` (the decoded\n\
+project directory) when known. --provider defaults to 'claude'.";
+
+/// A `ClaudeSession` flattened with its decoded project directory. `project_path`
+/// is the project's real filesystem path (its original working directory), so a
+/// caller can match the cwd against it directly instead of reproducing Claude's
+/// lossy storage-folder encoding. Omitted when not known (an explicit
+/// `--project` storage path is not resolved back to its decoded form).
+#[derive(serde::Serialize)]
+struct SessionWithProjectPath {
+    #[serde(flatten)]
+    session: ClaudeSession,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_path: Option<String>,
+}
 
 /// List sessions for `provider`, optionally limited to one project storage path.
-async fn list_sessions(provider: &str, project: Option<&str>) -> Result<Vec<ClaudeSession>, String> {
+async fn list_sessions(
+    provider: &str,
+    project: Option<&str>,
+) -> Result<Vec<SessionWithProjectPath>, String> {
     if let Some(path) = project {
         // A non-existent project dir (e.g. no sessions for this cwd) is not an
         // error — it just yields an empty list.
         if !std::path::Path::new(path).exists() {
             return Ok(Vec::new());
         }
-        return load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await;
+        let sessions =
+            load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await?;
+        return Ok(sessions
+            .into_iter()
+            .map(|session| SessionWithProjectPath {
+                session,
+                project_path: None,
+            })
+            .collect());
     }
 
     let projects =
         scan_all_projects(None, Some(vec![provider.to_string()]), None, None, None).await?;
-    let mut all: Vec<ClaudeSession> = Vec::new();
+    let mut all: Vec<SessionWithProjectPath> = Vec::new();
     for proj in projects {
         // Skip a project that fails to load rather than aborting the whole list.
-        if let Ok(mut sessions) =
+        if let Ok(sessions) =
             load_provider_sessions(provider.to_string(), proj.path.clone(), Some(true)).await
         {
-            all.append(&mut sessions);
+            all.extend(sessions.into_iter().map(|session| SessionWithProjectPath {
+                session,
+                project_path: Some(proj.actual_path.clone()),
+            }));
         }
     }
     Ok(all)
@@ -198,7 +258,7 @@ pub fn run_list_sessions(args: &[String]) -> i32 {
     let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
     let project = extract_flag_value(args, "--project");
 
-    let result: Result<Vec<ClaudeSession>, String> =
+    let result: Result<Vec<SessionWithProjectPath>, String> =
         block_on(async { list_sessions(&provider, project.as_deref()).await });
 
     match result {
