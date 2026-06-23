@@ -1676,8 +1676,8 @@ fn parse_line_to_message(
 /// (`[{ "type": "text", "text": … }]`), which is passed through unchanged.
 /// Returns `None` for every other attachment subtype (todo reminders, hook
 /// context, listing deltas, file refs, … — UI/plumbing, not authored content).
-fn queued_command_prompt(attachment: &Option<serde_json::Value>) -> Option<serde_json::Value> {
-    let att = attachment.as_ref()?;
+fn queued_command_prompt(attachment: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let att = attachment?;
     if att.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
         return None;
     }
@@ -1766,7 +1766,7 @@ fn parse_line_simd(
     // causal chain and any reply still link to it); otherwise it would surface
     // with null content and be dropped downstream.
     if log_entry.message_type == "attachment" {
-        if let Some(content) = queued_command_prompt(&log_entry.attachment) {
+        if let Some(content) = queued_command_prompt(log_entry.attachment.as_ref()) {
             return Some(ClaudeMessage {
                 uuid,
                 parent_uuid: log_entry.parent_uuid,
@@ -1795,7 +1795,10 @@ fn parse_line_simd(
                 tool_use_id: None,
                 parent_tool_use_id: None,
                 operation: None,
-                subtype: None,
+                // Mark provenance so consumers can present a queued/mid-response
+                // message distinctly from a normal user turn. The content is a
+                // normal user message; this is only a "how it was delivered" tag.
+                subtype: Some("queued_command".to_string()),
                 level: None,
                 hook_count: None,
                 hook_infos: None,
@@ -3924,6 +3927,8 @@ mod tests {
         assert_eq!(msg.role.as_deref(), Some("user"));
         assert_eq!(msg.uuid, "q1");
         assert_eq!(msg.parent_uuid.as_deref(), Some("p1"));
+        // Provenance marker so consumers can present it distinctly.
+        assert_eq!(msg.subtype.as_deref(), Some("queued_command"));
         let text = msg
             .content
             .as_ref()
@@ -3938,11 +3943,11 @@ mod tests {
     fn non_queued_attachment_is_not_reclassified() {
         // Other attachment subtypes are UI/plumbing, not authored content, and
         // must NOT become user messages.
-        assert!(queued_command_prompt(&Some(serde_json::json!({"type":"todo_reminder"}))).is_none());
-        assert!(queued_command_prompt(&None).is_none());
-        assert!(queued_command_prompt(
-            &Some(serde_json::json!({"type":"queued_command","prompt":[{"type":"text","text":"x"}]}))
-        )
+        assert!(queued_command_prompt(Some(&serde_json::json!({"type":"todo_reminder"}))).is_none());
+        assert!(queued_command_prompt(None).is_none());
+        assert!(queued_command_prompt(Some(
+            &serde_json::json!({"type":"queued_command","prompt":[{"type":"text","text":"x"}]})
+        ))
         .is_some());
 
         let line = r#"{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"2026-06-23T19:27:37.044Z","attachment":{"type":"todo_reminder"}}"#;
