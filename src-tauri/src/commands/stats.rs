@@ -4132,6 +4132,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4193,6 +4194,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4246,6 +4248,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4296,6 +4299,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4346,6 +4350,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
 
         // Should succeed with timestamp even without session_id
@@ -6047,6 +6052,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            attachment: None,
         };
         ClaudeMessage::try_from(raw).expect("test message construction")
     }

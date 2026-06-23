@@ -1669,6 +1669,21 @@ fn parse_line_to_message(
 
 /// Parse a single line using simd-json for faster parsing
 /// Returns None if the line is empty or fails to parse
+/// If a raw `attachment` record is a `queued_command` — a message the user sent
+/// while the agent was still generating (queued, then injected) — return its
+/// prompt content so it can be normalized into a user message. The text lives in
+/// `attachment.prompt`, already shaped as a content-block array
+/// (`[{ "type": "text", "text": … }]`), which is passed through unchanged.
+/// Returns `None` for every other attachment subtype (todo reminders, hook
+/// context, listing deltas, file refs, … — UI/plumbing, not authored content).
+fn queued_command_prompt(attachment: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let att = attachment.as_ref()?;
+    if att.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
+        return None;
+    }
+    att.get("prompt").filter(|p| p.is_array()).cloned()
+}
+
 fn parse_line_simd(
     line_num: usize,
     line: &mut [u8],
@@ -1744,6 +1759,54 @@ fn parse_line_simd(
     let uuid = log_entry
         .uuid
         .unwrap_or_else(|| format!("{}-line-{}", Uuid::new_v4(), line_num + 1));
+
+    // A message sent while the agent was still generating is persisted as a
+    // `queued_command` attachment, not a `user` record — but it is authored user
+    // text. Normalize it into a user message (keeping its uuid/parentUuid, so the
+    // causal chain and any reply still link to it); otherwise it would surface
+    // with null content and be dropped downstream.
+    if log_entry.message_type == "attachment" {
+        if let Some(content) = queued_command_prompt(&log_entry.attachment) {
+            return Some(ClaudeMessage {
+                uuid,
+                parent_uuid: log_entry.parent_uuid,
+                session_id: log_entry
+                    .session_id
+                    .unwrap_or_else(|| "unknown-session".to_string()),
+                timestamp: log_entry
+                    .timestamp
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                message_type: "user".to_string(),
+                content: Some(content),
+                project_name: None,
+                tool_use: None,
+                tool_use_result: None,
+                is_sidechain: log_entry.is_sidechain,
+                usage: None,
+                role: Some("user".to_string()),
+                model: None,
+                stop_reason: None,
+                cost_usd: None,
+                duration_ms: None,
+                message_id: None,
+                snapshot: None,
+                is_snapshot_update: None,
+                data: None,
+                tool_use_id: None,
+                parent_tool_use_id: None,
+                operation: None,
+                subtype: None,
+                level: None,
+                hook_count: None,
+                hook_infos: None,
+                stop_reason_system: None,
+                prevented_continuation: None,
+                compact_metadata: None,
+                microcompact_metadata: None,
+                provider: None,
+            });
+        }
+    }
 
     let (role, message_id, model, stop_reason, usage, extracted_tool_use) =
         if let Some(ref msg) = log_entry.message {
@@ -3845,5 +3908,47 @@ mod tests {
         let link = dir.path().join("agent-link.meta.json");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(read_subagent_tool_use_id(&link), None);
+    }
+
+    #[test]
+    fn queued_command_attachment_normalizes_to_user_message() {
+        // A message sent while the agent is still generating is persisted as a
+        // `queued_command` attachment, not a `user` record. It must surface as a
+        // user message carrying the prompt text, with uuid/parentUuid preserved
+        // so the causal chain (and any reply) still links to it.
+        let line = r#"{"type":"attachment","uuid":"q1","parentUuid":"p1","sessionId":"s1","timestamp":"2026-06-23T19:27:37.044Z","attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"text","text":"do the thing"}]}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg =
+            parse_line_simd(0, &mut bytes, false).expect("queued_command should yield a message");
+        assert_eq!(msg.message_type, "user");
+        assert_eq!(msg.role.as_deref(), Some("user"));
+        assert_eq!(msg.uuid, "q1");
+        assert_eq!(msg.parent_uuid.as_deref(), Some("p1"));
+        let text = msg
+            .content
+            .as_ref()
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str());
+        assert_eq!(text, Some("do the thing"));
+    }
+
+    #[test]
+    fn non_queued_attachment_is_not_reclassified() {
+        // Other attachment subtypes are UI/plumbing, not authored content, and
+        // must NOT become user messages.
+        assert!(queued_command_prompt(&Some(serde_json::json!({"type":"todo_reminder"}))).is_none());
+        assert!(queued_command_prompt(&None).is_none());
+        assert!(queued_command_prompt(
+            &Some(serde_json::json!({"type":"queued_command","prompt":[{"type":"text","text":"x"}]}))
+        )
+        .is_some());
+
+        let line = r#"{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"2026-06-23T19:27:37.044Z","attachment":{"type":"todo_reminder"}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("record still parses");
+        assert_eq!(msg.message_type, "attachment");
+        assert!(msg.role.is_none());
     }
 }

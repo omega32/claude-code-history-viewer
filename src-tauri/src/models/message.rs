@@ -91,6 +91,12 @@ pub struct RawLogEntry {
     // Meta message flag (internal/command-related messages)
     #[serde(rename = "isMeta")]
     pub is_meta: Option<bool>,
+
+    // Attachment payload (for type: "attachment"). A heterogeneous bucket of
+    // out-of-band records; most subtypes are UI/plumbing, but `queued_command`
+    // carries authored user text (a message sent while the agent was generating)
+    // under `attachment.prompt`, which is normalized into a user message.
+    pub attachment: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
