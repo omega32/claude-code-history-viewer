@@ -62,7 +62,12 @@ struct SessionMetadataCache {
 // Bumped 10 -> 11: a verifiable folder name now takes priority over the JSONL
 // `cwd` for the project name (handles sessions moved between project folders);
 // stale caches must be invalidated to recompute project_name.
-const CACHE_VERSION: u32 = 11;
+// Bumped 11 -> 12: message_count is now computed from an allowlist (user +
+// assistant + `queued_command` attachments) instead of an exclusion denylist, so
+// it no longer counts non-conversational metadata records (`ai-title`, `mode`,
+// `permission-mode`, and any future type); stale caches hold the old inflated
+// count, so they must be invalidated to recompute.
+const CACHE_VERSION: u32 = 12;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -76,7 +81,6 @@ pub struct SessionPage {
     pub next_offset: usize,
     pub has_more: bool,
 }
-
 /// Get the cache file path for a project
 fn get_cache_path(project_path: &str) -> PathBuf {
     PathBuf::from(project_path).join(".session_cache.json")
@@ -202,6 +206,7 @@ struct SessionMetadataEntry {
     message: Option<SessionMetadataMessage>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    attachment: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -224,6 +229,7 @@ struct QuickLineClassifier {
     entrypoint: Option<String>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    attachment: Option<serde_json::Value>,
 }
 
 /// Fast session metadata extraction result
@@ -390,8 +396,22 @@ fn extract_session_metadata_internal(
                     continue;
                 }
 
-                // Skip other system message types
-                if is_system_message_type(&entry.message_type) {
+                // Count only genuine conversational messages, via an ALLOWLIST: a
+                // `user` or `assistant` record, or a `queued_command` attachment (an
+                // authored user message sent while the agent was generating, which the
+                // dump path normalizes into a user message). An allowlist — rather than
+                // excluding a denylist of metadata types — keeps `message_count` immune
+                // to the non-conversational record types Claude Code keeps adding
+                // (`ai-title`, `mode`, `permission-mode`, …): anything not on the list is
+                // simply not counted, with no per-type maintenance. (`summary` / `system`
+                // / `custom-title` are handled above for title extraction, so they never
+                // reach here. The viewer's own denylist — `EXCLUDED_MESSAGE_TYPES` via
+                // `is_system_message_type` — is intentionally left untouched.)
+                let is_conversational = entry.message_type == "user"
+                    || entry.message_type == "assistant"
+                    || (entry.message_type == "attachment"
+                        && queued_command_prompt(entry.attachment.as_ref()).is_some());
+                if !is_conversational {
                     continue;
                 }
 
@@ -544,8 +564,14 @@ fn extract_session_metadata_internal(
                 continue;
             }
 
-            // Skip other system message types
-            if is_system_message_type(&classifier.message_type) {
+            // Same allowlist as Phase 1: count only `user` / `assistant` records and
+            // `queued_command` attachments; everything else (metadata, plumbing, and
+            // any future non-conversational type) is simply not counted.
+            let is_conversational = classifier.message_type == "user"
+                || classifier.message_type == "assistant"
+                || (classifier.message_type == "attachment"
+                    && queued_command_prompt(classifier.attachment.as_ref()).is_some());
+            if !is_conversational {
                 continue;
             }
 
@@ -662,7 +688,7 @@ fn extract_session_metadata_internal(
 }
 
 /// Message types that should always be excluded from the viewer
-const EXCLUDED_MESSAGE_TYPES: [&str; 6] = [
+const EXCLUDED_MESSAGE_TYPES: [&str; 8] = [
     "progress",
     "queue-operation",
     "file-history-snapshot",
@@ -671,6 +697,16 @@ const EXCLUDED_MESSAGE_TYPES: [&str; 6] = [
     // Emitted alongside "custom-title" by the `/branch` command; redundant with it
     // (same name), so it's excluded from the viewer rather than used as a rename source.
     "agent-name",
+    // Per-turn AI-generated session title (`{type:"ai-title",aiTitle:…}`) — non-
+    // conversational metadata, hidden from the viewer.
+    "ai-title",
+    // `/mode`-change marker (`{type:"mode",mode:…,sessionId:…}`) — non-conversational
+    // metadata, hidden from the viewer.
+    "mode",
+    // Note: this list is the *viewer* denylist (via `is_system_message_type`). It no
+    // longer drives `message_count`, which is computed from a conversational allowlist
+    // in `extract_session_metadata_internal`, so new metadata types need no entry here
+    // to be kept out of the count (only to be hidden from the viewer).
 ];
 
 /// System subtypes that are internal metadata (excluded from the viewer).
