@@ -1691,7 +1691,15 @@ fn parse_line_to_message(
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
-        subtype: log_entry.subtype,
+        // A compaction summary is recorded as a `type: "user"` record flagged
+        // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
+        // so consumers can tell it apart from an authored user turn. Content and
+        // type stay as-is — this only tags "what this record is".
+        subtype: if log_entry.is_compact_summary.unwrap_or(false) {
+            Some("compact_summary".to_string())
+        } else {
+            log_entry.subtype
+        },
         level: log_entry.level,
         hook_count: log_entry.hook_count,
         hook_infos: log_entry.hook_infos,
@@ -1900,7 +1908,15 @@ fn parse_line_simd(
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
-        subtype: log_entry.subtype,
+        // A compaction summary is recorded as a `type: "user"` record flagged
+        // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
+        // so consumers can tell it apart from an authored user turn. Content and
+        // type stay as-is — this only tags "what this record is".
+        subtype: if log_entry.is_compact_summary.unwrap_or(false) {
+            Some("compact_summary".to_string())
+        } else {
+            log_entry.subtype
+        },
         level: log_entry.level,
         hook_count: log_entry.hook_count,
         hook_infos: log_entry.hook_infos,
@@ -3973,6 +3989,27 @@ mod tests {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str());
         assert_eq!(text, Some("do the thing"));
+    }
+
+    #[test]
+    fn compact_summary_user_record_gets_provenance_subtype() {
+        // The summary Claude Code injects when it compacts a session is a
+        // `type: "user"` record flagged `isCompactSummary`. It must keep its type
+        // and content but gain a `compact_summary` subtype so consumers can tell it
+        // apart from an authored user turn (rather than relying on a text heuristic).
+        let line = r#"{"type":"user","uuid":"c1","parentUuid":"p0","sessionId":"s1","timestamp":"2026-06-24T10:00:00Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("compact summary should parse");
+        assert_eq!(msg.message_type, "user");
+        assert_eq!(msg.role.as_deref(), Some("user"));
+        assert_eq!(msg.uuid, "c1");
+        assert_eq!(msg.subtype.as_deref(), Some("compact_summary"));
+
+        // A normal user record (no flag) keeps no subtype.
+        let plain = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-06-24T10:01:00Z","message":{"role":"user","content":"hello"}}"#;
+        let mut pbytes = plain.as_bytes().to_vec();
+        let pmsg = parse_line_simd(0, &mut pbytes, false).expect("plain user should parse");
+        assert_eq!(pmsg.subtype, None);
     }
 
     #[test]

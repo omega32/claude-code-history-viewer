@@ -92,6 +92,13 @@ pub struct RawLogEntry {
     #[serde(rename = "isMeta")]
     pub is_meta: Option<bool>,
 
+    // Set on the synthetic `user` record Claude Code injects when it compacts a
+    // session — the conversation summary that stands in for the compacted turns.
+    // Surfaced via the message `subtype` ("compact_summary") so consumers can
+    // label or skip it instead of mistaking it for an authored user turn.
+    #[serde(rename = "isCompactSummary")]
+    pub is_compact_summary: Option<bool>,
+
     // Attachment payload (for type: "attachment"). A heterogeneous bucket of
     // out-of-band records; most subtypes are UI/plumbing, but `queued_command`
     // carries authored user text (a message sent while the agent was generating)

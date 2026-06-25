@@ -4132,6 +4132,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
 
@@ -4194,6 +4195,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
 
@@ -4248,6 +4250,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
 
@@ -4299,6 +4302,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
 
@@ -4350,6 +4354,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
 
@@ -6052,6 +6057,7 @@ mod tests {
             microcompact_metadata: None,
             content: None,
             is_meta: None,
+            is_compact_summary: None,
             attachment: None,
         };
         ClaudeMessage::try_from(raw).expect("test message construction")
