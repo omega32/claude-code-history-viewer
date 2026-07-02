@@ -313,28 +313,7 @@ fn scan_workspace(
     let mut last_modified_ms: u64 = 0;
     let mut message_count = 0usize;
 
-    for chat_entry in fs::read_dir(&chat_dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-    {
-        let session_path = chat_entry.path();
-        if is_symlink(&session_path) || !session_path.is_file() {
-            continue;
-        }
-        if session_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some("jsonl")
-        {
-            continue;
-        }
-
-        let info = match probe_session_metadata(&session_path) {
-            Some(i) => i,
-            None => continue,
-        };
+    for (_, info) in list_session_metadata(&chat_dir)? {
         // Empty chat panels (kind:0 with requests:[]) should not be
         // counted as sessions or contribute to the project's tally.
         if info.message_count == 0 {
@@ -401,29 +380,7 @@ fn load_sessions_in(
         .unwrap_or_else(|| "VS Code".to_string());
 
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(&chat_dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-    {
-        let session_path = entry.path();
-        if is_symlink(&session_path) || !session_path.is_file() {
-            continue;
-        }
-        if session_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some("jsonl")
-        {
-            continue;
-        }
-
-        let info = match probe_session_metadata(&session_path) {
-            Some(i) => i,
-            None => continue,
-        };
-
+    for (session_path, info) in list_session_metadata(&chat_dir)? {
         // Skip empty sessions (e.g., chat panels opened but never used).
         if info.message_count == 0 {
             continue;
@@ -951,6 +908,8 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8(buf).unwrap_or_else(|_| input.to_string())
 }
 
+// Serializable so it can be cached on disk (see the metadata cache below).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SessionMetadata {
     session_id: String,
     message_count: usize,
@@ -962,6 +921,159 @@ struct SessionMetadata {
     /// by VS Code's own rename UI as a `{"kind":1,"k":["customTitle"],"v":…}`
     /// patch record. Present ⇒ the session was deliberately renamed.
     custom_title: Option<String>,
+}
+
+// ── Persistent metadata cache ────────────────────────────────────────────────
+//
+// `probe_session_metadata` replays a session's whole append-only patch log to
+// derive its metadata — costly for large sessions, and repeated on *every*
+// listing (and twice per `--list-sessions`, once for the project tally and once
+// for the session list). Cache the derived metadata per `chatSessions/` dir,
+// keyed by each file's (mtime, size): the logs are append-only, so a matching
+// (mtime, size) means the metadata is unchanged and the replay can be skipped.
+// This mirrors the Claude scanner's `.session_cache.json` (see
+// `commands/session/load.rs`); the copilot CLI scanner has only an in-process
+// cache, which is cold across the separate processes a headless caller spawns.
+
+/// One cached session's derived metadata plus the (mtime, size) it was valid for.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedSessionMetadata {
+    /// File modification time (Unix seconds).
+    modified_time: u64,
+    /// File size in bytes (catches sub-second appends a seconds-mtime misses).
+    file_size: u64,
+    metadata: SessionMetadata,
+}
+
+/// The on-disk cache file for one `chatSessions/` directory.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SessionMetadataCache {
+    /// Bumped on any format change to `SessionMetadata`/this struct so stale
+    /// caches are dropped rather than misread.
+    version: u32,
+    /// session filename -> cached metadata.
+    entries: std::collections::HashMap<String, CachedSessionMetadata>,
+}
+
+const METADATA_CACHE_VERSION: u32 = 1;
+
+/// The cache file lives alongside the sessions it describes (mirroring Claude's
+/// `.session_cache.json`); VS Code only reads `*.jsonl` here, so the dotfile is
+/// inert to it.
+fn metadata_cache_path(chat_dir: &Path) -> PathBuf {
+    chat_dir.join(".session_cache.json")
+}
+
+/// A file's freshness key: (modified-time seconds, size bytes). `None` if it
+/// can't be stat'd (the caller then probes without caching).
+fn file_freshness(path: &Path) -> Option<(u64, u64)> {
+    let meta = path.metadata().ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((mtime, meta.len()))
+}
+
+/// Load a `chatSessions/` cache from disk (empty on any error or a version bump).
+fn load_metadata_cache(chat_dir: &Path) -> SessionMetadataCache {
+    if let Ok(content) = fs::read_to_string(metadata_cache_path(chat_dir)) {
+        if let Ok(cache) = serde_json::from_str::<SessionMetadataCache>(&content) {
+            if cache.version == METADATA_CACHE_VERSION {
+                return cache;
+            }
+        }
+    }
+    SessionMetadataCache::default()
+}
+
+/// Save a `chatSessions/` cache atomically (best effort; errors ignored — the
+/// cache is only an accelerator). Skips the write when there is nothing to cache.
+fn save_metadata_cache(chat_dir: &Path, cache: &SessionMetadataCache) {
+    if cache.entries.is_empty() {
+        return;
+    }
+    let path = metadata_cache_path(chat_dir);
+    let Ok(content) = serde_json::to_string(cache) else {
+        return;
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("json.{nonce}.tmp"));
+    if fs::write(&tmp, content.as_bytes()).is_ok() {
+        #[cfg(target_os = "windows")]
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+/// Probe one session's metadata, reusing the cache when the file is unchanged.
+/// On a hit the entry is carried into `next`; on a miss the file is replayed and
+/// the fresh result stored. A file that can't be stat'd or replayed is probed
+/// directly / skipped and left uncached (so a transient failure is never sticky).
+fn probe_cached(
+    path: &Path,
+    old: &SessionMetadataCache,
+    next: &mut SessionMetadataCache,
+) -> Option<SessionMetadata> {
+    let Some(key) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return probe_session_metadata(path);
+    };
+    let Some((modified_time, file_size)) = file_freshness(path) else {
+        return probe_session_metadata(path);
+    };
+    if let Some(hit) = old.entries.get(&key) {
+        if hit.modified_time == modified_time && hit.file_size == file_size {
+            next.entries.insert(key, hit.clone());
+            return Some(hit.metadata.clone());
+        }
+    }
+    let metadata = probe_session_metadata(path)?;
+    next.entries.insert(
+        key,
+        CachedSessionMetadata { modified_time, file_size, metadata: metadata.clone() },
+    );
+    Some(metadata)
+}
+
+/// Every readable session in a `chatSessions/` dir as `(path, metadata)`, backed
+/// by the persistent cache so unchanged sessions aren't re-replayed. Only entries
+/// still present are carried forward, so deleted sessions are evicted naturally.
+/// Callers filter empties (`message_count == 0`) — those stay cached, so the
+/// common empty chat panels aren't re-replayed either.
+fn list_session_metadata(chat_dir: &Path) -> Result<Vec<(PathBuf, SessionMetadata)>, String> {
+    let old = load_metadata_cache(chat_dir);
+    let mut next = SessionMetadataCache {
+        version: METADATA_CACHE_VERSION,
+        entries: std::collections::HashMap::new(),
+    };
+    let mut out = Vec::new();
+    for entry in fs::read_dir(chat_dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if is_symlink(&path) || !path.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            != Some("jsonl")
+        {
+            continue;
+        }
+        if let Some(meta) = probe_cached(&path, &old, &mut next) {
+            out.push((path, meta));
+        }
+    }
+    save_metadata_cache(chat_dir, &next);
+    Ok(out)
 }
 
 /// Text of a VS Code message field that is either a markdown object
@@ -1377,6 +1489,116 @@ mod tests {
             read_workspace_folder(&ws_json).as_deref(),
             Some("/Users/me/my project")
         );
+    }
+
+    // ── Metadata cache (A4) ─────────────────────────────────────────────────
+
+    /// Write one real session file and return (chat_dir, filename, path).
+    fn seed_session(tmp: &tempfile::TempDir, name: &str) -> (PathBuf, String, PathBuf) {
+        let chat = tmp.path().join("chatSessions");
+        fs::create_dir_all(&chat).unwrap();
+        let file = format!("{name}.jsonl");
+        let path = chat.join(&file);
+        fs::write(
+            &path,
+            json!({"kind": 0, "v": {
+                "sessionId": "real",
+                "creationDate": 1000u64,
+                "requests": [{"message": {"text": "hi"}}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        (chat, file, path)
+    }
+
+    fn sentinel_meta() -> SessionMetadata {
+        SessionMetadata {
+            session_id: "CACHED".into(),
+            message_count: 999,
+            first_message_ms: 0,
+            last_modified_ms: 0,
+            has_tool_use: false,
+            summary: None,
+            custom_title: None,
+        }
+    }
+
+    #[test]
+    fn metadata_cache_hit_returns_cached_and_skips_the_replay() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "aaaa");
+        // Seed a cache entry whose metadata differs from a real probe, stamped
+        // with the file's actual (mtime, size) so it's considered fresh.
+        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
+        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        save_metadata_cache(&chat, &cache);
+
+        let listed = list_session_metadata(&chat).unwrap();
+        assert_eq!(listed.len(), 1);
+        // The sentinel came back → the replay was skipped (a real probe → "real").
+        assert_eq!(listed[0].1.session_id, "CACHED");
+        assert_eq!(listed[0].1.message_count, 999);
+    }
+
+    #[test]
+    fn metadata_cache_misses_on_size_change_and_reprobes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "bbbb");
+        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
+        // Wrong size → stale entry → real probe runs (append-only ⇒ size always moves).
+        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size: file_size + 1, metadata: sentinel_meta() });
+        save_metadata_cache(&chat, &cache);
+
+        let listed = list_session_metadata(&chat).unwrap();
+        assert_eq!(listed[0].1.session_id, "real"); // re-probed, not the sentinel
+    }
+
+    #[test]
+    fn metadata_cache_ignores_a_stale_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "cccc");
+        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        // Right freshness but wrong version → the whole cache is dropped.
+        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION + 1, entries: Default::default() };
+        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        save_metadata_cache(&chat, &cache);
+
+        let listed = list_session_metadata(&chat).unwrap();
+        assert_eq!(listed[0].1.session_id, "real"); // stale-version cache ignored
+        // …and the freshly written cache is at the current version.
+        assert_eq!(load_metadata_cache(&chat).version, METADATA_CACHE_VERSION);
+    }
+
+    #[test]
+    fn metadata_cache_evicts_vanished_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "dddd");
+        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
+        cache.entries.insert(file.clone(), CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        cache.entries.insert("ghost.jsonl".into(), CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        save_metadata_cache(&chat, &cache);
+
+        list_session_metadata(&chat).unwrap();
+        let after = load_metadata_cache(&chat);
+        assert!(after.entries.contains_key(&file)); // present file kept
+        assert!(!after.entries.contains_key("ghost.jsonl")); // vanished file evicted
+    }
+
+    #[test]
+    fn metadata_cache_round_trips_a_cold_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, _) = seed_session(&tmp, "eeee");
+        // Cold: no cache file yet → probe runs, then the cache is written.
+        assert!(!metadata_cache_path(&chat).exists());
+        let listed = list_session_metadata(&chat).unwrap();
+        assert_eq!(listed[0].1.session_id, "real");
+        let cached = load_metadata_cache(&chat);
+        assert_eq!(cached.version, METADATA_CACHE_VERSION);
+        assert_eq!(cached.entries.get(&file).unwrap().metadata.session_id, "real");
     }
 
     #[test]
