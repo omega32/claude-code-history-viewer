@@ -806,15 +806,15 @@ fn build_assistant_message(
                         *counter += 1;
                         format!("vscode-tool-{idx}-{counter}")
                     });
+                // `invocationMessage` is a markdown object ({value, uris?}) for
+                // most tools, but a bare string for some (e.g. copilot_applyPatch).
                 let invocation_text = part
                     .get("invocationMessage")
-                    .and_then(|m| m.get("value"))
-                    .and_then(Value::as_str)
+                    .and_then(markdown_or_str)
                     .unwrap_or("");
                 let past_text = part
                     .get("pastTenseMessage")
-                    .and_then(|m| m.get("value"))
-                    .and_then(Value::as_str)
+                    .and_then(markdown_or_str)
                     .unwrap_or("");
                 let is_complete = part
                     .get("isComplete")
@@ -827,6 +827,16 @@ fn build_assistant_message(
                         "message".to_string(),
                         Value::String(invocation_text.to_string()),
                     );
+                }
+                // Structured arguments, where the serialized part carries them
+                // (machine-readable next to the prose `message`): file-target
+                // tools resolve their target into `invocationMessage.uris`, the
+                // terminal tool carries the exact command line.
+                if let Some(path) = first_invocation_uri_path(part) {
+                    input.insert("path".to_string(), Value::String(path));
+                }
+                if let Some(command) = terminal_command_line(part) {
+                    input.insert("command".to_string(), Value::String(command));
                 }
                 let tool_use = serde_json::json!({
                     "type": "tool_use",
@@ -952,6 +962,38 @@ struct SessionMetadata {
     /// by VS Code's own rename UI as a `{"kind":1,"k":["customTitle"],"v":…}`
     /// patch record. Present ⇒ the session was deliberately renamed.
     custom_title: Option<String>,
+}
+
+/// Text of a VS Code message field that is either a markdown object
+/// (`{value, uris?, …}`) or a bare string.
+fn markdown_or_str(m: &Value) -> Option<&str> {
+    m.as_str().or_else(|| m.get("value").and_then(Value::as_str))
+}
+
+/// First resolved file path of a tool invocation: `invocationMessage.uris` maps
+/// each markdown link target to URI components whose `path` is already decoded
+/// (e.g. `/e:/Programas/…/script.ps1`). Single-target tools (readFile,
+/// createFile, replaceString, …) carry exactly one.
+fn first_invocation_uri_path(part: &Value) -> Option<String> {
+    let uris = part.get("invocationMessage")?.get("uris")?.as_object()?;
+    uris.values()
+        .find_map(|u| u.get("path").and_then(Value::as_str))
+        .map(String::from)
+}
+
+/// The terminal tool's exact command line
+/// (`toolSpecificData.commandLine.original`, falling back to `forDisplay`).
+fn terminal_command_line(part: &Value) -> Option<String> {
+    let data = part.get("toolSpecificData")?;
+    if data.get("kind").and_then(Value::as_str) != Some("terminal") {
+        return None;
+    }
+    let command_line = data.get("commandLine")?;
+    command_line
+        .get("original")
+        .and_then(Value::as_str)
+        .or_else(|| command_line.get("forDisplay").and_then(Value::as_str))
+        .map(String::from)
 }
 
 /// Cheap metadata probe — replays the patch log and walks the final state once.
@@ -1205,6 +1247,57 @@ mod tests {
         assert_eq!(blocks[1]["type"], "tool_result");
         assert_eq!(blocks[0]["id"], blocks[1]["tool_use_id"]);
         assert_eq!(blocks[0]["id"], "vscode-tool-0-2");
+    }
+
+    #[test]
+    fn tool_use_carries_structured_path_and_command_arguments() {
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "message": {"text": "do things"},
+                "response": [
+                    {
+                        // File-target tool: the invocation markdown resolves the
+                        // target into `uris` (decoded `path`, real shape).
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_readFile",
+                        "toolCallId": "tc-read",
+                        "invocationMessage": {
+                            "value": "Reading [](file:///e%3A/proj/a.ps1)",
+                            "uris": {"file:///e%3A/proj/a.ps1#1-1": {"scheme": "file", "path": "/e:/proj/a.ps1", "fragment": "1-1"}}
+                        }
+                    },
+                    {
+                        // Terminal tool: the exact command line rides toolSpecificData.
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "run_in_terminal",
+                        "toolCallId": "tc-term",
+                        "invocationMessage": {"value": "Running `dir`"},
+                        "toolSpecificData": {"kind": "terminal", "commandLine": {"original": "dir /b", "forDisplay": "dir"}}
+                    },
+                    {
+                        // Bare-string invocation message (copilot_applyPatch's shape):
+                        // still captured as `message`; no structured args exist.
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_applyPatch",
+                        "toolCallId": "tc-patch",
+                        "invocationMessage": "Apply Patch"
+                    }
+                ]
+            }]
+        });
+
+        let msgs = messages_from_state(&state);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(blocks[0]["input"]["path"], "/e:/proj/a.ps1");
+        assert_eq!(blocks[0]["input"]["message"], "Reading [](file:///e%3A/proj/a.ps1)");
+        assert_eq!(blocks[1]["input"]["command"], "dir /b");
+        assert!(blocks[1]["input"].get("path").is_none());
+        assert_eq!(blocks[2]["input"]["message"], "Apply Patch");
+        assert!(blocks[2]["input"].get("command").is_none());
     }
 
     #[test]
