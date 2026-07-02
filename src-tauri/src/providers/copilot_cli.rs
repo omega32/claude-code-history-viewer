@@ -542,6 +542,14 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let mut session_id = String::new();
     let mut current_model: Option<String> = None;
     let mut counter: u64 = 0;
+    // The raw event chain (`parentId` → previous event of ANY type — a linear
+    // spine), collected so message parents can be resolved after the pass.
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    // event id → the uuid of the message it became (system messages get
+    // synthetic uuids, so this is a map rather than a set).
+    let mut emitted_uuid: HashMap<String, String> = HashMap::new();
+    // Source event id per pushed message (parallel to `messages`).
+    let mut msg_event_ids: Vec<Option<String>> = Vec::new();
 
     for &(start, end) in &ranges {
         let mut buf = mmap[start..end].to_vec();
@@ -551,6 +559,13 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
         };
 
         let event_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        let event_id = val.get("id").and_then(Value::as_str).map(String::from);
+        if let (Some(id), Some(parent)) = (
+            event_id.as_deref(),
+            val.get("parentId").and_then(Value::as_str),
+        ) {
+            parent_of.insert(id.to_string(), parent.to_string());
+        }
         let timestamp = val
             .get("timestamp")
             .and_then(Value::as_str)
@@ -559,6 +574,16 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
         let data = match val.get("data") {
             Some(d) => d,
             None => continue,
+        };
+
+        let mut push = |msg: ClaudeMessage,
+                        messages: &mut Vec<ClaudeMessage>,
+                        msg_event_ids: &mut Vec<Option<String>>| {
+            if let Some(id) = &event_id {
+                emitted_uuid.insert(id.clone(), msg.uuid.clone());
+            }
+            msg_event_ids.push(event_id.clone());
+            messages.push(msg);
         };
 
         match event_type {
@@ -581,32 +606,32 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
                 if let Some(msg) =
                     convert_system_message(data, &session_id, &timestamp, &mut counter, client)
                 {
-                    messages.push(msg);
+                    push(msg, &mut messages, &mut msg_event_ids);
                 }
             }
             "user.message" => {
                 if let Some(msg) = convert_user_message(
                     data,
-                    val.get("id").and_then(Value::as_str),
+                    event_id.as_deref(),
                     &session_id,
                     &timestamp,
                     &mut counter,
                     client,
                 ) {
-                    messages.push(msg);
+                    push(msg, &mut messages, &mut msg_event_ids);
                 }
             }
             "assistant.message" => {
                 if let Some(msg) = convert_assistant_message(
                     data,
-                    val.get("id").and_then(Value::as_str),
+                    event_id.as_deref(),
                     &session_id,
                     &timestamp,
                     current_model.as_deref(),
                     &mut counter,
                     client,
                 ) {
-                    messages.push(msg);
+                    push(msg, &mut messages, &mut msg_event_ids);
                 }
             }
             "tool.execution_complete" => {
@@ -615,6 +640,32 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Restore the causal chain. Each event's `parentId` names the immediately
+    // preceding event of any type, so a message's meaningful parent is its
+    // nearest *ancestor that itself became a message*: walk up past the dropped
+    // events (turn markers, hooks, tool executions, model changes). A chain
+    // that never reaches an emitted event (e.g. the first message, whose
+    // ancestry ends at session.start) leaves `parent_uuid` unset — consumers
+    // treat that as a root and fall back to timestamp order.
+    for (i, event_id) in msg_event_ids.iter().enumerate() {
+        let Some(event_id) = event_id else { continue };
+        let mut cursor = parent_of.get(event_id);
+        let mut hops = 0usize;
+        while let Some(parent_id) = cursor {
+            if let Some(parent_uuid) = emitted_uuid.get(parent_id) {
+                if parent_uuid != &messages[i].uuid {
+                    messages[i].parent_uuid = Some(parent_uuid.clone());
+                }
+                break;
+            }
+            hops += 1;
+            if hops > parent_of.len() {
+                break; // malformed chain (cycle) — leave unlinked
+            }
+            cursor = parent_of.get(parent_id);
         }
     }
 
@@ -1394,6 +1445,51 @@ mod tests {
             42
         );
         assert_eq!(assistant.message_id.as_deref(), Some("asst-1"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_restores_the_causal_chain_past_dropped_events() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+
+        // The real event spine: every parentId names the immediately preceding
+        // event of ANY type; messages must link to their nearest ancestor that
+        // itself became a message, skipping the dropped events in between.
+        let session_path = write_session(
+            tmp.path(),
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            &[
+                json!({"type": "session.start", "id": "e0", "parentId": null,
+                       "data": {"sessionId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "context": {"cwd": "/repo"}},
+                       "timestamp": "2026-01-01T00:00:00.000Z"}),
+                json!({"type": "user.message", "id": "e1", "parentId": "e0",
+                       "data": {"content": "hello"}, "timestamp": "2026-01-01T00:00:01.000Z"}),
+                json!({"type": "assistant.turn_start", "id": "e2", "parentId": "e1",
+                       "data": {}, "timestamp": "2026-01-01T00:00:02.000Z"}),
+                json!({"type": "assistant.message", "id": "e3", "parentId": "e2",
+                       "data": {"content": "hi"}, "timestamp": "2026-01-01T00:00:03.000Z"}),
+                json!({"type": "tool.execution_start", "id": "e4", "parentId": "e3",
+                       "data": {"toolCallId": "t1"}, "timestamp": "2026-01-01T00:00:04.000Z"}),
+                json!({"type": "tool.execution_complete", "id": "e5", "parentId": "e4",
+                       "data": {"toolCallId": "t1", "success": true, "result": {"content": "ok"}},
+                       "timestamp": "2026-01-01T00:00:05.000Z"}),
+                json!({"type": "user.message", "id": "e6", "parentId": "e5",
+                       "data": {"content": "thanks"}, "timestamp": "2026-01-01T00:00:06.000Z"}),
+            ],
+        );
+
+        let messages = load_messages(&session_path.to_string_lossy()).unwrap();
+        assert_eq!(messages.len(), 3);
+        // First message: ancestry ends at session.start (never a message) → root.
+        assert_eq!(messages[0].uuid, "e1");
+        assert_eq!(messages[0].parent_uuid, None);
+        // Assistant links past the dropped turn_start to the user message.
+        assert_eq!(messages[1].uuid, "e3");
+        assert_eq!(messages[1].parent_uuid.as_deref(), Some("e1"));
+        // Next user links past tool start/complete to the assistant message.
+        assert_eq!(messages[2].uuid, "e6");
+        assert_eq!(messages[2].parent_uuid.as_deref(), Some("e3"));
     }
 
     #[test]
