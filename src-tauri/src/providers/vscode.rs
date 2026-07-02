@@ -440,8 +440,10 @@ fn load_sessions_in(
             last_modified: ms_to_iso(info.last_modified_ms),
             has_tool_use: info.has_tool_use,
             has_errors: false,
-            summary: info.summary,
-            is_renamed: false,
+            // A user rename wins over the first-request preview (same precedence
+            // as the Claude/codex scanners give their native titles).
+            is_renamed: info.custom_title.is_some(),
+            summary: info.custom_title.or(info.summary),
             provider: Some(PROVIDER_ID.to_string()),
             storage_type: None,
             entrypoint: Some(ENTRYPOINT.to_string()),
@@ -946,6 +948,10 @@ struct SessionMetadata {
     last_modified_ms: u64,
     has_tool_use: bool,
     summary: Option<String>,
+    /// The user-assigned title (`customTitle` in the replayed state) — written
+    /// by VS Code's own rename UI as a `{"kind":1,"k":["customTitle"],"v":…}`
+    /// patch record. Present ⇒ the session was deliberately renamed.
+    custom_title: Option<String>,
 }
 
 /// Cheap metadata probe — replays the patch log and walks the final state once.
@@ -970,6 +976,15 @@ fn probe_session_metadata(session_path: &Path) -> Option<SessionMetadata> {
     let mut message_count = 0usize;
     let mut has_tool_use = false;
     let mut summary: Option<String> = None;
+
+    // A user rename (VS Code's own UI, or an external writer appending the same
+    // patch record). A `null` set (a reset) yields None via `as_str`.
+    let custom_title = state
+        .get("customTitle")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_preview(s, 200));
 
     if let Some(requests) = state.get("requests").and_then(Value::as_array) {
         for req in requests {
@@ -1020,6 +1035,7 @@ fn probe_session_metadata(session_path: &Path) -> Option<SessionMetadata> {
         last_modified_ms: last_message_ms.max(creation_ms),
         has_tool_use,
         summary,
+        custom_title,
     })
 }
 
@@ -1213,6 +1229,50 @@ mod tests {
 
         let metadata = probe_session_metadata(&session_path).unwrap();
         assert_eq!(metadata.message_count, 1);
+    }
+
+    #[test]
+    fn probe_reads_custom_title_latest_set_wins_and_null_clears() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_path = tmp.path().join("renamed.jsonl");
+        let header = json!({"kind": 0, "v": {
+            "sessionId": "rename-1111-1111-1111-111111111111",
+            "creationDate": 1779490058917u64,
+            "requests": [{"message": {"text": "hello"}}]
+        }});
+
+        // A rename set-patch: custom_title populated, latest wins.
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{}\n{}",
+                header,
+                json!({"kind": 1, "k": ["customTitle"], "v": "First Name"}),
+                json!({"kind": 1, "k": ["customTitle"], "v": "Final Name"}),
+            ),
+        )
+        .unwrap();
+        let metadata = probe_session_metadata(&session_path).unwrap();
+        assert_eq!(metadata.custom_title.as_deref(), Some("Final Name"));
+
+        // A trailing null set (a reset) clears it; blank/whitespace also clears.
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{}\n{}",
+                header,
+                json!({"kind": 1, "k": ["customTitle"], "v": "Named"}),
+                json!({"kind": 1, "k": ["customTitle"], "v": null}),
+            ),
+        )
+        .unwrap();
+        let metadata = probe_session_metadata(&session_path).unwrap();
+        assert_eq!(metadata.custom_title, None);
+
+        // No rename records at all: None.
+        fs::write(&session_path, header.to_string()).unwrap();
+        let metadata = probe_session_metadata(&session_path).unwrap();
+        assert_eq!(metadata.custom_title, None);
     }
 
     #[test]

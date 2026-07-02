@@ -256,17 +256,24 @@ struct SessionInfo {
     has_tool_use: bool,
     summary: Option<String>,
     client_kind: ClientKind,
+    /// Whether the summary is a deliberate user rename (`workspace.yaml`'s
+    /// `user_named: true` with a usable `name`).
+    is_renamed: bool,
 }
 
 /// Parsed subset of `<sessionDir>/workspace.yaml`.
 ///
 /// Copilot writes a flat (key: value) YAML file alongside `events.jsonl` with
 /// session metadata. We tolerate missing files and malformed lines because
-/// only the `client_name`/`name` fields are load-bearing for routing/UI.
+/// only the `client_name`/`name`/`user_named` fields are load-bearing for
+/// routing/UI.
 #[derive(Debug, Default)]
 struct WorkspaceMetadata {
     client_name: Option<String>,
     name: Option<String>,
+    /// Whether `name` was set deliberately by the user (the CLI's `/name`, or
+    /// an external renamer) rather than auto-derived — drives `is_renamed`.
+    user_named: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,11 +310,22 @@ fn parse_flat_yaml(input: &str) -> WorkspaceMetadata {
         }
         match key {
             "client_name" => meta.client_name = Some(value.to_string()),
-            "name" => meta.name = Some(value.to_string()),
+            // A block-scalar indicator (`|`/`>` forms) means the real value is a
+            // multiline body this flat parser deliberately doesn't read (the
+            // github/acp persona blob) — treat it as absent rather than exposing
+            // the literal indicator as a junk title (`|-`).
+            "name" if !is_block_scalar_indicator(value) => meta.name = Some(value.to_string()),
+            "user_named" => meta.user_named = value == "true",
             _ => {}
         }
     }
     meta
+}
+
+/// Whether a flat-YAML value is a block-scalar header (`|`, `|-`, `>+`, …) —
+/// i.e. the actual content is on following indented lines we don't parse.
+fn is_block_scalar_indicator(value: &str) -> bool {
+    matches!(value, "|" | "|-" | "|+" | ">" | ">-" | ">+")
 }
 
 /// Read `workspace.yaml` next to `events.jsonl` (best-effort; absence ⇒ default).
@@ -492,7 +510,7 @@ pub fn load_sessions(
             has_tool_use: info.has_tool_use,
             has_errors: false,
             summary: info.summary,
-            is_renamed: false,
+            is_renamed: info.is_renamed,
             provider: Some(client.provider_id().to_string()),
             storage_type: None,
             entrypoint: Some(info.client_kind.entrypoint().to_string()),
@@ -835,7 +853,10 @@ fn extract_session_info(events_path: &Path) -> Result<SessionInfo, String> {
 
     // Prefer workspace.yaml's user-friendly `name` as the session summary
     // when present; the Desktop app sets it from the first user prompt and
-    // the CLI sometimes sets it via `/name`.
+    // the CLI sometimes sets it via `/name`. `user_named: true` marks it a
+    // deliberate rename (the parser already drops block-scalar names).
+    let named = workspace.name.as_deref().is_some_and(|s| !s.is_empty());
+    let is_renamed = workspace.user_named && named;
     let summary = workspace
         .name
         .filter(|s| !s.is_empty())
@@ -853,6 +874,7 @@ fn extract_session_info(events_path: &Path) -> Result<SessionInfo, String> {
         has_tool_use,
         summary,
         client_kind,
+        is_renamed,
     })
 }
 
@@ -1475,16 +1497,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_flat_yaml_reads_user_named_and_skips_block_scalar_names() {
+        // user_named parses as a bool; anything but "true" is false.
+        assert!(parse_flat_yaml("user_named: true\n").user_named);
+        assert!(!parse_flat_yaml("user_named: false\n").user_named);
+        assert!(!parse_flat_yaml("user_named: yes\n").user_named);
+        assert!(!parse_flat_yaml("name: X\n").user_named);
+
+        // A block-scalar `name` (the persona blob this flat parser can't read)
+        // yields NO name — previously the literal indicator leaked out as a
+        // junk `|-` session title.
+        let meta = parse_flat_yaml("name: |-\n  persona line one\n  persona line two\n");
+        assert!(meta.name.is_none());
+        for indicator in ["|", "|+", ">", ">-", ">+"] {
+            assert!(parse_flat_yaml(&format!("name: {indicator}\n")).name.is_none());
+        }
+
+        // A plain single-line name still parses.
+        assert_eq!(parse_flat_yaml("name: Fix the build\n").name.as_deref(), Some("Fix the build"));
+    }
+
+    #[test]
     fn classify_client_routes_by_client_name() {
         let meta = WorkspaceMetadata {
             client_name: Some("github/autopilot".to_string()),
             name: None,
+            user_named: false,
         };
         assert_eq!(classify_client(&meta), ClientKind::Desktop);
 
         let meta = WorkspaceMetadata {
             client_name: Some("github/cli".to_string()),
             name: None,
+            user_named: false,
         };
         assert_eq!(classify_client(&meta), ClientKind::Cli);
 
@@ -1498,6 +1543,7 @@ mod tests {
         let meta = WorkspaceMetadata {
             client_name: Some("github/something-new".to_string()),
             name: None,
+            user_named: false,
         };
         assert_eq!(classify_client(&meta), ClientKind::Cli);
     }
