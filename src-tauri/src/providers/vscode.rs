@@ -847,6 +847,15 @@ fn build_assistant_message(
                 if let Some(command) = terminal_command_line(part) {
                     input.insert("command".to_string(), Value::String(command));
                 }
+                // The to-do tool (`manage_todo_list`) carries its structured list
+                // in `toolSpecificData.todoList` — surface it beside the prose
+                // `message` so the consumer can render a real checklist instead of
+                // the "Created N todos" one-liner (the questions tool, by contrast,
+                // has no `toolSpecificData`; its data is a separate `questionCarousel`
+                // response part — handled elsewhere).
+                if let Some(todos) = todo_list_items(part) {
+                    input.insert("todoList".to_string(), todos);
+                }
                 let tool_use = serde_json::json!({
                     "type": "tool_use",
                     "id": call_id,
@@ -1158,6 +1167,18 @@ fn terminal_command_line(part: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| command_line.get("forDisplay").and_then(Value::as_str))
         .map(String::from)
+}
+
+/// The structured to-do items of a `manage_todo_list` invocation, if present.
+/// VS Code carries them in `toolSpecificData.todoList` — a `[{id,title,status}]`
+/// array — beside the prose `message`. Returned verbatim (the consumer owns the
+/// `{id,title,status}` → common-model mapping); `None` for any non-todo tool.
+fn todo_list_items(part: &Value) -> Option<Value> {
+    let data = part.get("toolSpecificData")?;
+    if data.get("kind").and_then(Value::as_str) != Some("todoList") {
+        return None;
+    }
+    data.get("todoList").filter(|v| v.is_array()).cloned()
 }
 
 /// Cheap metadata probe — replays the patch log and walks the final state once.
@@ -1530,6 +1551,55 @@ mod tests {
         assert!(blocks[1]["input"].get("path").is_none());
         assert_eq!(blocks[2]["input"]["message"], "Apply Patch");
         assert!(blocks[2]["input"].get("command").is_none());
+    }
+
+    #[test]
+    fn tool_use_carries_todo_list_items() {
+        let state = json!({
+            "sessionId": "s",
+            "creationDate": 1,
+            "requests": [{
+                "requestId": "r",
+                "message": {"text": "plan it"},
+                "response": [{
+                    "kind": "toolInvocationSerialized",
+                    "toolId": "manage_todo_list",
+                    "toolCallId": "tc-1",
+                    "isComplete": true,
+                    "invocationMessage": {"value": "Created 2 todos"},
+                    "toolSpecificData": {"kind": "todoList", "todoList": [
+                        {"id": "1", "title": "Add flag", "status": "in-progress"},
+                        {"id": "2", "title": "Write tests", "status": "not-started"}
+                    ]}
+                }]
+            }]
+        });
+        let msgs = messages_from_state(&state);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let tool = blocks.iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert_eq!(tool["name"], "manage_todo_list");
+        // Structured items carried verbatim beside the prose message.
+        assert_eq!(tool["input"]["message"], "Created 2 todos");
+        let todos = tool["input"]["todoList"].as_array().unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["title"], "Add flag");
+        assert_eq!(todos[0]["status"], "in-progress");
+        assert_eq!(todos[1]["id"], "2");
+        // A non-todo tool gets no todoList key.
+        let state2 = json!({
+            "sessionId": "s", "creationDate": 1,
+            "requests": [{
+                "message": {"text": "x"},
+                "response": [{
+                    "kind": "toolInvocationSerialized",
+                    "toolId": "copilot_readFile",
+                    "invocationMessage": {"value": "Reading foo"}
+                }]
+            }]
+        });
+        let m2 = messages_from_state(&state2);
+        let b2 = m2[1].content.as_ref().unwrap().as_array().unwrap();
+        assert!(b2[0]["input"].get("todoList").is_none());
     }
 
     #[test]
