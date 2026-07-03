@@ -684,6 +684,32 @@ fn messages_from_state(state: &Value) -> Vec<ClaudeMessage> {
         {
             messages.push(assistant);
         }
+
+        // Compaction summary: VS Code records a background conversation summary on
+        // `requests[n].result.metadata.summaries[].text` (flattened to
+        // `metadata.summary`) when it compresses context. Surface it as a synthetic
+        // user record stamped `subtype: "compact_summary"` — mirroring how the Claude
+        // parser marks Claude Code's compaction summary — so the consumer detects it
+        // structurally (never by sniffing text) and labels it, instead of treating it
+        // as an authored turn. Emitted after the request's own turn, at the point the
+        // earlier context was compressed.
+        if let Some(summary) = extract_compaction_summary(req) {
+            counter += 1;
+            let uuid = format!("vscode-compact-{idx}-{counter}");
+            let content = serde_json::json!([{ "type": "text", "text": summary }]);
+            let mut msg = build_provider_message(
+                PROVIDER_ID,
+                uuid,
+                &session_id,
+                req_ts.clone(),
+                "user",
+                Some("user"),
+                Some(content),
+                None,
+            );
+            msg.subtype = Some("compact_summary".to_string());
+            messages.push(msg);
+        }
     }
 
     messages
@@ -714,6 +740,32 @@ fn extract_user_text(req: &Value) -> Option<String> {
     } else {
         Some(joined)
     }
+}
+
+/// The conversation-compaction summary attached to a request's result, if any.
+/// VS Code writes a background summary under `result.metadata.summaries[].text`
+/// (also flattened to `result.metadata.summary`). Returns the summary text, or
+/// `None` when the request carries no compaction. Prefers the structured
+/// `summaries[]` (the source of truth; joins multiple non-empty entries), falling
+/// back to the flat `summary` string.
+fn extract_compaction_summary(req: &Value) -> Option<String> {
+    let metadata = req.get("result")?.get("metadata")?;
+    if let Some(arr) = metadata.get("summaries").and_then(Value::as_array) {
+        let joined = arr
+            .iter()
+            .filter_map(|s| s.get("text").and_then(Value::as_str))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    metadata
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn build_assistant_message(
@@ -1332,6 +1384,74 @@ mod tests {
         assert_eq!(blocks[2]["id"], "tc-1");
         assert_eq!(blocks[3]["tool_use_id"], "tc-1");
         assert!(msgs[1].tool_use.is_some());
+    }
+
+    #[test]
+    fn messages_surface_compaction_summary_as_compact_summary_record() {
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "timestamp": 1700000005000u64,
+                "message": {"text": "Analyze the script"},
+                "response": [{"value": "Working on it."}],
+                "result": {"metadata": {
+                    "maxToolCallsExceeded": true,
+                    "summaries": [{"text": "## Conversation Overview\n\n**Primary Objectives:** …"}]
+                }}
+            }]
+        });
+        let msgs = messages_from_state(&state);
+        // user + assistant + the synthetic compaction record
+        assert_eq!(msgs.len(), 3);
+        let compact = &msgs[2];
+        assert_eq!(compact.message_type, "user");
+        assert_eq!(compact.role.as_deref(), Some("user"));
+        assert_eq!(compact.subtype.as_deref(), Some("compact_summary"));
+        let text = compact.content.as_ref().unwrap().as_array().unwrap()[0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("Conversation Overview"));
+        // the ordinary turn is not flagged.
+        assert!(msgs[0].subtype.is_none() && msgs[1].subtype.is_none());
+    }
+
+    #[test]
+    fn no_compaction_record_when_metadata_lacks_summary() {
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "message": {"text": "hi"},
+                "response": [{"value": "hello"}],
+                "result": {"metadata": {"codeBlocks": []}}
+            }]
+        });
+        let msgs = messages_from_state(&state);
+        assert!(msgs.iter().all(|m| m.subtype.is_none()));
+    }
+
+    #[test]
+    fn extract_compaction_summary_prefers_summaries_then_flat() {
+        // structured summaries[] wins over the flat string.
+        let req = json!({"result": {"metadata": {
+            "summaries": [{"text": "structured"}],
+            "summary": "flat"
+        }}});
+        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("structured"));
+        // falls back to the flat `summary`.
+        let req = json!({"result": {"metadata": {"summary": "flat only"}}});
+        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("flat only"));
+        // joins multiple non-empty summaries, skipping blanks.
+        let req = json!({"result": {"metadata": {
+            "summaries": [{"text": "a"}, {"text": ""}, {"text": "b"}]
+        }}});
+        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("a\n\nb"));
+        // none when absent.
+        assert_eq!(extract_compaction_summary(&json!({"result": {"metadata": {}}})), None);
+        assert_eq!(extract_compaction_summary(&json!({"message": {"text": "x"}})), None);
     }
 
     #[test]
