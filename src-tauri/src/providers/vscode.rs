@@ -787,9 +787,15 @@ fn build_assistant_message(
         let kind = part.get("kind").and_then(Value::as_str);
         match kind {
             None => {
-                // Plain markdown content: just a {value, …} object.
+                // Plain markdown content: just a {value, …} object. VS Code wraps a
+                // tool invocation in a fenced code block and persists the opening and
+                // closing fences as their *own* standalone markdown parts (a bare ```
+                // line each); landing adjacent (the tool part sits beside them) they
+                // render as an empty code block downstream. They are UI scaffolding,
+                // not model-authored prose (a real code block arrives as one part with
+                // its code inside), so drop a fence-delimiter-only part.
                 if let Some(text) = part.get("value").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                    if !text.is_empty() && !is_fence_delimiter_only(text) {
                         blocks.push(serde_json::json!({ "type": "text", "text": text }));
                     }
                 }
@@ -1168,6 +1174,21 @@ fn markdown_or_str(m: &Value) -> Option<&str> {
     m.as_str().or_else(|| m.get("value").and_then(Value::as_str))
 }
 
+/// True when `text` (ignoring surrounding whitespace) is *only* a Markdown
+/// code-fence delimiter: three backticks, optionally followed by a bare language
+/// token (letters/digits/`-`/`_`) and nothing else — e.g. `"\n```\n"` or
+/// ```"```json"```. VS Code Copilot Chat wraps a tool invocation in a fenced block
+/// and persists the opening/closing fences as their own standalone markdown parts;
+/// these carry no model-authored prose and would render as empty code blocks, so
+/// they are dropped. A real code block arrives as a single part with its code
+/// *inside* the fences (so the remainder contains a newline), and is never matched.
+fn is_fence_delimiter_only(text: &str) -> bool {
+    match text.trim().strip_prefix("```") {
+        Some(rest) => rest.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+        None => false,
+    }
+}
+
 /// First resolved file path of a tool invocation: `invocationMessage.uris` maps
 /// each markdown link target to URI components whose `path` is already decoded
 /// (e.g. `/e:/Programas/…/script.ps1`). Single-target tools (readFile,
@@ -1506,6 +1527,64 @@ mod tests {
         assert_eq!(blocks[2]["id"], "tc-1");
         assert_eq!(blocks[3]["tool_use_id"], "tc-1");
         assert!(msgs[1].tool_use.is_some());
+    }
+
+    #[test]
+    fn is_fence_delimiter_only_matches_bare_fences_not_real_blocks() {
+        // Bare fence parts (VS Code's tool-wrapper delimiters), any surrounding ws:
+        assert!(is_fence_delimiter_only("\n```\n"));
+        assert!(is_fence_delimiter_only("```"));
+        assert!(is_fence_delimiter_only("```json"));
+        assert!(is_fence_delimiter_only("  ```ts-x_1  "));
+        // Real code blocks / prose are never matched (the code is inside the part):
+        assert!(!is_fence_delimiter_only("```js\nconst x = 1;\n```"));
+        assert!(!is_fence_delimiter_only("Editing now."));
+        assert!(!is_fence_delimiter_only("``"));
+        assert!(!is_fence_delimiter_only("```json extra"));
+    }
+
+    #[test]
+    fn messages_drop_vscode_tool_wrapper_fence_parts() {
+        // VS Code wraps a tool invocation in a code fence, storing the opening/closing
+        // fences as their own standalone markdown parts; adjacent, they'd render as an
+        // empty code block. The normalizer drops the fence-only parts (prose is kept).
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "timestamp": 1700000005000u64,
+                "message": {"text": "edit it"},
+                "response": [
+                    {"value": "Editing now."},
+                    {"kind": "toolInvocationSerialized",
+                        "toolId": "copilot_applyPatch",
+                        "toolCallId": "tc-1",
+                        "isComplete": true,
+                        "invocationMessage": "Applying patch"
+                    },
+                    {"value": "\n```\n"},
+                    {"value": "\n```\n"},
+                    {"value": "Done."}
+                ]
+            }]
+        });
+        let msgs = messages_from_state(&state);
+        let kinds: Vec<&str> = msgs[1]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap_or(""))
+            .collect();
+        // The two fence-only parts are gone; only real prose + the tool call remain.
+        assert_eq!(kinds, vec!["text", "tool_use", "text"]);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "Editing now.");
+        assert_eq!(blocks[2]["text"], "Done.");
     }
 
     #[test]
