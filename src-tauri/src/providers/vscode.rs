@@ -778,6 +778,10 @@ fn build_assistant_message(
     let response = req.get("response").and_then(Value::as_array)?;
     let mut blocks: Vec<Value> = Vec::new();
     let mut tool_use_block: Option<Value> = None;
+    // A `vscode_askQuestions` call stores its questions + the user's answers in a
+    // separate `questionCarousel` response part; pre-scan them (keyed by the owning
+    // tool-call id) so the invocation below can fold them into the tool's input.
+    let carousels = question_carousels(response);
 
     for part in response {
         let kind = part.get("kind").and_then(Value::as_str);
@@ -856,6 +860,16 @@ fn build_assistant_message(
                 if let Some(todos) = todo_list_items(part) {
                     input.insert("todoList".to_string(), todos);
                 }
+                // A questions tool (`vscode_askQuestions`): fold the carousel's
+                // questions into `input.questions` (the AskUserQuestion shape) and turn
+                // the user's `selectedValue`s into the paired answer text — so the whole
+                // Q&A normalizes to Claude's prompt+reply shape and the consumer
+                // reconstructs it with no provider-specific code.
+                let question_answer = carousels.get(&call_id).map(|carousel| {
+                    let (mapped, answers) = map_question_carousel(carousel);
+                    input.insert("questions".to_string(), Value::Array(mapped));
+                    answers
+                });
                 let tool_use = serde_json::json!({
                     "type": "tool_use",
                     "id": call_id,
@@ -867,7 +881,18 @@ fn build_assistant_message(
                 }
                 blocks.push(tool_use);
 
-                if is_complete && !past_text.is_empty() {
+                // The paired result: the user's answers for a questions tool (even when
+                // the invocation isn't flagged complete), else the prose past-tense line.
+                // Unanswered questions emit no result (the prompt still shows, answerless).
+                if let Some(answers) = question_answer {
+                    if !answers.is_empty() {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": answers,
+                        }));
+                    }
+                } else if is_complete && !past_text.is_empty() {
                     blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": call_id,
@@ -1179,6 +1204,82 @@ fn todo_list_items(part: &Value) -> Option<Value> {
         return None;
     }
     data.get("todoList").filter(|v| v.is_array()).cloned()
+}
+
+/// Map each `questionCarousel` response part to its owning tool-call id (`resolveId`)
+/// → the whole carousel. The carousel holds the prompt (`questions[]`) and the user's
+/// answers (`data[<questionId>].selectedValue`). A carousel can be snapshotted more
+/// than once as it's answered, so prefer a snapshot that carries `data`.
+fn question_carousels(response: &[Value]) -> std::collections::HashMap<String, Value> {
+    let mut map: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for part in response {
+        if part.get("kind").and_then(Value::as_str) != Some("questionCarousel") {
+            continue;
+        }
+        let id = match part.get("resolveId").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let has_data = part.get("data").and_then(Value::as_object).is_some();
+        if has_data || !map.contains_key(&id) {
+            map.insert(id, part.clone());
+        }
+    }
+    map
+}
+
+/// Map a `questionCarousel` to the AskUserQuestion `input.questions` shape
+/// (`{question, header, options:[{label}], multiSelect}`) and collect the user's
+/// answers as readable text. A question's answer is `carousel.data[q.id].selectedValue`;
+/// each answered question adds one `header: value` line. Returns `(questions, answers)`.
+fn map_question_carousel(carousel: &Value) -> (Vec<Value>, String) {
+    let questions = carousel.get("questions").and_then(Value::as_array);
+    let data = carousel.get("data");
+    let mut mapped = Vec::new();
+    let mut answers: Vec<String> = Vec::new();
+    for q in questions.into_iter().flatten() {
+        let message = q.get("message").and_then(Value::as_str).unwrap_or("");
+        let title = q.get("title").and_then(Value::as_str).unwrap_or("");
+        let multi = q.get("type").and_then(Value::as_str) == Some("multiSelect");
+        let options: Vec<Value> = q
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|o| o.get("label").and_then(Value::as_str))
+                    .map(|label| serde_json::json!({ "label": label }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        mapped.push(serde_json::json!({
+            "question": message,
+            "header": title,
+            "options": options,
+            "multiSelect": multi,
+        }));
+        if let Some(ans) = q
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|qid| data.and_then(|d| d.get(qid)))
+            .and_then(selected_answer)
+        {
+            answers.push(if title.is_empty() { ans } else { format!("{title}: {ans}") });
+        }
+    }
+    (mapped, answers.join("\n"))
+}
+
+/// The chosen answer in a carousel `data` entry — `selectedValue` as text (a string
+/// for `singleSelect`, comma-joined for a `multiSelect` array). `None` when unanswered.
+fn selected_answer(entry: &Value) -> Option<String> {
+    match entry.get("selectedValue") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Array(arr)) => {
+            let joined = arr.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
 }
 
 /// Cheap metadata probe — replays the patch log and walks the final state once.
@@ -1600,6 +1701,62 @@ mod tests {
         let m2 = messages_from_state(&state2);
         let b2 = m2[1].content.as_ref().unwrap().as_array().unwrap();
         assert!(b2[0]["input"].get("todoList").is_none());
+    }
+
+    #[test]
+    fn askquestions_folds_carousel_into_input_questions_and_answers() {
+        let state = json!({
+            "sessionId": "s",
+            "creationDate": 1,
+            "requests": [{
+                "requestId": "r",
+                "message": {"text": "ask me"},
+                "response": [
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "vscode_askQuestions",
+                        "toolCallId": "call_x",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Asking 3 questions (A, B, C)"},
+                        "pastTenseMessage": {"value": "Asked 3 questions (A, B, C)"}
+                    },
+                    {
+                        "kind": "questionCarousel",
+                        "resolveId": "call_x",
+                        "questions": [
+                            {"id": "call_x:0", "type": "singleSelect", "title": "A", "message": "Pick A?",
+                             "options": [{"id":"y","label":"Yes","value":"Yes"},{"id":"n","label":"No","value":"No"}]},
+                            {"id": "call_x:1", "type": "multiSelect", "title": "B", "message": "Pick B?",
+                             "options": [{"id":"1","label":"One","value":"One"},{"id":"2","label":"Two","value":"Two"}]},
+                            {"id": "call_x:2", "type": "singleSelect", "title": "C", "message": "Pick C?",
+                             "options": [{"id":"a","label":"A","value":"A"}]}
+                        ],
+                        "data": {
+                            "call_x:0": {"selectedValue": "Yes"},
+                            "call_x:1": {"selectedValue": ["One", "Two"]},
+                            "call_x:2": {"selectedValue": null}
+                        }
+                    }
+                ]
+            }]
+        });
+        let msgs = messages_from_state(&state);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let tool = blocks.iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert_eq!(tool["name"], "vscode_askQuestions");
+        // Questions folded into the AskUserQuestion shape (message→question, title→header).
+        let qs = tool["input"]["questions"].as_array().unwrap();
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0]["question"], "Pick A?");
+        assert_eq!(qs[0]["header"], "A");
+        assert_eq!(qs[0]["multiSelect"], false);
+        assert_eq!(qs[0]["options"][0]["label"], "Yes");
+        assert_eq!(qs[1]["multiSelect"], true);
+        // The paired result carries the user's answers (unanswered C omitted);
+        // multiSelect joins its array; the prose past-tense line is NOT used.
+        let result = blocks.iter().find(|b| b["type"] == "tool_result").unwrap();
+        assert_eq!(result["tool_use_id"], "call_x");
+        assert_eq!(result["content"], "A: Yes\nB: One, Two");
     }
 
     #[test]
