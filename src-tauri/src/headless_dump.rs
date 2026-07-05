@@ -23,6 +23,9 @@ use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::ClaudeSession;
+use rusqlite::{Connection, OpenFlags};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
@@ -195,6 +198,87 @@ sessions are listed (path is the provider storage dir, e.g. a folder under\n\
 are returned. Each session is also stamped with `project_path` (the decoded\n\
 project directory) when known. --provider defaults to 'claude'.";
 
+/// The Claude Code VS Code extension "deletes" a session by adding its id to a
+/// `hiddenSessionIds` array in the editor's global-state DB — a soft hide that
+/// leaves the `.jsonl` on disk untouched, so a filesystem scan still lists it.
+/// These helpers read that list so `--list-sessions` can stamp `is_hidden`,
+/// letting a caller mark such sessions instead of showing them as active.
+///
+/// The store is `<user-data>/globalStorage/state.vscdb` (an SQLite DB with one
+/// `ItemTable(key, value)`); the extension's blob lives under key
+/// `Anthropic.claude-code`. The list is global (keyed by session id, not path),
+/// so we union it across every installed editor flavor. Best-effort throughout:
+/// a missing / locked / renamed store contributes nothing rather than failing
+/// the listing — so detection degrades to "show everything", never an error.
+const CLAUDE_VSCODE_STATE_KEY: &str = "Anthropic.claude-code";
+
+/// `state.vscdb` paths for every installed editor flavor that can host the
+/// Claude Code extension (stock VS Code, its insiders/OSS builds, and the forks).
+fn claude_global_state_dbs() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    const FLAVORS: [&str; 6] = [
+        "Code",
+        "Code - Insiders",
+        "VSCodium",
+        "VSCodium - Insiders",
+        "Cursor",
+        "Windsurf",
+    ];
+    #[cfg(target_os = "windows")]
+    let base = home.join("AppData/Roaming");
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Application Support");
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let base = home.join(".config");
+
+    FLAVORS
+        .iter()
+        .map(|flavor| {
+            base.join(flavor)
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+        .filter(|db| db.is_file())
+        .collect()
+}
+
+/// Read the `hiddenSessionIds` array from one `state.vscdb`. Returns `None` on
+/// any failure (locked/absent DB, missing key, non-JSON value) — best-effort.
+fn read_hidden_ids(db: &Path) -> Option<Vec<String>> {
+    // Read-only, like the other providers' `state.vscdb` reads; a WAL DB open by
+    // a running editor still permits concurrent readers.
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [CLAUDE_VSCODE_STATE_KEY],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&value).ok()?;
+    let ids = parsed.get("hiddenSessionIds")?.as_array()?;
+    Some(
+        ids.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The union of Claude VS Code hidden (soft-deleted) session ids across every
+/// installed editor flavor. Empty when nothing is installed or readable.
+fn claude_hidden_session_ids() -> HashSet<String> {
+    let mut hidden = HashSet::new();
+    for db in claude_global_state_dbs() {
+        if let Some(ids) = read_hidden_ids(&db) {
+            hidden.extend(ids);
+        }
+    }
+    hidden
+}
+
 /// A `ClaudeSession` flattened with its decoded project directory. `project_path`
 /// is the project's real filesystem path (its original working directory), so a
 /// caller can match the cwd against it directly instead of reproducing Claude's
@@ -206,6 +290,11 @@ struct SessionWithProjectPath {
     session: ClaudeSession,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_path: Option<String>,
+    /// True when this session was soft-deleted (hidden) in the Claude Code VS
+    /// Code extension. Claude-only; always `false` for other providers. Read
+    /// live from the editor's global state — deliberately not cached, since the
+    /// hidden list changes independently of the session file's (mtime, size).
+    is_hidden: bool,
 }
 
 /// List sessions for `provider`, optionally limited to one project storage path.
@@ -213,6 +302,15 @@ async fn list_sessions(
     provider: &str,
     project: Option<&str>,
 ) -> Result<Vec<SessionWithProjectPath>, String> {
+    // The hidden list is a Claude VS Code concept; read it once per listing and
+    // only for the Claude provider (empty set → every session is `is_hidden:false`).
+    let hidden = if provider == "claude" {
+        claude_hidden_session_ids()
+    } else {
+        HashSet::new()
+    };
+    let is_hidden = |session: &ClaudeSession| hidden.contains(&session.actual_session_id);
+
     if let Some(path) = project {
         // A non-existent project dir (e.g. no sessions for this cwd) is not an
         // error — it just yields an empty list.
@@ -224,6 +322,7 @@ async fn list_sessions(
         return Ok(sessions
             .into_iter()
             .map(|session| SessionWithProjectPath {
+                is_hidden: is_hidden(&session),
                 session,
                 project_path: None,
             })
@@ -239,6 +338,7 @@ async fn list_sessions(
             load_provider_sessions(provider.to_string(), proj.path.clone(), Some(true)).await
         {
             all.extend(sessions.into_iter().map(|session| SessionWithProjectPath {
+                is_hidden: is_hidden(&session),
                 session,
                 project_path: Some(proj.actual_path.clone()),
             }));
