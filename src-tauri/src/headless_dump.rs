@@ -23,8 +23,10 @@ use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::ClaudeSession;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use rusqlite::{Connection, OpenFlags};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
@@ -279,6 +281,141 @@ fn claude_hidden_session_ids() -> HashSet<String> {
     hidden
 }
 
+// ── Copilot (VS Code) session lifecycle: `orphan` and `archived` ─────────────
+//
+// VS Code Copilot Chat writes each session to
+// `workspaceStorage/<hash>/chatSessions/<id>.jsonl` and tracks two independent
+// per-workspace states in that workspace's own `state.vscdb`:
+//   • `chat.ChatSessionStore.index` — the recent-session list, hard-capped at 50
+//     (VS Code's `trimEntries`). When a workspace exceeds 50, the oldest by
+//     recency are dropped *from the index only* (the file stays). So a listed
+//     session whose id is absent from this index has aged out of the visible
+//     list — we mark it **orphan**.
+//   • `agentSessions.state.cache` — an *uncapped* array of `{resource, archived}`
+//     entries. `archived:true` on a `vscode-chat-session://local/<base64-id>`
+//     resource is an explicit, reversible hide (the file is kept) — we mark it
+//     **archived**.
+// A user *delete* removes the file outright, so it never reaches this listing and
+// needs no marker. `archived` takes precedence over `orphan` (an archived session
+// is deliberately hidden, not merely aged out), so a session is at most one of the
+// two. Both are read live from the workspace `state.vscdb`; best-effort — an
+// unreadable store just yields neither mark. VS Code surface only.
+const COPILOT_CHAT_INDEX_KEY: &str = "chat.ChatSessionStore.index";
+const COPILOT_AGENT_STATE_KEY: &str = "agentSessions.state.cache";
+const COPILOT_VSCODE_ENTRYPOINT: &str = "copilot-vscode";
+const COPILOT_LOCAL_RESOURCE_PREFIX: &str = "vscode-chat-session://local/";
+
+#[derive(Default)]
+struct WorkspaceChatState {
+    /// Session ids in `chat.ChatSessionStore.index` (VS Code's recent list).
+    /// `None` when the index couldn't be read — so orphan is never asserted on a
+    /// guess (a missing index means "unknown", not "everything orphaned").
+    index_ids: Option<HashSet<String>>,
+    /// Session ids marked `archived:true` in `agentSessions.state.cache`.
+    archived_ids: HashSet<String>,
+}
+
+/// The workspace `state.vscdb` for a Copilot VS Code session, derived from the
+/// session's own absolute file path `…/workspaceStorage/<hash>/chatSessions/
+/// <id>.jsonl` — so it works regardless of where the editor's user-data dir lives
+/// (default or a custom/portable location). `None` if the shape doesn't match or
+/// the db is absent.
+fn copilot_workspace_state_db(file_path: &str) -> Option<PathBuf> {
+    let chat_sessions = Path::new(file_path).parent()?;
+    if chat_sessions.file_name()?.to_str()? != "chatSessions" {
+        return None;
+    }
+    let db = chat_sessions.parent()?.join("state.vscdb");
+    db.is_file().then_some(db)
+}
+
+/// Decode a `vscode-chat-session://local/<base64>` resource into its session id
+/// (the base64 payload is the plain UUID string). `None` for non-local resources
+/// (e.g. `openai-codex://…` agent sessions) or malformed input.
+fn decode_local_chat_resource(resource: &str) -> Option<String> {
+    let b64 = resource.strip_prefix(COPILOT_LOCAL_RESOURCE_PREFIX)?;
+    String::from_utf8(BASE64_STANDARD.decode(b64).ok()?).ok()
+}
+
+/// Read a Copilot VS Code workspace's chat state (recent-list ids + archived ids)
+/// from its `state.vscdb`. Best-effort per key — a missing/locked db or key just
+/// yields the empty/`None` default.
+fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
+    let mut state = WorkspaceChatState::default();
+    let Ok(conn) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return state;
+    };
+    let read_value = |key: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+    if let Some(value) = read_value(COPILOT_CHAT_INDEX_KEY) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
+            if let Some(entries) = parsed.get("entries").and_then(|e| e.as_object()) {
+                state.index_ids = Some(entries.keys().cloned().collect());
+            }
+        }
+    }
+    if let Some(value) = read_value(COPILOT_AGENT_STATE_KEY) {
+        if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&value) {
+            for entry in entries {
+                let archived = entry.get("archived").and_then(|a| a.as_bool()) == Some(true);
+                let resource = entry.get("resource").and_then(|r| r.as_str());
+                if let (true, Some(id)) = (archived, resource.and_then(decode_local_chat_resource)) {
+                    state.archived_ids.insert(id);
+                }
+            }
+        }
+    }
+    state
+}
+
+/// Classifies Copilot VS Code sessions as `orphan` / `archived`, caching each
+/// workspace's `state.vscdb` read so a workspace with many sessions is read once.
+struct CopilotClassifier {
+    enabled: bool,
+    cache: RefCell<HashMap<PathBuf, WorkspaceChatState>>,
+}
+
+impl CopilotClassifier {
+    fn new(provider: &str) -> Self {
+        Self {
+            // Only relevant when listing Copilot; every other provider is inert.
+            enabled: provider == "copilot",
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `(is_orphan, is_archived)` for a session — `(false, false)` unless
+    /// it's a Copilot VS Code session with a readable workspace state.
+    fn classify(&self, session: &ClaudeSession) -> (bool, bool) {
+        if !self.enabled || session.entrypoint.as_deref() != Some(COPILOT_VSCODE_ENTRYPOINT) {
+            return (false, false);
+        }
+        let Some(db) = copilot_workspace_state_db(&session.file_path) else {
+            return (false, false);
+        };
+        let mut cache = self.cache.borrow_mut();
+        let state = cache
+            .entry(db.clone())
+            .or_insert_with(|| read_workspace_chat_state(&db));
+        let id = &session.actual_session_id;
+        let archived = state.archived_ids.contains(id);
+        // Orphan only when the index was read and this id is absent — and not when
+        // already archived (archived is the more specific, deliberate state).
+        let orphan = !archived
+            && state
+                .index_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(id));
+        (orphan, archived)
+    }
+}
+
 /// A `ClaudeSession` flattened with its decoded project directory. `project_path`
 /// is the project's real filesystem path (its original working directory), so a
 /// caller can match the cwd against it directly instead of reproducing Claude's
@@ -295,6 +432,14 @@ struct SessionWithProjectPath {
     /// live from the editor's global state — deliberately not cached, since the
     /// hidden list changes independently of the session file's (mtime, size).
     is_hidden: bool,
+    /// Copilot VS Code only: the session's file is on disk but its id has aged
+    /// out of the workspace's 50-entry `chat.ChatSessionStore.index` (VS Code no
+    /// longer lists it). `false` for other providers/surfaces. See the classifier.
+    is_orphan: bool,
+    /// Copilot VS Code only: the session is explicitly archived (`archived:true`
+    /// in the workspace's `agentSessions.state.cache`) — a deliberate, reversible
+    /// hide that keeps the file. `false` for other providers/surfaces.
+    is_archived: bool,
 }
 
 /// List sessions for `provider`, optionally limited to one project storage path.
@@ -310,6 +455,19 @@ async fn list_sessions(
         HashSet::new()
     };
     let is_hidden = |session: &ClaudeSession| hidden.contains(&session.actual_session_id);
+    // Copilot VS Code orphan/archived classification (inert for other providers),
+    // caching each workspace's state.vscdb read across its sessions.
+    let copilot = CopilotClassifier::new(provider);
+    let wrap = |session: ClaudeSession, project_path: Option<String>| {
+        let (is_orphan, is_archived) = copilot.classify(&session);
+        SessionWithProjectPath {
+            is_hidden: is_hidden(&session),
+            is_orphan,
+            is_archived,
+            session,
+            project_path,
+        }
+    };
 
     if let Some(path) = project {
         // A non-existent project dir (e.g. no sessions for this cwd) is not an
@@ -321,11 +479,7 @@ async fn list_sessions(
             load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await?;
         return Ok(sessions
             .into_iter()
-            .map(|session| SessionWithProjectPath {
-                is_hidden: is_hidden(&session),
-                session,
-                project_path: None,
-            })
+            .map(|session| wrap(session, None))
             .collect());
     }
 
@@ -337,11 +491,11 @@ async fn list_sessions(
         if let Ok(sessions) =
             load_provider_sessions(provider.to_string(), proj.path.clone(), Some(true)).await
         {
-            all.extend(sessions.into_iter().map(|session| SessionWithProjectPath {
-                is_hidden: is_hidden(&session),
-                session,
-                project_path: Some(proj.actual_path.clone()),
-            }));
+            all.extend(
+                sessions
+                    .into_iter()
+                    .map(|session| wrap(session, Some(proj.actual_path.clone()))),
+            );
         }
     }
     Ok(all)
