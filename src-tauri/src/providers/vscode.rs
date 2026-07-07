@@ -917,8 +917,13 @@ fn build_assistant_message(
                     }
                 }
             }
-            // Unknown / non-renderable kinds (including "inlineReference" and
-            // "mcpServersStarting") are intentionally skipped.
+            Some("inlineReference") => {
+                if let Some(text) = inline_reference_text(part) {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+            }
+            // Unknown / non-renderable kinds (e.g. "mcpServersStarting") are
+            // intentionally skipped.
             Some(_) => {}
         }
     }
@@ -1227,6 +1232,77 @@ fn todo_list_items(part: &Value) -> Option<Value> {
     data.get("todoList").filter(|v| v.is_array()).cloned()
 }
 
+/// Text representation of a VS Code `inlineReference` response part.
+///
+/// Copilot Chat emits references as standalone parts (typically with
+/// `inlineReference: "file:///..."`) interleaved in assistant prose. Render them
+/// as text so the prose remains readable in-order after normalization.
+///
+/// Preference order:
+/// 1) explicit label/title/name fields when present
+/// 2) basename derived from a URI/path payload
+/// 3) the decoded URI/path itself
+fn inline_reference_text(part: &Value) -> Option<String> {
+    fn non_empty(v: Option<&str>) -> Option<String> {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
+    fn field_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+        v.get(key).and_then(Value::as_str)
+    }
+
+    fn display_name(raw: &str) -> Option<String> {
+        if raw.trim().is_empty() {
+            return None;
+        }
+
+        let mut decoded = if let Some(rest) = raw.strip_prefix("file://") {
+            percent_decode(rest)
+        } else {
+            raw.to_string()
+        };
+
+        // Normalize file:// URI-drive form (`/e:/...`) to native-drive form.
+        if decoded.len() > 2 {
+            let bytes = decoded.as_bytes();
+            if bytes[0] == b'/' && bytes[2] == b':' {
+                decoded = decoded[1..].to_string();
+            }
+        }
+
+        let without_fragment = decoded.split('#').next().unwrap_or(decoded.as_str());
+        let trimmed = without_fragment.trim_end_matches(['/','\\']);
+        let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+        if !basename.is_empty() {
+            Some(basename.to_string())
+        } else {
+            Some(decoded)
+        }
+    }
+
+    let reference = part.get("inlineReference").unwrap_or(part);
+
+    // Prefer a human-authored label if the shape carries one.
+    for key in ["label", "title", "name", "displayName"] {
+        if let Some(text) = non_empty(field_str(reference, key).or_else(|| field_str(part, key))) {
+            return Some(text);
+        }
+    }
+
+    let raw = reference
+        .as_str()
+        .or_else(|| field_str(reference, "uri"))
+        .or_else(|| field_str(reference, "path"))
+        .or_else(|| field_str(reference, "target"))
+        .or_else(|| field_str(reference, "value"))
+        .or_else(|| field_str(part, "uri"))
+        .or_else(|| field_str(part, "path"));
+
+    raw.and_then(display_name)
+}
+
 /// Map each `questionCarousel` response part to its owning tool-call id (`resolveId`)
 /// → the whole carousel. The carousel holds the prompt (`questions[]`) and the user's
 /// answers (`data[<questionId>].selectedValue`). A carousel can be snapshotted more
@@ -1367,6 +1443,7 @@ fn probe_session_metadata(session_path: &Path) -> Option<SessionMetadata> {
                             .and_then(Value::as_str)
                             .map(|s| !s.is_empty())
                             .unwrap_or(false),
+                        Some("inlineReference") => inline_reference_text(part).is_some(),
                         _ => false,
                     }
                 });
@@ -1585,6 +1662,34 @@ mod tests {
         let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
         assert_eq!(blocks[0]["text"], "Editing now.");
         assert_eq!(blocks[2]["text"], "Done.");
+    }
+
+    #[test]
+    fn messages_render_inline_references_as_text() {
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "timestamp": 1700000005000u64,
+                "message": {"text": "summarize"},
+                "response": [
+                    {"value": "Main reference: "},
+                    {"kind": "inlineReference", "inlineReference": "file:///e%3A/proj/README.md"},
+                    {"value": ", secondary: "},
+                    {"kind": "inlineReference", "label": "Phase 1 plan", "inlineReference": "file:///e%3A/proj/implementation%20drafts/Phase%201%20-%20Implementation%20Plan.md"}
+                ]
+            }]
+        });
+
+        let msgs = messages_from_state(&state);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        assert_eq!(texts, vec!["Main reference: ", "README.md", ", secondary: ", "Phase 1 plan"]);
     }
 
     #[test]
@@ -1851,6 +1956,30 @@ mod tests {
                     "response": [{
                         "kind": "progressTaskSerialized",
                         "content": {"value": "Working..."}
+                    }]
+                }]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let metadata = probe_session_metadata(&session_path).unwrap();
+        assert_eq!(metadata.message_count, 1);
+    }
+
+    #[test]
+    fn probe_counts_inline_reference_responses_as_visible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_path = tmp.path().join("inline-reference.jsonl");
+        fs::write(
+            &session_path,
+            json!({"kind": 0, "v": {
+                "sessionId": "inline-ref-1111-1111-1111-111111111111",
+                "creationDate": 1779490058917u64,
+                "requests": [{
+                    "response": [{
+                        "kind": "inlineReference",
+                        "inlineReference": "file:///e%3A/proj/README.md"
                     }]
                 }]
             }})
