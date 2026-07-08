@@ -782,6 +782,11 @@ fn build_assistant_message(
     // separate `questionCarousel` response part; pre-scan them (keyed by the owning
     // tool-call id) so the invocation below can fold them into the tool's input.
     let carousels = question_carousels(response);
+    // Track whether the previous visible block was plain prose or an inline
+    // reference, so consecutive spans from the same response (split at every
+    // inlineReference boundary) can be coalesced into one text block. Thinking,
+    // tool calls, and progress steps break the prose run.
+    let mut last_was_prose = false;
 
     for part in response {
         let kind = part.get("kind").and_then(Value::as_str);
@@ -796,11 +801,26 @@ fn build_assistant_message(
                 // its code inside), so drop a fence-delimiter-only part.
                 if let Some(text) = part.get("value").and_then(Value::as_str) {
                     if !text.is_empty() && !is_fence_delimiter_only(text) {
+                        // Coalesce into the preceding text block when in a prose run —
+                        // the surrounding text parts at an inlineReference boundary
+                        // belong to the same sentence; the JOIN (\n\n) between them
+                        // would add a spurious blank line.
+                        if last_was_prose {
+                            if let Some(last) = blocks.last_mut() {
+                                if last.get("type").and_then(Value::as_str) == Some("text") {
+                                    let old = last["text"].as_str().unwrap_or("").to_string();
+                                    last["text"] = Value::String(old + text);
+                                    continue;
+                                }
+                            }
+                        }
                         blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                        last_was_prose = true;
                     }
                 }
             }
             Some("thinking") => {
+                last_was_prose = false;
                 let text = part.get("value").and_then(Value::as_str).unwrap_or("");
                 // Skip empty/encrypted-only thinking blobs; render visible text only.
                 if !text.is_empty() {
@@ -811,6 +831,7 @@ fn build_assistant_message(
                 }
             }
             Some("toolInvocationSerialized") => {
+                last_was_prose = false;
                 let tool_id = part
                     .get("toolId")
                     .and_then(Value::as_str)
@@ -907,6 +928,7 @@ fn build_assistant_message(
                 }
             }
             Some("progressTaskSerialized") => {
+                last_was_prose = false;
                 if let Some(text) = part
                     .get("content")
                     .and_then(|c| c.get("value"))
@@ -918,8 +940,20 @@ fn build_assistant_message(
                 }
             }
             Some("inlineReference") => {
-                if let Some(text) = inline_reference_text(part) {
-                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                if let Some(ref_text) = inline_reference_text(part) {
+                    // Coalesce into the preceding prose block — an inline reference
+                    // is a mid-sentence span, not a paragraph boundary.
+                    if last_was_prose {
+                        if let Some(last) = blocks.last_mut() {
+                            if last.get("type").and_then(Value::as_str) == Some("text") {
+                                let old = last["text"].as_str().unwrap_or("").to_string();
+                                last["text"] = Value::String(old + &ref_text);
+                                continue;
+                            }
+                        }
+                    }
+                    blocks.push(serde_json::json!({ "type": "text", "text": ref_text }));
+                    last_was_prose = true;
                 }
             }
             // Unknown / non-renderable kinds (e.g. "mcpServersStarting") are
@@ -1689,7 +1723,9 @@ mod tests {
             .iter()
             .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect();
-        assert_eq!(texts, vec!["Main reference: ", "README.md", ", secondary: ", "Phase 1 plan"]);
+        // Consecutive plain-text and inlineReference spans from the same response are
+        // coalesced into one text block; no blank lines are inserted between them.
+        assert_eq!(texts, vec!["Main reference: README.md, secondary: Phase 1 plan"]);
     }
 
     #[test]
