@@ -24,6 +24,7 @@ use crate::commands::multi_provider::{
 };
 use crate::models::ClaudeSession;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -440,6 +441,148 @@ struct SessionWithProjectPath {
     /// in the workspace's `agentSessions.state.cache`) — a deliberate, reversible
     /// hide that keeps the file. `false` for other providers/surfaces.
     is_archived: bool,
+    /// Claude only: this local session was "teleported" — its conversation was
+    /// relocated to a cloud (web) session and the local `.jsonl` emptied to a
+    /// single `teleported-from` redirect stub. The normal metadata scan drops it
+    /// (0 conversational messages), so it is re-surfaced here (see
+    /// `scan_teleport_stubs`). `false` for a normal session and every other
+    /// provider.
+    is_teleported: bool,
+    /// Claude only: the cloud session id a teleported stub points at (its
+    /// `remoteSessionId`), so a caller can direct the user to the Web tab. `None`
+    /// for a normal session, other providers, or a stub missing the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_session_id: Option<String>,
+}
+
+/// A teleport redirect stub: a Claude session whose local `.jsonl` was emptied to
+/// a single `teleported-from` record when its conversation was relocated to a
+/// cloud (web) session. The base's normal metadata scan drops such a file (it has
+/// 0 conversational messages), so `--list-sessions` re-surfaces it here — stamped
+/// `is_teleported` with the `remote_session_id` it points at — letting a caller
+/// mark it (and point the user at the Web tab) instead of the session silently
+/// vanishing. Claude-only: teleport is a Claude-cloud feature; no other provider
+/// writes such a stub.
+const TELEPORT_RECORD_TYPE: &str = "teleported-from";
+
+/// A teleport stub is a single ~100-byte record. Cap candidate files well above
+/// that but far below any real session, so a non-listed large/corrupt file is
+/// never read (a real session is always already listed and skipped anyway).
+const TELEPORT_STUB_MAX_BYTES: u64 = 1024;
+
+#[derive(serde::Deserialize)]
+struct TeleportStubRecord {
+    #[serde(rename = "type")]
+    record_type: String,
+    #[serde(rename = "remoteSessionId")]
+    remote_session_id: Option<String>,
+}
+
+/// If `path` is a teleport stub — its first non-empty line is a `teleported-from`
+/// record — return that record's `remoteSessionId` (an inner `None` means the
+/// field was absent). An outer `None` means "not a teleport stub". Best-effort:
+/// any read/parse failure, or a file larger than a stub, is treated as "not a
+/// stub" (a real session is far larger and never reaches here anyway).
+fn read_teleport_stub(path: &Path) -> Option<Option<String>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > TELEPORT_STUB_MAX_BYTES {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let line = content.lines().find(|l| !l.trim().is_empty())?;
+    let record: TeleportStubRecord = serde_json::from_str(line).ok()?;
+    (record.record_type == TELEPORT_RECORD_TYPE).then_some(record.remote_session_id)
+}
+
+/// Build the listing entry for a teleported session. It has no local content, so
+/// the fields are synthesized: id from the filename, timestamps from the file
+/// mtime, and a placeholder summary (the original title lived in the now-relocated
+/// conversation and is not recoverable from the stub).
+fn synthesize_teleport_session(
+    path: &Path,
+    remote_session_id: Option<String>,
+    project_path: Option<String>,
+) -> SessionWithProjectPath {
+    let file_path = path.to_string_lossy().to_string();
+    let actual_session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-session")
+        .to_string();
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            let dt: DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    let project_name = project_path
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+        .or_else(|| path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()))
+        .unwrap_or("Unknown")
+        .to_string();
+    SessionWithProjectPath {
+        session: ClaudeSession {
+            session_id: file_path.clone(),
+            actual_session_id,
+            file_path,
+            project_name,
+            message_count: 0,
+            first_message_time: modified.clone(),
+            last_message_time: modified.clone(),
+            last_modified: modified,
+            has_tool_use: false,
+            has_errors: false,
+            // Neutral, direction-correct placeholder: the stub is a redirect
+            // pointer to a cloud session (remote→local), not necessarily a session
+            // that was "moved to the cloud". No real title survives in the stub.
+            summary: Some("(teleported · cloud session)".to_string()),
+            is_renamed: false,
+            provider: None,
+            storage_type: None,
+            entrypoint: None,
+        },
+        project_path,
+        is_hidden: false,
+        is_orphan: false,
+        is_archived: false,
+        is_teleported: true,
+        remote_session_id,
+    }
+}
+
+/// Scan one project storage `dir` for teleport stubs not already in `listed` (the
+/// file paths of the sessions the normal scan returned — every real session is
+/// there, so only dropped/empty files are inspected, and only the tiny ones read).
+/// Claude-only; the caller gates on the provider.
+fn scan_teleport_stubs(
+    dir: &Path,
+    listed: &HashSet<String>,
+    project_path: Option<String>,
+) -> Vec<SessionWithProjectPath> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if listed.contains(&path.to_string_lossy().to_string()) {
+            continue;
+        }
+        if let Some(remote_session_id) = read_teleport_stub(&path) {
+            out.push(synthesize_teleport_session(
+                &path,
+                remote_session_id,
+                project_path.clone(),
+            ));
+        }
+    }
+    out
 }
 
 /// List sessions for `provider`, optionally limited to one project storage path.
@@ -464,6 +607,8 @@ async fn list_sessions(
             is_hidden: is_hidden(&session),
             is_orphan,
             is_archived,
+            is_teleported: false,
+            remote_session_id: None,
             session,
             project_path,
         }
@@ -477,10 +622,15 @@ async fn list_sessions(
         }
         let sessions =
             load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await?;
-        return Ok(sessions
-            .into_iter()
-            .map(|session| wrap(session, None))
-            .collect());
+        let mut wrapped: Vec<SessionWithProjectPath> =
+            sessions.into_iter().map(|session| wrap(session, None)).collect();
+        // Teleport stubs (Claude only) are dropped by the metadata scan; re-surface
+        // any in this storage dir that weren't already listed.
+        if provider == "claude" {
+            let listed = listed_paths(&wrapped);
+            wrapped.extend(scan_teleport_stubs(std::path::Path::new(path), &listed, None));
+        }
+        return Ok(wrapped);
     }
 
     let projects =
@@ -491,14 +641,35 @@ async fn list_sessions(
         if let Ok(sessions) =
             load_provider_sessions(provider.to_string(), proj.path.clone(), Some(true)).await
         {
-            all.extend(
-                sessions
-                    .into_iter()
-                    .map(|session| wrap(session, Some(proj.actual_path.clone()))),
-            );
+            let wrapped: Vec<SessionWithProjectPath> = sessions
+                .into_iter()
+                .map(|session| wrap(session, Some(proj.actual_path.clone())))
+                .collect();
+            // Re-surface this project's teleport stubs (Claude only), scoped to the
+            // sessions the normal scan already returned for it.
+            if provider == "claude" {
+                let listed = listed_paths(&wrapped);
+                all.extend(wrapped);
+                all.extend(scan_teleport_stubs(
+                    std::path::Path::new(&proj.path),
+                    &listed,
+                    Some(proj.actual_path.clone()),
+                ));
+            } else {
+                all.extend(wrapped);
+            }
         }
     }
     Ok(all)
+}
+
+/// The set of file paths in a wrapped-session list — the "already listed" guard
+/// so `scan_teleport_stubs` never re-inspects a real session.
+fn listed_paths(wrapped: &[SessionWithProjectPath]) -> HashSet<String> {
+    wrapped
+        .iter()
+        .map(|w| w.session.file_path.clone())
+        .collect()
 }
 
 /// Handle the `--list-sessions` CLI flag. Returns the process exit code.
