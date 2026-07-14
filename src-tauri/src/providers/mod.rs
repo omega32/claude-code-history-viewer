@@ -25,6 +25,7 @@ pub mod openhands;
 pub mod openinterpreter;
 pub mod pearai;
 pub mod pi;
+pub mod powerpoint;
 /// Shared `ConversationState` parsing for the Amazon Q CLI lineage (amazon_q + kiro).
 pub mod q_conversation;
 pub mod qwen;
@@ -74,6 +75,8 @@ pub enum ProviderId {
     Pi,
     /// oh-my-pi (`omp`) — a `pi` fork with the same session format under `~/.omp`.
     Ompi,
+    /// Claude for PowerPoint — local WebView2 IndexedDB chat history.
+    PowerPoint,
     /// Qwen Code (Gemini-CLI fork) — JSONL transcripts under `~/.qwen/projects`.
     Qwen,
     Antigravity,
@@ -111,6 +114,7 @@ impl ProviderId {
             Self::OpenHands => "openhands",
             Self::Pi => "pi",
             Self::Ompi => "ompi",
+            Self::PowerPoint => "powerpoint",
             Self::Qwen => "qwen",
             Self::Antigravity => "antigravity",
             Self::Zed => "zed",
@@ -144,6 +148,7 @@ impl ProviderId {
             "openhands" => Some(Self::OpenHands),
             "pi" => Some(Self::Pi),
             "ompi" => Some(Self::Ompi),
+            "powerpoint" => Some(Self::PowerPoint),
             "qwen" => Some(Self::Qwen),
             "antigravity" => Some(Self::Antigravity),
             "zed" => Some(Self::Zed),
@@ -178,6 +183,7 @@ impl ProviderId {
             Self::OpenHands => "OpenHands",
             Self::Pi => "Pi",
             Self::Ompi => "oh-my-pi",
+            Self::PowerPoint => "Claude for PowerPoint",
             Self::Qwen => "Qwen Code",
             Self::Antigravity => "Antigravity",
             Self::Zed => "Zed",
@@ -282,6 +288,9 @@ pub fn detect_providers() -> Vec<ProviderInfo> {
         providers.push(info);
     }
     if let Some(info) = vibe::detect() {
+        providers.push(info);
+    }
+    if let Some(info) = powerpoint::detect() {
         providers.push(info);
     }
 
