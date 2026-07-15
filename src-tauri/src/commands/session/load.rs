@@ -3954,6 +3954,50 @@ mod tests {
         assert_eq!(read_subagent_tool_use_id(&meta_bad), None);
     }
 
+    #[test]
+    fn metadata_phase_counts_only_conversational_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        // Keep metadata discovery incomplete until the final user record so every
+        // preceding line exercises the full SessionMetadataEntry phase.
+        let lines = [
+            create_sample_assistant_message("a1", "session-1", "hello"),
+            r#"{"type":"ai-title","aiTitle":"Generated","sessionId":"session-1","timestamp":"2026-01-01T00:00:01Z"}"#.to_string(),
+            r#"{"type":"mode","mode":"plan","sessionId":"session-1","timestamp":"2026-01-01T00:00:02Z"}"#.to_string(),
+            r#"{"type":"permission-mode","mode":"acceptEdits","sessionId":"session-1","timestamp":"2026-01-01T00:00:03Z"}"#.to_string(),
+            r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z"}"#.to_string(),
+            r#"{"type":"attachment","uuid":"q1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued prompt"}]}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:06Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
+            create_sample_user_message("u1", "session-1", "authored prompt"),
+        ];
+        let path = create_test_jsonl_file(&temp_dir, "metadata-phase.jsonl", &lines.join("\n"));
+
+        let result = extract_session_metadata_from_file(&path).unwrap();
+        assert_eq!(result.session.message_count, 3);
+    }
+
+    #[test]
+    fn fast_count_phase_uses_the_same_conversational_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        // The first complete user record ends metadata discovery. Everything
+        // after it therefore runs through QuickLineClassifier's fast phase.
+        let lines = [
+            create_sample_user_message("u1", "session-1", "start"),
+            create_sample_assistant_message("a1", "session-1", "reply"),
+            r#"{"type":"attachment","uuid":"q1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued prompt"}]}}"#.to_string(),
+            r#"{"type":"ai-title","aiTitle":"Generated","sessionId":"session-1","timestamp":"2026-01-01T00:00:06Z"}"#.to_string(),
+            r#"{"type":"mode","mode":"plan","sessionId":"session-1","timestamp":"2026-01-01T00:00:07Z"}"#.to_string(),
+            r#"{"type":"permission-mode","mode":"acceptEdits","sessionId":"session-1","timestamp":"2026-01-01T00:00:08Z"}"#.to_string(),
+            r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z"}"#.to_string(),
+            r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:10Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
+            r#"{"type":"user","sessionId":"session-1","timestamp":"2026-01-01T00:00:11Z","isMeta":true,"message":{"role":"user","content":"internal"}}"#.to_string(),
+            r#"{"type":"user","message":{"role":"user","content":"invalid without identity or time"}}"#.to_string(),
+        ];
+        let path = create_test_jsonl_file(&temp_dir, "fast-phase.jsonl", &lines.join("\n"));
+
+        let result = extract_session_metadata_from_file(&path).unwrap();
+        assert_eq!(result.session.message_count, 3);
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_subagent_tool_use_id_rejects_symlink() {

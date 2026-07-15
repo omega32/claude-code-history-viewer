@@ -694,3 +694,301 @@ pub fn run_list_sessions(args: &[String]) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tempfile::TempDir;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn session(file_path: &Path, id: &str, entrypoint: Option<&str>) -> ClaudeSession {
+        ClaudeSession {
+            session_id: file_path.to_string_lossy().to_string(),
+            actual_session_id: id.to_string(),
+            file_path: file_path.to_string_lossy().to_string(),
+            project_name: "test-project".to_string(),
+            message_count: 2,
+            first_message_time: "2026-01-01T00:00:00Z".to_string(),
+            last_message_time: "2026-01-01T00:01:00Z".to_string(),
+            last_modified: "2026-01-01T00:01:00Z".to_string(),
+            has_tool_use: false,
+            has_errors: false,
+            summary: Some("Test session".to_string()),
+            is_renamed: false,
+            provider: None,
+            storage_type: None,
+            entrypoint: entrypoint.map(str::to_string),
+        }
+    }
+
+    fn create_item_table(db: &Path, values: &[(&str, Value)]) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)",
+            [],
+        )
+        .unwrap();
+        for (key, value) in values {
+            conn.execute(
+                "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+                (key, value.to_string()),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn capabilities_command_writes_the_headless_contract() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("capabilities.json");
+        let argv = args(&[
+            "viewer",
+            "--capabilities",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_capabilities(&argv), 0);
+        let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(value["api_version"], HEADLESS_API_VERSION);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["commands"],
+            json!(["dump-session", "list-sessions", "capabilities"])
+        );
+    }
+
+    #[test]
+    fn dump_session_command_loads_an_absolute_claude_path() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("session.jsonl");
+        let output = temp.path().join("dump.json");
+        std::fs::write(
+            &input,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let argv = args(&[
+            "viewer",
+            "--dump-session",
+            input.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_dump_session(&argv), 0);
+        let messages: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["parentUuid"], "u1");
+    }
+
+    #[test]
+    fn list_sessions_command_emits_normal_and_teleport_entries() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("sessions.json");
+        std::fs::write(
+            temp.path().join("normal.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"normal","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"normal","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("teleported.jsonl"),
+            r#"{"type":"teleported-from","remoteSessionId":"remote-123"}"#,
+        )
+        .unwrap();
+        let argv = args(&[
+            "viewer",
+            "--list-sessions",
+            "--provider",
+            "claude",
+            "--project",
+            temp.path().to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_sessions(&argv), 0);
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 2);
+        let normal = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "normal")
+            .unwrap();
+        assert_eq!(normal["message_count"], 2);
+        assert_eq!(normal["is_teleported"], false);
+        let teleport = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "teleported")
+            .unwrap();
+        assert_eq!(teleport["is_teleported"], true);
+        assert_eq!(teleport["remote_session_id"], "remote-123");
+        assert_eq!(teleport["message_count"], 0);
+    }
+
+    #[test]
+    fn flattened_listing_serializes_decoded_project_path_and_flags() {
+        let temp = TempDir::new().unwrap();
+        let wrapped = SessionWithProjectPath {
+            session: session(&temp.path().join("s.jsonl"), "s1", None),
+            project_path: Some(r"C:\work\decoded-project".to_string()),
+            is_hidden: true,
+            is_orphan: false,
+            is_archived: false,
+            is_teleported: false,
+            remote_session_id: None,
+        };
+
+        let value = serde_json::to_value(wrapped).unwrap();
+        assert_eq!(value["project_path"], r"C:\work\decoded-project");
+        assert_eq!(value["is_hidden"], true);
+        assert!(
+            value.get("session").is_none(),
+            "ClaudeSession must stay flattened"
+        );
+    }
+
+    #[test]
+    fn hidden_ids_are_read_best_effort_from_vscode_state() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("state.vscdb");
+        create_item_table(
+            &db,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({"hiddenSessionIds":["hidden-1", 42, "hidden-2"]}),
+            )],
+        );
+
+        assert_eq!(
+            read_hidden_ids(&db),
+            Some(vec!["hidden-1".to_string(), "hidden-2".to_string()])
+        );
+        assert_eq!(read_hidden_ids(&temp.path().join("missing.vscdb")), None);
+    }
+
+    #[test]
+    fn copilot_classifier_distinguishes_recent_orphan_and_archived() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspaceStorage").join("abc");
+        let chats = workspace.join("chatSessions");
+        std::fs::create_dir_all(&chats).unwrap();
+        let db = workspace.join("state.vscdb");
+        let archived_resource = format!(
+            "{COPILOT_LOCAL_RESOURCE_PREFIX}{}",
+            BASE64_STANDARD.encode("archived")
+        );
+        create_item_table(
+            &db,
+            &[
+                (COPILOT_CHAT_INDEX_KEY, json!({"entries":{"recent":{}}})),
+                (
+                    COPILOT_AGENT_STATE_KEY,
+                    json!([{"resource":archived_resource,"archived":true}]),
+                ),
+            ],
+        );
+        let classifier = CopilotClassifier::new("copilot");
+
+        assert_eq!(
+            classifier.classify(&session(
+                &chats.join("recent.jsonl"),
+                "recent",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (false, false)
+        );
+        assert_eq!(
+            classifier.classify(&session(
+                &chats.join("orphan.jsonl"),
+                "orphan",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (true, false)
+        );
+        assert_eq!(
+            classifier.classify(&session(
+                &chats.join("archived.jsonl"),
+                "archived",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (false, true),
+            "archive must take precedence over absence from the recent index"
+        );
+        assert_eq!(
+            CopilotClassifier::new("claude").classify(&session(
+                &chats.join("orphan.jsonl"),
+                "orphan",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn copilot_missing_recent_index_does_not_guess_orphan() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspaceStorage").join("unknown");
+        let chats = workspace.join("chatSessions");
+        std::fs::create_dir_all(&chats).unwrap();
+        create_item_table(
+            &workspace.join("state.vscdb"),
+            &[(COPILOT_AGENT_STATE_KEY, json!([]))],
+        );
+
+        let result = CopilotClassifier::new("copilot").classify(&session(
+            &chats.join("unknown.jsonl"),
+            "unknown",
+            Some(COPILOT_VSCODE_ENTRYPOINT),
+        ));
+        assert_eq!(result, (false, false));
+    }
+
+    #[test]
+    fn teleport_scan_skips_listed_non_stubs_and_oversized_files() {
+        let temp = TempDir::new().unwrap();
+        let listed_path = temp.path().join("listed.jsonl");
+        let teleport_path = temp.path().join("redirect.jsonl");
+        std::fs::write(
+            &listed_path,
+            r#"{"type":"teleported-from","remoteSessionId":"skip-me"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &teleport_path,
+            "\n{\"type\":\"teleported-from\",\"remoteSessionId\":\"remote-1\"}\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("ordinary.jsonl"), r#"{"type":"user"}"#).unwrap();
+        std::fs::write(
+            temp.path().join("oversized.jsonl"),
+            vec![b'x'; TELEPORT_STUB_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let listed = HashSet::from([listed_path.to_string_lossy().to_string()]);
+
+        let found = scan_teleport_stubs(temp.path(), &listed, Some(r"C:\work\project".to_string()));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session.actual_session_id, "redirect");
+        assert_eq!(found[0].remote_session_id.as_deref(), Some("remote-1"));
+        assert_eq!(found[0].project_path.as_deref(), Some(r"C:\work\project"));
+        assert!(found[0].is_teleported);
+    }
+}

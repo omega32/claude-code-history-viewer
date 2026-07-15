@@ -64,8 +64,12 @@ pub fn get_base_path() -> Option<String> {
 }
 
 pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
+    Ok(scan_projects_from(find_stores()))
+}
+
+fn scan_projects_from(stores: Vec<PathBuf>) -> Vec<ClaudeProject> {
     let mut projects = Vec::new();
-    for path in find_stores() {
+    for path in stores {
         let sessions = match read_store(&path) {
             Ok(sessions) => sessions,
             Err(error) => {
@@ -101,7 +105,7 @@ pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
             custom_directory_label: None,
         });
     }
-    Ok(projects)
+    projects
 }
 
 pub fn load_sessions(
@@ -146,7 +150,13 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 }
 
 fn find_stores() -> Vec<PathBuf> {
-    if let Ok(value) = std::env::var(PATH_OVERRIDE) {
+    let override_value = std::env::var(PATH_OVERRIDE).ok();
+    let data_local = dirs::data_local_dir();
+    find_stores_from(override_value.as_deref(), data_local.as_deref())
+}
+
+fn find_stores_from(override_value: Option<&str>, data_local: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(value) = override_value {
         let value = value.trim();
         if !value.is_empty() {
             let path = PathBuf::from(value);
@@ -159,7 +169,7 @@ fn find_stores() -> Vec<PathBuf> {
         }
     }
 
-    let Some(local) = dirs::data_local_dir() else {
+    let Some(local) = data_local else {
         return Vec::new();
     };
     let office = local.join("Microsoft").join("Office");
@@ -1127,6 +1137,48 @@ fn find_v8_payload(bytes: &[u8]) -> Option<&[u8]> {
 mod tests {
     use super::*;
 
+    fn encoded_chat(id: &str, title: &str, content: &str, timestamp: f64) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0x15, 0xfe, 0, 0, 0, 0xff, 0x10, b'o'];
+        one_byte("id", &mut bytes);
+        one_byte(id, &mut bytes);
+        one_byte("title", &mut bytes);
+        one_byte(title, &mut bytes);
+        one_byte("messages", &mut bytes);
+        bytes.extend_from_slice(&[b'A', 1, b'o']);
+        one_byte("type", &mut bytes);
+        one_byte("user", &mut bytes);
+        one_byte("content", &mut bytes);
+        one_byte(content, &mut bytes);
+        one_byte("timestamp", &mut bytes);
+        bytes.push(b'D');
+        bytes.extend_from_slice(&timestamp.to_le_bytes());
+        bytes.extend_from_slice(&[b'{', 3, b'$', 0, 1, b'{', 3]);
+        bytes
+    }
+
+    fn create_store(root: &Path, chats: &[(&str, &str, &str, f64)]) -> PathBuf {
+        let store = root.join(STORE_DIR);
+        fs::create_dir_all(&store).unwrap();
+        let mut options = Options::default();
+        options.create_if_missing = true;
+        let mut db = DB::open(&store, options).unwrap();
+        // Chromium stores metadata before object-store records. Seed the same
+        // ordering because LdbIterator::seek_to_first positions before the first
+        // item and the provider consumes records through `next()`.
+        db.put(b"", b"fixture metadata").unwrap();
+        for (index, (id, title, content, timestamp)) in chats.iter().enumerate() {
+            // One-byte database/object-store/index ids: 1/1/1. The remaining
+            // suffix only needs to make each IndexedDB record key unique.
+            let key = [0, 1, 1, 1, 1, index as u8 + 1];
+            let mut stored = vec![0]; // Chromium IndexedDB record-version varint.
+            stored.extend_from_slice(&encoded_chat(id, title, content, *timestamp));
+            db.put(&key, &stored).unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+        store
+    }
+
     fn one_byte(value: &str, out: &mut Vec<u8>) {
         out.push(b'"');
         out.push(value.len() as u8);
@@ -1199,5 +1251,123 @@ mod tests {
         let (decoded, id) = parse_session_path(&encoded).unwrap();
         assert_eq!(decoded, path);
         assert_eq!(id, "session-1");
+    }
+
+    #[test]
+    fn finds_override_and_office_profile_stores() {
+        let temp = TempDir::new().unwrap();
+        let override_parent = temp.path().join("override");
+        let override_store = override_parent.join(STORE_DIR);
+        fs::create_dir_all(&override_store).unwrap();
+
+        assert_eq!(
+            find_stores_from(Some(override_parent.to_str().unwrap()), None),
+            vec![override_store.clone()]
+        );
+        assert_eq!(
+            find_stores_from(Some(override_store.to_str().unwrap()), None),
+            vec![override_store]
+        );
+
+        let discovered = temp
+            .path()
+            .join("local")
+            .join("Microsoft")
+            .join("Office")
+            .join("16.0")
+            .join("Wef")
+            .join("profile")
+            .join(STORE_DIR);
+        fs::create_dir_all(&discovered).unwrap();
+        assert_eq!(
+            find_stores_from(None, Some(&temp.path().join("local"))),
+            vec![discovered]
+        );
+    }
+
+    #[test]
+    fn snapshots_leveldb_and_adjacent_blob_tree_without_lock() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(STORE_DIR);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("CURRENT"), "MANIFEST-000001\n").unwrap();
+        fs::write(store.join("000003.log"), b"log").unwrap();
+        fs::write(store.join("LOCK"), b"live lock").unwrap();
+        let blob = temp.path().join(BLOB_DIR).join("1").join("00");
+        fs::create_dir_all(&blob).unwrap();
+        fs::write(blob.join("1"), b"blob payload").unwrap();
+
+        let (_snapshot, leveldb, blobs) = snapshot_store(&store).unwrap();
+        assert_eq!(
+            fs::read_to_string(leveldb.join("CURRENT")).unwrap(),
+            "MANIFEST-000001\n"
+        );
+        assert_eq!(fs::read(leveldb.join("000003.log")).unwrap(), b"log");
+        assert!(!leveldb.join("LOCK").exists());
+        assert_eq!(fs::read(blobs.join("1/00/1")).unwrap(), b"blob payload");
+    }
+
+    #[test]
+    fn provider_enumerates_sessions_and_loads_messages_from_indexeddb() {
+        let temp = TempDir::new().unwrap();
+        let fixture = V8Reader::deserialize(&encoded_chat(
+            "session-1",
+            "Deck title",
+            "make a deck",
+            1_700_000_100_000f64,
+        ))
+        .unwrap();
+        assert!(parse_chat_session(&fixture).is_some());
+        let store = create_store(
+            temp.path(),
+            &[(
+                "session-1",
+                "Deck title",
+                "make a deck",
+                1_700_000_100_000f64,
+            )],
+        );
+
+        let mut options = Options::default();
+        options.create_if_missing = false;
+        let mut fixture_db = DB::open(&store, options).unwrap();
+        let mut fixture_iter = fixture_db.new_iter().unwrap();
+        fixture_iter.seek_to_first();
+        let mut fixture_records = Vec::new();
+        while let Some(record) = fixture_iter.next() {
+            fixture_records.push(record);
+        }
+        assert_eq!(
+            fixture_records.len(),
+            1,
+            "fixture records: {fixture_records:?}"
+        );
+        assert_eq!(fixture_records[0].0, vec![0, 1, 1, 1, 1, 1]);
+        drop(fixture_iter);
+        drop(fixture_db);
+
+        let decoded = read_store(&store).unwrap();
+        assert_eq!(decoded.len(), 1, "decoded sessions: {decoded:?}");
+
+        let projects = scan_projects_from(vec![store.clone()]);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(projects[0].message_count, 1);
+        assert_eq!(projects[0].provider.as_deref(), Some(PROVIDER));
+        assert_eq!(projects[0].storage_type.as_deref(), Some("indexeddb"));
+
+        let sessions = load_sessions(store.to_str().unwrap(), false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].actual_session_id, "session-1");
+        assert_eq!(sessions[0].summary.as_deref(), Some("Deck title"));
+        assert_eq!(sessions[0].entrypoint.as_deref(), Some(ENTRYPOINT));
+
+        let messages = load_messages(&sessions[0].session_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role.as_deref(), Some("user"));
+        assert_eq!(
+            messages[0].content.as_ref().unwrap()[0]["text"],
+            "make a deck"
+        );
     }
 }
