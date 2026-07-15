@@ -227,6 +227,10 @@ fn validate_session_path(session_path: &Path, raw_session_path: &str) -> Result<
 pub(crate) struct SessionInfo {
     pub(crate) session_id: String,
     pub(crate) cwd: Option<String>,
+    /// Provider-qualified source from the rollout's first `session_meta`.
+    /// Known user-facing surfaces are `codex-cli` / `codex-vscode`; other
+    /// Codex sources are preserved without being presented as a UI surface.
+    pub(crate) entrypoint: Option<String>,
     #[allow(dead_code)]
     pub(crate) model: Option<String>,
     pub(crate) message_count: usize,
@@ -236,6 +240,21 @@ pub(crate) struct SessionInfo {
     pub(crate) file_path: String,
     pub(crate) has_tool_use: bool,
     pub(crate) summary: Option<String>,
+}
+
+/// Map Codex's unqualified rollout `source` to the shared provider entrypoint
+/// namespace. Unknown future values remain inspectable metadata, but only
+/// the known CLI / VS Code sources are treated as user-facing surfaces.
+fn codex_entrypoint(source: Option<&str>) -> Option<String> {
+    let source = source?.trim();
+    if source.is_empty() {
+        return None;
+    }
+    Some(match source {
+        "cli" => "codex-cli".to_string(),
+        "vscode" => "codex-vscode".to_string(),
+        other => format!("codex-{other}"),
+    })
 }
 
 /// Lightweight metadata used by project-level scans.
@@ -391,7 +410,7 @@ pub fn load_sessions(
                     is_renamed: native_title.is_some_and(|native| native.is_renamed),
                     provider: Some("codex".to_string()),
                     storage_type: None,
-                    entrypoint: None,
+                    entrypoint: info.entrypoint,
                 });
             }
         }
@@ -1090,6 +1109,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     let mut session_id = String::new();
     let mut meta_seen = false;
     let mut cwd = None;
+    let mut source = None;
     let mut turn_context_cwd = None;
     let mut model = None;
     let mut message_count = 0usize;
@@ -1124,6 +1144,10 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                         .to_string();
                     cwd = payload
                         .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    source = payload
+                        .get("source")
                         .and_then(|v| v.as_str())
                         .map(String::from);
                 }
@@ -1216,6 +1240,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     Ok(SessionInfo {
         session_id,
         cwd,
+        entrypoint: codex_entrypoint(source.as_deref()),
         model,
         message_count,
         first_message_time: first_time,
@@ -3862,6 +3887,23 @@ mod tests {
 
         assert_eq!(info.summary.as_deref(), Some("fix the WSL crash"));
         assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    fn extract_session_info_stamps_provider_qualified_source() {
+        let info = run_extract_session_info_on_lines(vec![json!({
+            "timestamp": "2026-05-13T08:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "sess-source", "cwd": "/tmp/proj", "source": "vscode" }
+        })]);
+        assert_eq!(info.entrypoint.as_deref(), Some("codex-vscode"));
+
+        assert_eq!(codex_entrypoint(Some("cli")).as_deref(), Some("codex-cli"));
+        assert_eq!(
+            codex_entrypoint(Some("future-surface")).as_deref(),
+            Some("codex-future-surface")
+        );
+        assert_eq!(codex_entrypoint(Some(" ")), None);
     }
 
     #[test]
