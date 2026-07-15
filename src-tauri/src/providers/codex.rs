@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use memchr::{memchr_iter, memmem};
 use memmap2::Mmap;
 use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -18,7 +19,26 @@ use walkdir::WalkDir;
 use crate::commands::session::NativeRenameResult;
 
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
+const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const STEER_SUBTYPE: &str = "steer";
+
+#[derive(Debug, Clone)]
+struct NativeTitle {
+    title: String,
+    is_renamed: bool,
+}
+
+#[derive(Debug)]
+struct SqliteTitle {
+    title: String,
+    preview: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionIndexEntry {
+    id: String,
+    thread_name: String,
+}
 
 fn mark_pending_steer(
     messages: &mut [ClaudeMessage],
@@ -359,8 +379,10 @@ pub fn load_sessions(
                     last_modified: info.last_modified,
                     has_tool_use: info.has_tool_use,
                     has_errors: false,
-                    summary: native_title.cloned().or(info.summary),
-                    is_renamed: native_title.is_some(),
+                    summary: native_title
+                        .map(|native| native.title.clone())
+                        .or(info.summary),
+                    is_renamed: native_title.is_some_and(|native| native.is_renamed),
                     provider: Some("codex".to_string()),
                     storage_type: None,
                     entrypoint: None,
@@ -934,32 +956,102 @@ fn open_state_db_read_write(base_path: &str) -> Result<Connection, String> {
     .map_err(|e| format!("Failed to open Codex state database: {e}"))
 }
 
-fn load_native_title_index(base_path: &str) -> HashMap<String, String> {
-    let Some(conn) = open_state_db(base_path) else {
-        return HashMap::new();
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT id, title, first_user_message FROM threads") else {
-        return HashMap::new();
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) else {
-        return HashMap::new();
-    };
+fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
+    let mut sqlite_titles = open_state_db(base_path)
+        .and_then(|conn| load_sqlite_titles(&conn))
+        .unwrap_or_default();
+    let mut indexed_names = load_session_index_names(base_path);
+    let mut titles = HashMap::with_capacity(sqlite_titles.len() + indexed_names.len());
 
-    rows.filter_map(std::result::Result::ok)
-        .filter_map(|(id, title, first_user_message)| {
-            let title = title.trim();
-            if title.is_empty() || title == first_user_message.trim() {
-                return None;
-            }
-            Some((id, title.to_string()))
+    for (id, sqlite) in sqlite_titles.drain() {
+        let stored_title = sqlite.title.trim();
+        let preview = sqlite.preview.trim();
+        let indexed_name = indexed_names.remove(&id);
+        // Match Codex's LocalThreadStore precedence: a title distinct from the
+        // preview is authoritative SQLite metadata; otherwise fall back to the
+        // append-only compatibility index (latest entry wins).
+        let resolved = if !stored_title.is_empty() && stored_title != preview {
+            stored_title.to_string()
+        } else if let Some(indexed) = indexed_name {
+            indexed
+        } else if !preview.is_empty() {
+            preview.to_string()
+        } else if !stored_title.is_empty() {
+            stored_title.to_string()
+        } else {
+            continue;
+        };
+        let is_renamed = preview.is_empty() || resolved.trim() != preview;
+        titles.insert(
+            id,
+            NativeTitle {
+                title: resolved,
+                is_renamed,
+            },
+        );
+    }
+
+    // A missing/unreadable SQLite row must not hide a persisted legacy name.
+    // Without a preview there is no reliable reset comparison, so a non-empty
+    // index-only name is conservatively marked as renamed.
+    for (id, title) in indexed_names {
+        titles.insert(
+            id,
+            NativeTitle {
+                title,
+                is_renamed: true,
+            },
+        );
+    }
+
+    titles
+}
+
+fn load_sqlite_titles(conn: &Connection) -> Option<HashMap<String, SqliteTitle>> {
+    // `preview` is Codex's current user-facing original title. Fall back to the
+    // older `first_user_message` column so pre-preview databases remain readable.
+    query_sqlite_titles(conn, "preview").or_else(|| query_sqlite_titles(conn, "first_user_message"))
+}
+
+fn query_sqlite_titles(
+    conn: &Connection,
+    preview_column: &str,
+) -> Option<HashMap<String, SqliteTitle>> {
+    let sql = format!("SELECT id, title, {preview_column} FROM threads");
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
-        .collect()
+        .ok()?;
+    Some(
+        rows.filter_map(std::result::Result::ok)
+            .map(|(id, title, preview)| (id, SqliteTitle { title, preview }))
+            .collect(),
+    )
+}
+
+fn load_session_index_names(base_path: &str) -> HashMap<String, String> {
+    let path = Path::new(base_path).join(SESSION_INDEX_FILENAME);
+    let Ok(body) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let mut names = HashMap::new();
+    for line in body.lines() {
+        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(line.trim()) else {
+            continue;
+        };
+        let name = entry.thread_name.trim();
+        if entry.id.trim().is_empty() || name.is_empty() {
+            continue;
+        }
+        names.insert(entry.id, name.to_string());
+    }
+    names
 }
 
 #[allow(unsafe_code)] // Required for mmap performance optimization
@@ -1898,19 +1990,31 @@ mod tests {
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                preview TEXT NOT NULL,
                 first_user_message TEXT NOT NULL
             )",
             [],
         )
         .expect("threads table should be created");
 
-        for (id, title, first_user_message) in rows {
+        for (id, title, preview) in rows {
             conn.execute(
-                "INSERT INTO threads (id, title, first_user_message) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, title, first_user_message],
+                "INSERT INTO threads (id, title, preview, first_user_message)
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params![id, title, preview],
             )
             .expect("thread row should be inserted");
         }
+    }
+
+    fn write_session_index(codex_home: &Path, entries: &[Value]) {
+        let body = entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(codex_home.join(SESSION_INDEX_FILENAME), format!("{body}\n"))
+            .expect("session index should be written");
     }
 
     #[test]
@@ -3122,6 +3226,235 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary.as_deref(), Some("Pinned Codex title"));
         assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn native_title_uses_latest_session_index_name_when_sqlite_title_is_preview() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-index-title.jsonl",
+            "index-title-session",
+            project_cwd,
+            "Original first prompt",
+        );
+        create_codex_state_db(
+            &codex_home,
+            &[(
+                "index-title-session",
+                "Original first prompt",
+                "Original first prompt",
+            )],
+        );
+        write_session_index(
+            &codex_home,
+            &[
+                json!({"id":"index-title-session","thread_name":"Older title","updated_at":"2026-02-21T10:00:00Z"}),
+                json!({"malformed":"ignored"}),
+                json!({"id":"index-title-session","thread_name":"Persisted title","updated_at":"2026-02-21T11:00:00Z"}),
+            ],
+        );
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions[0].summary.as_deref(), Some("Persisted title"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn native_title_treats_latest_preview_name_as_reset() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-reset-title.jsonl",
+            "reset-title-session",
+            project_cwd,
+            "Original first prompt",
+        );
+        create_codex_state_db(
+            &codex_home,
+            &[(
+                "reset-title-session",
+                "Original first prompt",
+                "Original first prompt",
+            )],
+        );
+        write_session_index(
+            &codex_home,
+            &[
+                json!({"id":"reset-title-session","thread_name":"Temporary title","updated_at":"2026-02-21T10:00:00Z"}),
+                json!({"id":"reset-title-session","thread_name":"Original first prompt","updated_at":"2026-02-21T11:00:00Z"}),
+            ],
+        );
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some("Original first prompt")
+        );
+        assert!(!sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn native_title_prefers_distinct_sqlite_title_over_legacy_index() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-sqlite-title.jsonl",
+            "sqlite-title-session",
+            project_cwd,
+            "Original first prompt",
+        );
+        create_codex_state_db(
+            &codex_home,
+            &[(
+                "sqlite-title-session",
+                "Current SQLite title",
+                "Original first prompt",
+            )],
+        );
+        write_session_index(
+            &codex_home,
+            &[
+                json!({"id":"sqlite-title-session","thread_name":"Legacy index title","updated_at":"2026-02-21T10:00:00Z"}),
+            ],
+        );
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions[0].summary.as_deref(), Some("Current SQLite title"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn native_title_compares_with_preview_not_injected_first_user_message() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-preview-title.jsonl",
+            "preview-title-session",
+            project_cwd,
+            "Injected wrapper",
+        );
+        create_codex_state_db(
+            &codex_home,
+            &[(
+                "preview-title-session",
+                "Actual first prompt",
+                "Actual first prompt",
+            )],
+        );
+        let conn = Connection::open(codex_home.join(STATE_DB_FILENAME))
+            .expect("codex state db should be readable");
+        conn.execute(
+            "UPDATE threads SET first_user_message = ?1 WHERE id = ?2",
+            rusqlite::params!["Injected wrapper", "preview-title-session"],
+        )
+        .expect("first user message should be updated");
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions[0].summary.as_deref(), Some("Actual first prompt"));
+        assert!(!sessions[0].is_renamed);
+    }
+
+    #[test]
+    fn native_title_uses_session_index_without_sqlite() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        write_session_index(
+            tmp.path(),
+            &[json!({
+                "id": "index-only-session",
+                "thread_name": "Persisted index-only title"
+            })],
+        );
+
+        let titles = load_native_title_index(tmp.path().to_str().unwrap());
+        let title = titles
+            .get("index-only-session")
+            .expect("index-only title should be loaded");
+
+        assert_eq!(title.title, "Persisted index-only title");
+        assert!(title.is_renamed);
+    }
+
+    #[test]
+    fn native_title_supports_legacy_database_without_preview() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let conn = Connection::open(tmp.path().join(STATE_DB_FILENAME))
+            .expect("legacy Codex state db should be created");
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                first_user_message TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("legacy threads table should be created");
+        conn.execute(
+            "INSERT INTO threads (id, title, first_user_message) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "legacy-session",
+                "Legacy native title",
+                "Original first prompt"
+            ],
+        )
+        .expect("legacy thread row should be inserted");
+        drop(conn);
+
+        let titles = load_native_title_index(tmp.path().to_str().unwrap());
+        let title = titles
+            .get("legacy-session")
+            .expect("legacy title should be loaded");
+
+        assert_eq!(title.title, "Legacy native title");
+        assert!(title.is_renamed);
     }
 
     #[test]
