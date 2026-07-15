@@ -40,6 +40,12 @@ struct SessionIndexEntry {
     thread_name: String,
 }
 
+#[derive(Debug)]
+struct IndexedName {
+    latest: String,
+    changed: bool,
+}
+
 fn mark_pending_steer(
     messages: &mut [ClaudeMessage],
     pending_user_message_index: &mut Option<usize>,
@@ -967,13 +973,22 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
         let stored_title = sqlite.title.trim();
         let preview = sqlite.preview.trim();
         let indexed_name = indexed_names.remove(&id);
+        // The Codex extension sends both its initial generated title and manual
+        // edits through `thread/name/set`. A single index name identical to the
+        // SQLite title is therefore generated-title metadata, not rename
+        // provenance. A non-reset name is explicit only when it differs from the
+        // SQLite baseline or the append-only name history has changed.
+        let is_renamed = indexed_name.as_ref().is_some_and(|indexed| {
+            let name = indexed.latest.trim();
+            name != preview && (name != stored_title || indexed.changed)
+        });
         // Match Codex's LocalThreadStore precedence: a title distinct from the
         // preview is authoritative SQLite metadata; otherwise fall back to the
         // append-only compatibility index (latest entry wins).
         let resolved = if !stored_title.is_empty() && stored_title != preview {
             stored_title.to_string()
         } else if let Some(indexed) = indexed_name {
-            indexed
+            indexed.latest
         } else if !preview.is_empty() {
             preview.to_string()
         } else if !stored_title.is_empty() {
@@ -981,7 +996,6 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
         } else {
             continue;
         };
-        let is_renamed = preview.is_empty() || resolved.trim() != preview;
         titles.insert(
             id,
             NativeTitle {
@@ -991,14 +1005,14 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
         );
     }
 
-    // A missing/unreadable SQLite row must not hide a persisted legacy name.
+    // A missing/unreadable SQLite row must not hide an explicitly indexed name.
     // Without a preview there is no reliable reset comparison, so a non-empty
     // index-only name is conservatively marked as renamed.
-    for (id, title) in indexed_names {
+    for (id, indexed) in indexed_names {
         titles.insert(
             id,
             NativeTitle {
-                title,
+                title: indexed.latest,
                 is_renamed: true,
             },
         );
@@ -1035,12 +1049,12 @@ fn query_sqlite_titles(
     )
 }
 
-fn load_session_index_names(base_path: &str) -> HashMap<String, String> {
+fn load_session_index_names(base_path: &str) -> HashMap<String, IndexedName> {
     let path = Path::new(base_path).join(SESSION_INDEX_FILENAME);
     let Ok(body) = fs::read_to_string(path) else {
         return HashMap::new();
     };
-    let mut names = HashMap::new();
+    let mut names = HashMap::<String, IndexedName>::new();
     for line in body.lines() {
         let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(line.trim()) else {
             continue;
@@ -1049,7 +1063,21 @@ fn load_session_index_names(base_path: &str) -> HashMap<String, String> {
         if entry.id.trim().is_empty() || name.is_empty() {
             continue;
         }
-        names.insert(entry.id, name.to_string());
+        match names.get_mut(&entry.id) {
+            Some(indexed) => {
+                indexed.changed |= indexed.latest != name;
+                indexed.latest = name.to_string();
+            }
+            None => {
+                names.insert(
+                    entry.id,
+                    IndexedName {
+                        latest: name.to_string(),
+                        changed: false,
+                    },
+                );
+            }
+        }
     }
     names
 }
@@ -3192,7 +3220,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn load_sessions_uses_codex_native_title_from_state_db() {
+    fn load_sessions_does_not_mark_generated_sqlite_title_as_renamed() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let codex_home = tmp.path().join("codex-home");
         let sessions_dir = codex_home
@@ -3215,17 +3243,27 @@ mod tests {
             &codex_home,
             &[(
                 "native-title-session",
-                "Pinned Codex title",
+                "Generated Codex title",
                 "Original first prompt",
             )],
+        );
+        write_session_index(
+            &codex_home,
+            &[json!({
+                "id": "native-title-session",
+                "thread_name": "Generated Codex title"
+            })],
         );
 
         let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
             .expect("sessions should be loaded");
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].summary.as_deref(), Some("Pinned Codex title"));
-        assert!(sessions[0].is_renamed);
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some("Generated Codex title")
+        );
+        assert!(!sessions[0].is_renamed);
     }
 
     #[test]
@@ -3424,6 +3462,34 @@ mod tests {
     }
 
     #[test]
+    fn native_title_marks_changed_index_history_when_latest_matches_sqlite() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        create_codex_state_db(
+            tmp.path(),
+            &[(
+                "renamed-after-generation",
+                "Manual title",
+                "Original first prompt",
+            )],
+        );
+        write_session_index(
+            tmp.path(),
+            &[
+                json!({"id":"renamed-after-generation","thread_name":"Generated title"}),
+                json!({"id":"renamed-after-generation","thread_name":"Manual title"}),
+            ],
+        );
+
+        let titles = load_native_title_index(tmp.path().to_str().unwrap());
+        let title = titles
+            .get("renamed-after-generation")
+            .expect("changed title history should be loaded");
+
+        assert_eq!(title.title, "Manual title");
+        assert!(title.is_renamed);
+    }
+
+    #[test]
     fn native_title_supports_legacy_database_without_preview() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let conn = Connection::open(tmp.path().join(STATE_DB_FILENAME))
@@ -3454,7 +3520,7 @@ mod tests {
             .expect("legacy title should be loaded");
 
         assert_eq!(title.title, "Legacy native title");
-        assert!(title.is_renamed);
+        assert!(!title.is_renamed);
     }
 
     #[test]
