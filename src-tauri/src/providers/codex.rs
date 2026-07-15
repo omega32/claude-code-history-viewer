@@ -18,6 +18,16 @@ use walkdir::WalkDir;
 use crate::commands::session::NativeRenameResult;
 
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
+const STEER_SUBTYPE: &str = "steer";
+
+fn mark_pending_steer(
+    messages: &mut [ClaudeMessage],
+    pending_user_message_index: &mut Option<usize>,
+) {
+    if let Some(index) = pending_user_message_index.take() {
+        messages[index].subtype = Some(STEER_SUBTYPE.to_string());
+    }
+}
 
 /// Detect Codex CLI installation
 pub fn detect() -> Option<ProviderInfo> {
@@ -392,6 +402,9 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
     let mut prev_output_tokens: u32 = 0;
     let mut prev_cached_tokens: u32 = 0;
     let mut msg_counter = 0u64;
+    let mut active_turn_id: Option<String> = None;
+    let mut authored_user_messages_in_turn = 0usize;
+    let mut pending_user_message_index: Option<usize> = None;
 
     for &(start, end) in &ranges {
         let line = &mmap[start..end];
@@ -430,6 +443,9 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
             }
             "response_item" => {
                 if let Some(payload) = val.get("payload") {
+                    let is_user_message = payload.get("type").and_then(Value::as_str)
+                        == Some("message")
+                        && payload.get("role").and_then(Value::as_str) == Some("user");
                     if let Some(msg) = convert_codex_item(
                         payload,
                         &session_id,
@@ -441,6 +457,13 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                             continue;
                         }
                         messages.push(msg);
+                        if is_user_message && active_turn_id.is_some() {
+                            // The matching `event_msg.user_message` immediately follows the
+                            // persisted response item. Remember its normalized row so that the
+                            // event stream can classify authored input without mistaking
+                            // injected user-role context for a steer.
+                            pending_user_message_index = Some(messages.len() - 1);
+                        }
                     }
                 }
             }
@@ -450,10 +473,31 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
 
                     // Skip events that duplicate response_item messages.
                     // Codex logs user/assistant text in both response_item (type=message)
-                    // and event_msg (type=user_message / agent_message) — only keep
-                    // the response_item version to avoid showing every message twice.
-                    if event_type == "user_message" || event_type == "agent_message" {
+                    // and event_msg (type=user_message / agent_message). Keep the
+                    // response_item version for content, but use the authored-user event to
+                    // distinguish same-turn steering from injected user-role context.
+                    if event_type == "user_message" {
+                        if active_turn_id.is_some() {
+                            if authored_user_messages_in_turn > 0 {
+                                mark_pending_steer(&mut messages, &mut pending_user_message_index);
+                            } else {
+                                pending_user_message_index = None;
+                            }
+                            authored_user_messages_in_turn += 1;
+                        }
                         continue;
+                    }
+                    if event_type == "agent_message" {
+                        continue;
+                    }
+
+                    if event_type == "task_started" {
+                        active_turn_id = payload
+                            .get("turn_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        authored_user_messages_in_turn = 0;
+                        pending_user_message_index = None;
                     }
 
                     if event_type == "token_count" {
@@ -498,6 +542,15 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         convert_codex_event(payload, &session_id, &line_timestamp, &mut msg_counter)
                     {
                         messages.push(msg);
+                    }
+
+                    if event_type == "task_complete"
+                        && payload.get("turn_id").and_then(Value::as_str)
+                            == active_turn_id.as_deref()
+                    {
+                        active_turn_id = None;
+                        authored_user_messages_in_turn = 0;
+                        pending_user_message_index = None;
                     }
                 }
             }
@@ -2783,6 +2836,131 @@ mod tests {
                 .and_then(Value::as_str);
             assert_eq!(actual_text, Some(*text), "message {i} content");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_marks_only_same_turn_steers() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-steer.jsonl");
+
+        let lines = [
+            json!({
+                "timestamp": "2026-07-14T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "sess-steer" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            // User-role context is model input, not an authored prompt, because it has
+            // no matching user_message event. It must never consume the turn's first
+            // authored-message slot or receive steer provenance.
+            json!({
+                "timestamp": "2026-07-14T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "context-1", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "<environment_context>...</environment_context>" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u1", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "start the work" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "start the work" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "a1", "type": "message", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "working" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u2", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "focus on tests first" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:05Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "focus on tests first" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:06Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:07Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-2" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:08Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u3", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "ordinary follow-up" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:08Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "ordinary follow-up" }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:09Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-2" }
+            }),
+        ];
+
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n"))
+            .expect("rollout fixture should be written");
+
+        let messages = load_messages(
+            rollout_path
+                .to_str()
+                .expect("rollout path should be valid UTF-8"),
+        )
+        .expect("rollout should be parsed");
+        let users = messages
+            .iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 4);
+        assert_eq!(users[0].subtype, None, "injected context is not a steer");
+        assert_eq!(users[1].subtype, None, "the turn's first prompt is normal");
+        assert_eq!(users[2].subtype.as_deref(), Some(STEER_SUBTYPE));
+        assert_eq!(
+            users[3].subtype, None,
+            "the next task's first prompt resets steer detection"
+        );
     }
 
     #[test]
