@@ -67,7 +67,9 @@ struct SessionMetadataCache {
 // it no longer counts non-conversational metadata records (`ai-title`, `mode`,
 // `permission-mode`, and any future type); stale caches hold the old inflated
 // count, so they must be invalidated to recompute.
-const CACHE_VERSION: u32 = 12;
+// Bumped 12 -> 13: Claude local slash-command envelopes and their stdout echoes
+// are no longer counted as authored conversation.
+const CACHE_VERSION: u32 = 13;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -211,6 +213,7 @@ struct SessionMetadataEntry {
 
 #[derive(serde::Deserialize)]
 struct SessionMetadataMessage {
+    role: Option<String>,
     content: Option<serde_json::Value>,
 }
 
@@ -230,6 +233,7 @@ struct QuickLineClassifier {
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
     attachment: Option<serde_json::Value>,
+    message: Option<SessionMetadataMessage>,
 }
 
 /// Fast session metadata extraction result
@@ -407,7 +411,14 @@ fn extract_session_metadata_internal(
                 // / `custom-title` are handled above for title extraction, so they never
                 // reach here. The viewer's own denylist — `EXCLUDED_MESSAGE_TYPES` via
                 // `is_system_message_type` — is intentionally left untouched.)
-                let is_conversational = entry.message_type == "user"
+                let is_local_command = entry.message.as_ref().is_some_and(|message| {
+                    is_local_command_plumbing(
+                        &entry.message_type,
+                        message.role.as_deref(),
+                        message.content.as_ref(),
+                    )
+                });
+                let is_conversational = (entry.message_type == "user" && !is_local_command)
                     || entry.message_type == "assistant"
                     || (entry.message_type == "attachment"
                         && queued_command_prompt(entry.attachment.as_ref()).is_some());
@@ -567,7 +578,14 @@ fn extract_session_metadata_internal(
             // Same allowlist as Phase 1: count only `user` / `assistant` records and
             // `queued_command` attachments; everything else (metadata, plumbing, and
             // any future non-conversational type) is simply not counted.
-            let is_conversational = classifier.message_type == "user"
+            let is_local_command = classifier.message.as_ref().is_some_and(|message| {
+                is_local_command_plumbing(
+                    &classifier.message_type,
+                    message.role.as_deref(),
+                    message.content.as_ref(),
+                )
+            });
+            let is_conversational = (classifier.message_type == "user" && !is_local_command)
                 || classifier.message_type == "assistant"
                 || (classifier.message_type == "attachment"
                     && queued_command_prompt(classifier.attachment.as_ref()).is_some());
@@ -1728,6 +1746,55 @@ fn queued_command_prompt(attachment: Option<&serde_json::Value>) -> Option<serde
     att.get("prompt").filter(|p| p.is_array()).cloned()
 }
 
+/// Claude Code persists local slash-command UI traffic as ordinary user
+/// messages. Recognize only a complete reserved envelope: quoted tags or a
+/// wrapper followed by authored prose must remain ordinary user content.
+fn is_local_command_plumbing_text(text: &str) -> bool {
+    let text = text.trim();
+    const STDOUT_OPEN: &str = "<local-command-stdout>";
+    const STDOUT_CLOSE: &str = "</local-command-stdout>";
+    if text.starts_with(STDOUT_OPEN) && text.ends_with(STDOUT_CLOSE) {
+        return text[STDOUT_OPEN.len()..]
+            .find(STDOUT_CLOSE)
+            .is_some_and(|at| STDOUT_OPEN.len() + at == text.len() - STDOUT_CLOSE.len());
+    }
+
+    let mut rest = text;
+    let mut seen = 0_u8;
+    while !rest.is_empty() {
+        let Some((close, bit, after_open)) = [
+            ("<command-name>", "</command-name>", 1_u8),
+            ("<command-message>", "</command-message>", 2_u8),
+            ("<command-args>", "</command-args>", 4_u8),
+        ]
+        .into_iter()
+        .find_map(|(open, close, bit)| rest.strip_prefix(open).map(|after| (close, bit, after))) else {
+            return false;
+        };
+        if seen & bit != 0 {
+            return false;
+        }
+        seen |= bit;
+        let Some(close_at) = after_open.find(close) else {
+            return false;
+        };
+        rest = after_open[close_at + close.len()..].trim_start();
+    }
+    seen & 1 != 0
+}
+
+fn is_local_command_plumbing(
+    message_type: &str,
+    role: Option<&str>,
+    content: Option<&serde_json::Value>,
+) -> bool {
+    message_type == "user"
+        && role == Some("user")
+        && content
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_local_command_plumbing_text)
+}
+
 fn parse_line_simd(
     line_num: usize,
     line: &mut [u8],
@@ -1855,6 +1922,14 @@ fn parse_line_simd(
         }
     }
 
+    let is_local_command = log_entry.message.as_ref().is_some_and(|message| {
+        is_local_command_plumbing(
+            &log_entry.message_type,
+            Some(message.role.as_str()),
+            Some(&message.content),
+        )
+    });
+
     let (role, message_id, model, stop_reason, usage, extracted_tool_use) =
         if let Some(ref msg) = log_entry.message {
             // Try to extract tool_use from content array if not present at top level
@@ -1914,6 +1989,8 @@ fn parse_line_simd(
         // type stay as-is — this only tags "what this record is".
         subtype: if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
+        } else if is_local_command {
+            Some("local_command".to_string())
         } else {
             log_entry.subtype
         },
@@ -3374,6 +3451,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_command_plumbing_is_not_counted_as_conversation() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"uuid":"cmd","sessionId":"session-1","timestamp":"2026-07-15T22:19:17Z","type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-fable-5[1m]</command-args>"}}"#,
+            "\n",
+            r#"{"uuid":"stdout","parentUuid":"cmd","sessionId":"session-1","timestamp":"2026-07-15T22:19:17Z","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to claude-fable-5</local-command-stdout>"}}"#,
+            "\n",
+            r#"{"uuid":"u1","parentUuid":"stdout","sessionId":"session-1","timestamp":"2026-07-15T22:20:00Z","type":"user","message":{"role":"user","content":"Continue with the task."}}"#,
+            "\n",
+            r#"{"uuid":"a1","parentUuid":"u1","sessionId":"session-1","timestamp":"2026-07-15T22:20:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Continuing."}]}}"#,
+            "\n"
+        );
+        std::fs::write(temp_dir.path().join("test.jsonl"), content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message_count, 2);
+    }
+
+    #[tokio::test]
     async fn test_session_summary_fallback_incremental_preserves_values() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -3965,6 +4065,8 @@ mod tests {
             r#"{"type":"mode","mode":"plan","sessionId":"session-1","timestamp":"2026-01-01T00:00:02Z"}"#.to_string(),
             r#"{"type":"permission-mode","mode":"acceptEdits","sessionId":"session-1","timestamp":"2026-01-01T00:00:03Z"}"#.to_string(),
             r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z"}"#.to_string(),
+            r#"{"type":"user","uuid":"cmd","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<command-message>model</command-message>\n<command-name>/model</command-name>\n<command-args>default</command-args>"}}"#.to_string(),
+            r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
             r#"{"type":"attachment","uuid":"q1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued prompt"}]}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:06Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             create_sample_user_message("u1", "session-1", "authored prompt"),
@@ -3988,6 +4090,8 @@ mod tests {
             r#"{"type":"mode","mode":"plan","sessionId":"session-1","timestamp":"2026-01-01T00:00:07Z"}"#.to_string(),
             r#"{"type":"permission-mode","mode":"acceptEdits","sessionId":"session-1","timestamp":"2026-01-01T00:00:08Z"}"#.to_string(),
             r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z"}"#.to_string(),
+            r#"{"type":"user","uuid":"cmd","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>default</command-args>"}}"#.to_string(),
+            r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:10Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             r#"{"type":"user","sessionId":"session-1","timestamp":"2026-01-01T00:00:11Z","isMeta":true,"message":{"role":"user","content":"internal"}}"#.to_string(),
             r#"{"type":"user","message":{"role":"user","content":"invalid without identity or time"}}"#.to_string(),
@@ -4057,10 +4161,30 @@ mod tests {
     }
 
     #[test]
+    fn local_command_user_records_get_provenance_subtype() {
+        let cases = [
+            r#"{"type":"user","uuid":"cmd","sessionId":"s1","timestamp":"2026-07-15T22:19:17Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-fable-5[1m]</command-args>"}}"#,
+            r#"{"type":"user","uuid":"stdout","sessionId":"s1","timestamp":"2026-07-15T22:19:17Z","message":{"role":"user","content":"<local-command-stdout>Set model to claude-fable-5</local-command-stdout>"}}"#,
+        ];
+        for line in cases {
+            let mut bytes = line.as_bytes().to_vec();
+            let msg = parse_line_simd(0, &mut bytes, false).expect("local command should parse");
+            assert_eq!(msg.subtype.as_deref(), Some("local_command"));
+        }
+
+        let quoted = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-07-15T22:20:00Z","message":{"role":"user","content":"The literal <command-name>/model</command-name> tag is relevant."}}"#;
+        let mut bytes = quoted.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("quoted tag should parse");
+        assert_eq!(msg.subtype, None);
+    }
+
+    #[test]
     fn non_queued_attachment_is_not_reclassified() {
         // Other attachment subtypes are UI/plumbing, not authored content, and
         // must NOT become user messages.
-        assert!(queued_command_prompt(Some(&serde_json::json!({"type":"todo_reminder"}))).is_none());
+        assert!(
+            queued_command_prompt(Some(&serde_json::json!({"type":"todo_reminder"}))).is_none()
+        );
         assert!(queued_command_prompt(None).is_none());
         assert!(queued_command_prompt(Some(
             &serde_json::json!({"type":"queued_command","prompt":[{"type":"text","text":"x"}]})
