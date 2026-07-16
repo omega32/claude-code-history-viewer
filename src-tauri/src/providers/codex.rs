@@ -100,6 +100,16 @@ fn get_archived_sessions_dir() -> Result<PathBuf, String> {
     Ok(Path::new(&base_path).join("archived_sessions"))
 }
 
+/// Whether a discovered rollout belongs to Codex's archived-session root.
+///
+/// Keep this classification at the provider/storage boundary: callers should
+/// not infer lifecycle state from a coincidental `archived_sessions` path
+/// component. Both paths come from the same configured `CODEX_HOME`, so a
+/// component-aware prefix check preserves the exact scan-root provenance.
+pub(crate) fn is_archived_session_path(path: &Path) -> bool {
+    get_archived_sessions_dir().is_ok_and(|archived_dir| path.starts_with(archived_dir))
+}
+
 fn get_existing_session_dirs() -> Result<Vec<PathBuf>, String> {
     let sessions_dir = get_sessions_dir()?;
     let archived_sessions_dir = get_archived_sessions_dir()?;
@@ -3236,10 +3246,16 @@ mod tests {
             .expect("sessions should be loaded");
 
         assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().any(|s| s.file_path.contains("/sessions/")));
-        assert!(sessions
+        let active = sessions
             .iter()
-            .any(|s| s.file_path.contains("/archived_sessions/")));
+            .find(|s| s.actual_session_id == "active-session")
+            .expect("active session should be listed");
+        let archived = sessions
+            .iter()
+            .find(|s| s.actual_session_id == "archived-session")
+            .expect("archived session should be listed");
+        assert!(!is_archived_session_path(Path::new(&active.file_path)));
+        assert!(is_archived_session_path(Path::new(&archived.file_path)));
     }
 
     #[test]

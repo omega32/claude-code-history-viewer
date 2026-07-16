@@ -23,6 +23,7 @@ use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::ClaudeSession;
+use crate::providers::codex;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -437,9 +438,9 @@ struct SessionWithProjectPath {
     /// out of the workspace's 50-entry `chat.ChatSessionStore.index` (VS Code no
     /// longer lists it). `false` for other providers/surfaces. See the classifier.
     is_orphan: bool,
-    /// Copilot VS Code only: the session is explicitly archived (`archived:true`
-    /// in the workspace's `agentSessions.state.cache`) — a deliberate, reversible
-    /// hide that keeps the file. `false` for other providers/surfaces.
+    /// True when the provider reports an archived session. For Copilot VS Code,
+    /// this comes from `archived:true` in `agentSessions.state.cache`; for Codex,
+    /// it records that the rollout was discovered under `archived_sessions`.
     is_archived: bool,
     /// Claude only: this local session was "teleported" — its conversation was
     /// relocated to a cloud (web) session and the local `.jsonl` emptied to a
@@ -599,10 +600,14 @@ async fn list_sessions(
     };
     let is_hidden = |session: &ClaudeSession| hidden.contains(&session.actual_session_id);
     // Copilot VS Code orphan/archived classification (inert for other providers),
-    // caching each workspace's state.vscdb read across its sessions.
+    // caching each workspace's state.vscdb read across its sessions. Codex's
+    // archived state is cheaper and authoritative: it is the scan-root provenance.
     let copilot = CopilotClassifier::new(provider);
     let wrap = |session: ClaudeSession, project_path: Option<String>| {
-        let (is_orphan, is_archived) = copilot.classify(&session);
+        let (is_orphan, copilot_archived) = copilot.classify(&session);
+        let is_archived = copilot_archived
+            || (provider == "codex"
+                && codex::is_archived_session_path(Path::new(&session.file_path)));
         SessionWithProjectPath {
             is_hidden: is_hidden(&session),
             is_orphan,
@@ -699,7 +704,32 @@ pub fn run_list_sessions(args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use serial_test::serial;
+    use std::ffi::OsString;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -841,6 +871,63 @@ mod tests {
         assert_eq!(teleport["is_teleported"], true);
         assert_eq!(teleport["remote_session_id"], "remote-123");
         assert_eq!(teleport["message_count"], 0);
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_marks_codex_archive_root() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let active_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("16");
+        let archived_dir = codex_home.join("archived_sessions");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let output = temp.path().join("sessions.json");
+        let cwd = "/redacted/project";
+        let write_rollout = |path: &Path, id: &str, prompt: &str| {
+            let records = [
+                json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","created_at":"2026-07-16T10:00:00Z","content":[{"type":"input_text","text":prompt}]}}),
+            ];
+            let content = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, format!("{content}\n")).unwrap();
+        };
+        write_rollout(&active_dir.join("rollout-active.jsonl"), "active", "active");
+        write_rollout(
+            &archived_dir.join("rollout-archived.jsonl"),
+            "archived",
+            "archived",
+        );
+        let argv = args(&[
+            "viewer",
+            "--list-sessions",
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_sessions(&argv), 0);
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let active = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "active")
+            .unwrap();
+        let archived = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "archived")
+            .unwrap();
+        assert_eq!(active["is_archived"], false);
+        assert_eq!(archived["is_archived"], true);
     }
 
     #[test]
