@@ -1610,6 +1610,30 @@ fn convert_codex_event(
             }));
             Some(msg)
         }
+        "thread_rolled_back" => {
+            // Codex emits this durable branch boundary when it rolls back one or more
+            // completed turns (including the send-then-edit flow). Keep the count as
+            // structured data so downstream consumers can mark the superseded turns
+            // without guessing from timestamps, text similarity, or task ids.
+            let num_turns = payload
+                .get("num_turns")
+                .and_then(Value::as_u64)
+                .filter(|count| *count > 0)?;
+            *counter += 1;
+            let mut msg = build_codex_message(
+                format!("codex-rollback-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "system",
+                None,
+                None,
+                None,
+            );
+            msg.subtype = Some("thread_rolled_back".to_string());
+            msg.level = Some("info".to_string());
+            msg.data = Some(serde_json::json!({ "numTurns": num_turns }));
+            Some(msg)
+        }
         "agent_reasoning" => {
             let text = payload.get("text").and_then(Value::as_str)?.trim();
             if text.is_empty() {
@@ -2529,6 +2553,31 @@ mod tests {
             &mut counter,
         );
         assert!(msg.is_none());
+    }
+
+    #[test]
+    fn convert_thread_rolled_back_to_system_boundary() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "thread_rolled_back",
+                "num_turns": 2
+            }),
+            "session-1",
+            "2026-07-16T03:06:56Z",
+            &mut counter,
+        )
+        .expect("rollback event should be retained");
+
+        assert_eq!(msg.message_type, "system");
+        assert_eq!(msg.subtype.as_deref(), Some("thread_rolled_back"));
+        assert_eq!(
+            msg.data
+                .as_ref()
+                .and_then(|value| value.get("numTurns"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
