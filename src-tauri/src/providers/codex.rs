@@ -1935,7 +1935,7 @@ fn try_merge_tool_result_into_previous(
         return false;
     }
 
-    let Some((tool_use_id, tool_result_block)) = extract_tool_result_block(msg) else {
+    let Some((tool_use_id, mut tool_result_block)) = extract_tool_result_block(msg) else {
         return false;
     };
 
@@ -1943,7 +1943,12 @@ fn try_merge_tool_result_into_previous(
         if prev.message_type != "assistant" {
             continue;
         }
-        if has_matching_tool_use(prev, &tool_use_id) {
+        if let Some(tool_name) = matching_tool_use_name(prev, &tool_use_id) {
+            if tool_name == "apply_patch" && failed_apply_patch_result(&tool_result_block) {
+                if let Some(result) = tool_result_block.as_object_mut() {
+                    result.insert("is_error".to_string(), Value::Bool(true));
+                }
+            }
             append_content_block(prev, tool_result_block);
             return true;
         }
@@ -1965,14 +1970,25 @@ fn extract_tool_result_block(msg: &ClaudeMessage) -> Option<(String, Value)> {
     Some((tool_use_id, first.clone()))
 }
 
-fn has_matching_tool_use(msg: &ClaudeMessage, tool_use_id: &str) -> bool {
+fn matching_tool_use_name<'a>(msg: &'a ClaudeMessage, tool_use_id: &str) -> Option<&'a str> {
     let Some(arr) = msg.content.as_ref().and_then(Value::as_array) else {
+        return None;
+    };
+    arr.iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool_use")
+                && item.get("id").and_then(Value::as_str) == Some(tool_use_id)
+        })
+        .and_then(|item| item.get("name"))
+        .and_then(Value::as_str)
+}
+
+fn failed_apply_patch_result(block: &Value) -> bool {
+    let Some(content) = block.get("content").and_then(Value::as_str) else {
         return false;
     };
-    arr.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("tool_use")
-            && item.get("id").and_then(Value::as_str) == Some(tool_use_id)
-    })
+    let content = content.trim_start();
+    content.starts_with("apply_patch verification failed:") || content.starts_with("Invalid patch")
 }
 
 fn append_content_block(msg: &mut ClaudeMessage, block: Value) {
@@ -2499,6 +2515,143 @@ mod tests {
             merged_arr[1].get("type").and_then(Value::as_str),
             Some("tool_result")
         );
+    }
+
+    #[test]
+    fn merge_marks_failed_apply_patch_result_as_error() {
+        let mut messages = vec![build_codex_message(
+            "assistant-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call_patch",
+                "name": "apply_patch",
+                "input": { "patch": "*** Begin Patch\n*** End Patch" }
+            }])),
+            None,
+        )];
+        let result_msg = build_codex_message(
+            "user-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_patch",
+                "content": "apply_patch verification failed: expected context was not found"
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let result = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.get(1))
+            .expect("merged tool result should exist");
+        assert_eq!(result.get("is_error").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn merge_keeps_successful_apply_patch_result_non_error() {
+        let mut messages = vec![build_codex_message(
+            "assistant-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call_patch",
+                "name": "apply_patch",
+                "input": { "patch": "*** Begin Patch\n*** End Patch" }
+            }])),
+            None,
+        )];
+        let result_msg = build_codex_message(
+            "user-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_patch",
+                "content": "Success. Updated the following files:\nM src/lib.rs"
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let result = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.get(1))
+            .expect("merged tool result should exist");
+        assert!(result.get("is_error").is_none());
+    }
+
+    #[test]
+    fn merge_does_not_reclassify_another_tool_result() {
+        let mut messages = vec![build_codex_message(
+            "assistant-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call_shell",
+                "name": "shell_command",
+                "input": { "command": "echo test" }
+            }])),
+            None,
+        )];
+        let result_msg = build_codex_message(
+            "user-1".to_string(),
+            "session-1",
+            "2026-07-17T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_shell",
+                "content": "apply_patch verification failed: quoted diagnostic"
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let result = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.get(1))
+            .expect("merged tool result should exist");
+        assert!(result.get("is_error").is_none());
+    }
+
+    #[test]
+    fn failed_apply_patch_result_recognizes_invalid_patch_output() {
+        assert!(failed_apply_patch_result(&json!({
+            "type": "tool_result",
+            "content": "Invalid patch text"
+        })));
     }
 
     #[test]
