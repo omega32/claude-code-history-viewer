@@ -20,6 +20,7 @@ use crate::commands::session::NativeRenameResult;
 
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
+const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const STEER_SUBTYPE: &str = "steer";
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,18 @@ struct SessionIndexEntry {
 struct IndexedName {
     latest: String,
     changed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalAgentImportLedger {
+    #[serde(default)]
+    records: Vec<ExternalAgentImportRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalAgentImportRecord {
+    source_path: String,
+    imported_thread_id: String,
 }
 
 fn mark_pending_steer(
@@ -108,6 +121,57 @@ fn get_archived_sessions_dir() -> Result<PathBuf, String> {
 /// component-aware prefix check preserves the exact scan-root provenance.
 pub(crate) fn is_archived_session_path(path: &Path) -> bool {
     get_archived_sessions_dir().is_ok_and(|archived_dir| path.starts_with(archived_dir))
+}
+
+/// Imported Codex thread ids and their source providers, read from Codex's own
+/// external-agent import ledger. The ledger is authoritative for import state;
+/// rollout fields such as `source:"vscode"` and `history_mode:"legacy"` are also
+/// used by native sessions and therefore cannot classify an import.
+///
+/// Best-effort by design: an absent or malformed ledger simply yields no import
+/// stamps, matching the other independently-changing metadata stores.
+pub(crate) fn external_agent_imports() -> HashMap<String, Option<String>> {
+    let Some(base_path) = get_base_path() else {
+        return HashMap::new();
+    };
+    let Ok(bytes) = fs::read(Path::new(&base_path).join(EXTERNAL_AGENT_IMPORTS_FILENAME)) else {
+        return HashMap::new();
+    };
+    let Ok(ledger) = serde_json::from_slice::<ExternalAgentImportLedger>(&bytes) else {
+        return HashMap::new();
+    };
+
+    ledger
+        .records
+        .into_iter()
+        .filter(|record| !record.imported_thread_id.trim().is_empty())
+        .map(|record| {
+            let provider = imported_provider_from_path(&record.source_path);
+            (record.imported_thread_id, provider)
+        })
+        .collect()
+}
+
+/// The current ledger records the original file path rather than a provider id.
+/// Recognize the storage roots the provider registry already supports, without
+/// exposing the source path itself through the headless listing.
+fn imported_provider_from_path(source_path: &str) -> Option<String> {
+    let normalized = source_path.replace('\\', "/").to_ascii_lowercase();
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.contains(&".claude") {
+        Some("claude".to_string())
+    } else if parts.contains(&".copilot")
+        || parts.iter().any(|part| part.contains("github.copilot"))
+    {
+        Some("copilot".to_string())
+    } else if parts.contains(&"opencode") {
+        Some("opencode".to_string())
+    } else {
+        None
+    }
 }
 
 fn get_existing_session_dirs() -> Result<Vec<PathBuf>, String> {
@@ -2034,6 +2098,26 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn imported_provider_classifies_known_storage_roots() {
+        assert_eq!(
+            imported_provider_from_path(r"C:\Users\example\.claude\projects\x\session.jsonl"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            imported_provider_from_path("/home/example/.copilot/session-state/session"),
+            Some("copilot".to_string())
+        );
+        assert_eq!(
+            imported_provider_from_path("/home/example/.local/share/opencode/storage/session"),
+            Some("opencode".to_string())
+        );
+        assert_eq!(
+            imported_provider_from_path("/home/example/other-provider/session.jsonl"),
+            None
+        );
     }
 
     fn write_codex_rollout(

@@ -449,6 +449,13 @@ struct SessionWithProjectPath {
     /// `scan_teleport_stubs`). `false` for a normal session and every other
     /// provider.
     is_teleported: bool,
+    /// Codex only: this thread appears in Codex's authoritative external-agent
+    /// import ledger.
+    is_imported: bool,
+    /// Codex only: source provider inferred from the ledger's private source
+    /// path. The path itself is never emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_from: Option<String>,
     /// Claude only: the cloud session id a teleported stub points at (its
     /// `remoteSessionId`), so a caller can direct the user to the Web tab. `None`
     /// for a normal session, other providers, or a stub missing the field.
@@ -550,6 +557,8 @@ fn synthesize_teleport_session(
         is_orphan: false,
         is_archived: false,
         is_teleported: true,
+        is_imported: false,
+        imported_from: None,
         remote_session_id,
     }
 }
@@ -603,16 +612,30 @@ async fn list_sessions(
     // caching each workspace's state.vscdb read across its sessions. Codex's
     // archived state is cheaper and authoritative: it is the scan-root provenance.
     let copilot = CopilotClassifier::new(provider);
+    // Codex's import ledger changes independently of rollout files, so read it
+    // once per listing and join by the generated thread id.
+    let codex_imports = if provider == "codex" {
+        codex::external_agent_imports()
+    } else {
+        HashMap::new()
+    };
     let wrap = |session: ClaudeSession, project_path: Option<String>| {
         let (is_orphan, copilot_archived) = copilot.classify(&session);
         let is_archived = copilot_archived
             || (provider == "codex"
                 && codex::is_archived_session_path(Path::new(&session.file_path)));
+        let is_imported = codex_imports.contains_key(&session.actual_session_id);
+        let imported_from = codex_imports
+            .get(&session.actual_session_id)
+            .cloned()
+            .flatten();
         SessionWithProjectPath {
             is_hidden: is_hidden(&session),
             is_orphan,
             is_archived,
             is_teleported: false,
+            is_imported,
+            imported_from,
             remote_session_id: None,
             session,
             project_path,
@@ -931,6 +954,73 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn list_sessions_marks_codex_external_agent_imports() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let output = temp.path().join("sessions.json");
+        let write_rollout = |id: &str| {
+            let path = sessions_dir.join(format!("rollout-2026-07-17T00-00-00-{id}.jsonl"));
+            let records = [
+                json!({"type":"session_meta","payload":{"id":id,"cwd":"/redacted/project","source":"vscode"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","created_at":"2026-07-17T00:00:00Z","content":[{"type":"input_text","text":"hello"}]}}),
+            ];
+            let content = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, format!("{content}\n")).unwrap();
+        };
+        write_rollout("imported-thread");
+        write_rollout("native-thread");
+        std::fs::write(
+            codex_home.join("external_agent_session_imports.json"),
+            serde_json::to_vec(&json!({
+                "records": [{
+                    "source_path": "/home/test/.claude/projects/work/source-session.jsonl",
+                    "content_sha256": "abc",
+                    "imported_thread_id": "imported-thread",
+                    "imported_at": 1,
+                    "source_modified_at": 1
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let argv = args(&[
+            "viewer",
+            "--list-sessions",
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_sessions(&argv), 0);
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let imported = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "imported-thread")
+            .unwrap();
+        let native = rows
+            .iter()
+            .find(|row| row["actual_session_id"] == "native-thread")
+            .unwrap();
+        assert_eq!(imported["is_imported"], true);
+        assert_eq!(imported["imported_from"], "claude");
+        assert_eq!(native["is_imported"], false);
+        assert!(native.get("imported_from").is_none());
+    }
+
+    #[test]
     fn flattened_listing_serializes_decoded_project_path_and_flags() {
         let temp = TempDir::new().unwrap();
         let wrapped = SessionWithProjectPath {
@@ -940,6 +1030,8 @@ mod tests {
             is_orphan: false,
             is_archived: false,
             is_teleported: false,
+            is_imported: false,
+            imported_from: None,
             remote_session_id: None,
         };
 
