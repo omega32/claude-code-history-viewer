@@ -69,7 +69,9 @@ struct SessionMetadataCache {
 // count, so they must be invalidated to recompute.
 // Bumped 12 -> 13: Claude local slash-command envelopes and their stdout echoes
 // are no longer counted as authored conversation.
-const CACHE_VERSION: u32 = 13;
+// Bumped 13 -> 14: agent-invoking `/init` envelopes now count as conversational
+// boundaries instead of generic local-command plumbing.
+const CACHE_VERSION: u32 = 14;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -411,14 +413,15 @@ fn extract_session_metadata_internal(
                 // / `custom-title` are handled above for title extraction, so they never
                 // reach here. The viewer's own denylist — `EXCLUDED_MESSAGE_TYPES` via
                 // `is_system_message_type` — is intentionally left untouched.)
-                let is_local_command = entry.message.as_ref().is_some_and(|message| {
-                    is_local_command_plumbing(
+                let command_subtype = entry.message.as_ref().and_then(|message| {
+                    local_command_subtype(
                         &entry.message_type,
                         message.role.as_deref(),
                         message.content.as_ref(),
                     )
                 });
-                let is_conversational = (entry.message_type == "user" && !is_local_command)
+                let is_conversational = (entry.message_type == "user"
+                    && command_subtype != Some("local_command"))
                     || entry.message_type == "assistant"
                     || (entry.message_type == "attachment"
                         && queued_command_prompt(entry.attachment.as_ref()).is_some());
@@ -578,14 +581,15 @@ fn extract_session_metadata_internal(
             // Same allowlist as Phase 1: count only `user` / `assistant` records and
             // `queued_command` attachments; everything else (metadata, plumbing, and
             // any future non-conversational type) is simply not counted.
-            let is_local_command = classifier.message.as_ref().is_some_and(|message| {
-                is_local_command_plumbing(
+            let command_subtype = classifier.message.as_ref().and_then(|message| {
+                local_command_subtype(
                     &classifier.message_type,
                     message.role.as_deref(),
                     message.content.as_ref(),
                 )
             });
-            let is_conversational = (classifier.message_type == "user" && !is_local_command)
+            let is_conversational = (classifier.message_type == "user"
+                && command_subtype != Some("local_command"))
                 || classifier.message_type == "assistant"
                 || (classifier.message_type == "attachment"
                     && queued_command_prompt(classifier.attachment.as_ref()).is_some());
@@ -968,18 +972,20 @@ fn extract_user_text(content: &serde_json::Value) -> Option<String> {
 /// Extract command name + args from command message XML tags
 /// e.g., "<command-name>/research</command-name><command-args>query</command-args>"
 ///   → "/research query"
+fn extract_command_name(text: &str) -> Option<&str> {
+    let start = text.find("<command-name>")?;
+    let after = &text[start + 14..];
+    let end = after.find("</command-name>")?;
+    let command = after[..end].trim();
+    (!command.is_empty()).then_some(command)
+}
+
 fn extract_command_display(text: &str) -> Option<String> {
     let mut parts = Vec::new();
 
     // Extract command name
-    if let Some(start) = text.find("<command-name>") {
-        let after = &text[start + 14..];
-        if let Some(end) = after.find("</command-name>") {
-            let cmd = after[..end].trim();
-            if !cmd.is_empty() {
-                parts.push(cmd.to_string());
-            }
-        }
+    if let Some(command) = extract_command_name(text) {
+        parts.push(command.to_string());
     }
 
     // Extract command args
@@ -1795,6 +1801,29 @@ fn is_local_command_plumbing(
             .is_some_and(is_local_command_plumbing_text)
 }
 
+/// Local command envelopes normally describe UI-only plumbing (`/model`,
+/// `/rename`, and their stdout echoes). `/init` is different: Claude expands it
+/// into an `isMeta` prompt and then produces a normal assistant response. The
+/// expanded prompt is intentionally excluded, so preserve the authored command
+/// envelope as the conversational boundary that owns that response.
+fn local_command_subtype(
+    message_type: &str,
+    role: Option<&str>,
+    content: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    if !is_local_command_plumbing(message_type, role, content) {
+        return None;
+    }
+    let command_name = content
+        .and_then(serde_json::Value::as_str)
+        .and_then(extract_command_name);
+    if command_name == Some("/init") {
+        Some("prompt_command")
+    } else {
+        Some("local_command")
+    }
+}
+
 fn parse_line_simd(
     line_num: usize,
     line: &mut [u8],
@@ -1922,8 +1951,8 @@ fn parse_line_simd(
         }
     }
 
-    let is_local_command = log_entry.message.as_ref().is_some_and(|message| {
-        is_local_command_plumbing(
+    let command_subtype = log_entry.message.as_ref().and_then(|message| {
+        local_command_subtype(
             &log_entry.message_type,
             Some(message.role.as_str()),
             Some(&message.content),
@@ -1989,8 +2018,8 @@ fn parse_line_simd(
         // type stay as-is — this only tags "what this record is".
         subtype: if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
-        } else if is_local_command {
-            Some("local_command".to_string())
+        } else if let Some(subtype) = command_subtype {
+            Some(subtype.to_string())
         } else {
             log_entry.subtype
         },
@@ -4067,6 +4096,7 @@ mod tests {
             r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z"}"#.to_string(),
             r#"{"type":"user","uuid":"cmd","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<command-message>model</command-message>\n<command-name>/model</command-name>\n<command-args>default</command-args>"}}"#.to_string(),
             r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
+            r#"{"type":"user","uuid":"init","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<command-message>init</command-message>\n<command-name>/init</command-name>"}}"#.to_string(),
             r#"{"type":"attachment","uuid":"q1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued prompt"}]}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:06Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             create_sample_user_message("u1", "session-1", "authored prompt"),
@@ -4074,7 +4104,7 @@ mod tests {
         let path = create_test_jsonl_file(&temp_dir, "metadata-phase.jsonl", &lines.join("\n"));
 
         let result = extract_session_metadata_from_file(&path).unwrap();
-        assert_eq!(result.session.message_count, 3);
+        assert_eq!(result.session.message_count, 4);
     }
 
     #[test]
@@ -4092,6 +4122,7 @@ mod tests {
             r#"{"type":"future-metadata","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z"}"#.to_string(),
             r#"{"type":"user","uuid":"cmd","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>default</command-args>"}}"#.to_string(),
             r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
+            r#"{"type":"user","uuid":"init","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<command-message>init</command-message>\n<command-name>/init</command-name>"}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:10Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             r#"{"type":"user","sessionId":"session-1","timestamp":"2026-01-01T00:00:11Z","isMeta":true,"message":{"role":"user","content":"internal"}}"#.to_string(),
             r#"{"type":"user","message":{"role":"user","content":"invalid without identity or time"}}"#.to_string(),
@@ -4099,7 +4130,7 @@ mod tests {
         let path = create_test_jsonl_file(&temp_dir, "fast-phase.jsonl", &lines.join("\n"));
 
         let result = extract_session_metadata_from_file(&path).unwrap();
-        assert_eq!(result.session.message_count, 3);
+        assert_eq!(result.session.message_count, 4);
     }
 
     #[cfg(unix)]
@@ -4176,6 +4207,11 @@ mod tests {
         let mut bytes = quoted.as_bytes().to_vec();
         let msg = parse_line_simd(0, &mut bytes, false).expect("quoted tag should parse");
         assert_eq!(msg.subtype, None);
+
+        let init = r#"{"type":"user","uuid":"init","sessionId":"s1","timestamp":"2026-07-21T09:40:02Z","message":{"role":"user","content":"<command-message>init</command-message>\n<command-name>/init</command-name>"}}"#;
+        let mut bytes = init.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("prompt command should parse");
+        assert_eq!(msg.subtype.as_deref(), Some("prompt_command"));
     }
 
     #[test]
