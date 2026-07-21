@@ -15,8 +15,9 @@
 //!
 //! Two companion commands share this file: `--list-sessions` (which also stamps
 //! each session with its decoded project directory, so callers can match the cwd
-//! without reproducing Claude's storage-path encoding) and `--capabilities` (a
-//! tiny version/feature probe so callers can fail fast on an incompatible build).
+//! without reproducing Claude's storage-path encoding), `--hide-session` (Claude's
+//! reversible VS Code deletion state), and `--capabilities` (a tiny version/feature
+//! probe so callers can fail fast on an incompatible build).
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
@@ -26,7 +27,7 @@ use crate::models::ClaudeSession;
 use crate::providers::codex;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -95,7 +96,12 @@ pub fn run_capabilities(args: &[String]) -> i32 {
     let caps = Capabilities {
         api_version: HEADLESS_API_VERSION,
         version: env!("CARGO_PKG_VERSION"),
-        commands: vec!["dump-session", "list-sessions", "capabilities"],
+        commands: vec![
+            "dump-session",
+            "list-sessions",
+            "hide-session",
+            "capabilities",
+        ],
     };
     emit_json(args, &caps)
 }
@@ -281,6 +287,124 @@ fn claude_hidden_session_ids() -> HashSet<String> {
         }
     }
     hidden
+}
+
+const HIDE_USAGE: &str =
+    "Usage: --hide-session <session-id> [--provider claude] [--format json] [--output <file>]\n\n\
+Apply Claude Code's reversible VS Code deletion state by appending <session-id>\n\
+to hiddenSessionIds in each installed Claude extension state store. The session\n\
+transcript remains on disk. Only the claude provider is supported.";
+
+#[derive(Debug, serde::Serialize)]
+struct HideSessionOutcome {
+    session_id: String,
+    hidden: bool,
+    stores_updated: usize,
+    stores_already_hidden: usize,
+    stores_unavailable: usize,
+}
+
+/// Add one id to a single editor store. `Ok(Some(true))` means the row was
+/// updated, `Ok(Some(false))` means it already contained the id, and `Ok(None)`
+/// means that editor has no Claude extension state. Malformed or locked Claude
+/// stores are errors to the caller, which can continue with the other flavors.
+fn hide_session_in_db(db: &Path, session_id: &str) -> Result<Option<bool>, String> {
+    let mut conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    // Reserve the writer before reading so another extension-state update cannot
+    // land between our read and write and be lost by the JSON-object replacement.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let value: String = match tx.query_row(
+        "SELECT value FROM ItemTable WHERE key = ?1",
+        [CLAUDE_VSCODE_STATE_KEY],
+        |row| row.get(0),
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut parsed: serde_json::Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
+    let state = parsed
+        .as_object_mut()
+        .ok_or_else(|| "Claude extension state is not a JSON object".to_string())?;
+    let ids = state
+        .entry("hiddenSessionIds")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "hiddenSessionIds is not an array".to_string())?;
+    if ids.iter().any(|v| v.as_str() == Some(session_id)) {
+        return Ok(Some(false));
+    }
+    ids.push(serde_json::Value::String(session_id.to_string()));
+    let updated = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE ItemTable SET value = ?1 WHERE key = ?2",
+        (&updated, CLAUDE_VSCODE_STATE_KEY),
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(true))
+}
+
+fn hide_claude_session(session_id: &str, dbs: Vec<PathBuf>) -> Result<HideSessionOutcome, String> {
+    let mut outcome = HideSessionOutcome {
+        session_id: session_id.to_string(),
+        hidden: true,
+        stores_updated: 0,
+        stores_already_hidden: 0,
+        stores_unavailable: 0,
+    };
+    for db in dbs {
+        match hide_session_in_db(&db, session_id) {
+            Ok(Some(true)) => outcome.stores_updated += 1,
+            Ok(Some(false)) => outcome.stores_already_hidden += 1,
+            Ok(None) => {}
+            Err(_) => outcome.stores_unavailable += 1,
+        }
+    }
+    if outcome.stores_updated + outcome.stores_already_hidden == 0 {
+        return Err(
+            "No writable Claude VS Code extension state store was found. Open Claude Code in VS Code, then try again."
+                .to_string(),
+        );
+    }
+    Ok(outcome)
+}
+
+/// Handle Claude's reversible session deletion. This intentionally updates the
+/// same private VS Code global-state field as the extension; it never removes a
+/// transcript file. Every readable editor flavor is updated so the union used
+/// by `--list-sessions` cannot leave the row active in another installed editor.
+pub fn run_hide_session(args: &[String]) -> i32 {
+    let Some(session_id) = extract_flag_value(args, "--hide-session") else {
+        eprintln!("{HIDE_USAGE}");
+        return 2;
+    };
+    if session_id.trim().is_empty() {
+        eprintln!("{HIDE_USAGE}");
+        return 2;
+    }
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    if provider != "claude" {
+        eprintln!("--hide-session supports only the claude provider (got '{provider}')");
+        return 2;
+    }
+    match hide_claude_session(&session_id, claude_global_state_dbs()) {
+        Ok(outcome) => emit_json(args, &outcome),
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 // ── Copilot (VS Code) session lifecycle: `orphan` and `archived` ─────────────
@@ -811,7 +935,12 @@ mod tests {
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             value["commands"],
-            json!(["dump-session", "list-sessions", "capabilities"])
+            json!([
+                "dump-session",
+                "list-sessions",
+                "hide-session",
+                "capabilities"
+            ])
         );
     }
 
@@ -1061,6 +1190,67 @@ mod tests {
             Some(vec!["hidden-1".to_string(), "hidden-2".to_string()])
         );
         assert_eq!(read_hidden_ids(&temp.path().join("missing.vscdb")), None);
+    }
+
+    #[test]
+    fn hide_session_updates_each_eligible_store_without_removing_other_state() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.vscdb");
+        let second = temp.path().join("second.vscdb");
+        let without_claude = temp.path().join("without-claude.vscdb");
+        create_item_table(
+            &first,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({"theme":"dark","hiddenSessionIds":["old"]}),
+            )],
+        );
+        create_item_table(&second, &[(CLAUDE_VSCODE_STATE_KEY, json!({"other":true}))]);
+        create_item_table(&without_claude, &[("other-extension", json!({"value":1}))]);
+
+        let outcome = hide_claude_session(
+            "new-session",
+            vec![first.clone(), second.clone(), without_claude.clone()],
+        )
+        .unwrap();
+        assert_eq!(outcome.stores_updated, 2);
+        assert_eq!(outcome.stores_already_hidden, 0);
+        assert_eq!(outcome.stores_unavailable, 0);
+        assert_eq!(
+            read_hidden_ids(&first),
+            Some(vec!["old".into(), "new-session".into()])
+        );
+        assert_eq!(read_hidden_ids(&second), Some(vec!["new-session".into()]));
+
+        let repeated = hide_claude_session(
+            "new-session",
+            vec![first.clone(), second.clone(), without_claude],
+        )
+        .unwrap();
+        assert_eq!(repeated.stores_updated, 0);
+        assert_eq!(repeated.stores_already_hidden, 2);
+        let conn = Connection::open(first).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                [CLAUDE_VSCODE_STATE_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&value).unwrap()["theme"],
+            "dark"
+        );
+    }
+
+    #[test]
+    fn hide_session_fails_when_no_store_can_persist_the_state() {
+        let temp = TempDir::new().unwrap();
+        let unrelated = temp.path().join("state.vscdb");
+        create_item_table(&unrelated, &[("other-extension", json!({"value":1}))]);
+
+        let err = hide_claude_session("session", vec![unrelated]).unwrap_err();
+        assert!(err.contains("No writable Claude VS Code extension state store"));
     }
 
     #[test]

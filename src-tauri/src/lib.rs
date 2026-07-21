@@ -110,6 +110,13 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_sessions(&args));
         }
+        // Claude VS Code's reversible session deletion (`hiddenSessionIds`).
+        if args
+            .iter()
+            .any(|a| a == "--hide-session" || a.starts_with("--hide-session="))
+        {
+            std::process::exit(headless_dump::run_hide_session(&args));
+        }
         // Headless capability/version probe (`--capabilities`), so callers can
         // confirm this build speaks the headless protocol before relying on it.
         if args.iter().any(|a| a == "--capabilities") {
