@@ -24,7 +24,10 @@
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::ProviderInfo;
-use crate::utils::{build_provider_message, find_line_ranges, search_json_value_case_insensitive};
+use crate::utils::{
+    build_provider_message, find_line_ranges, prompt_attachment_name, prompt_attachments_data,
+    search_json_value_case_insensitive,
+};
 use chrono::{DateTime, Utc};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
@@ -1007,7 +1010,7 @@ fn convert_user_message(
     let uuid = event_id
         .map(str::to_string)
         .unwrap_or_else(|| format!("copilot-cli-user-{counter}"));
-    Some(build_provider_message(
+    let mut message = build_provider_message(
         client.provider_id(),
         uuid,
         session_id,
@@ -1016,7 +1019,32 @@ fn convert_user_message(
         Some("user"),
         Some(body),
         None,
-    ))
+    );
+    let names = data
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|attachment| {
+            attachment
+                .get("type")
+                .or_else(|| attachment.get("kind"))
+                .and_then(Value::as_str)
+                == Some("file")
+        })
+        .filter_map(|attachment| {
+            // Current Copilot SDK events use `path` + `displayName`; retain the
+            // older `name` spelling as a compatibility fallback. Prefer `path`
+            // because displayName may be an arbitrary human label rather than
+            // the actual filename.
+            ["path", "displayName", "name", "fileName"]
+                .into_iter()
+                .filter_map(|key| attachment.get(key).and_then(Value::as_str))
+                .find(|value| !value.trim().is_empty())
+        })
+        .filter_map(prompt_attachment_name);
+    message.data = prompt_attachments_data(names);
+    Some(message)
 }
 
 fn convert_assistant_message(
@@ -1215,6 +1243,36 @@ mod tests {
     fn write_session(root: &Path, session_id: &str, lines: &[Value]) -> PathBuf {
         let session_dir = root.join("session-state").join(session_id);
         write_events(&session_dir, lines)
+    }
+
+    #[test]
+    fn user_message_keeps_explicit_attachment_names_only() {
+        let data = json!({
+            "content": "Review these",
+            "attachments": [
+                {"type": "file", "path": "/private/docs/report.md", "displayName": "Report source", "content": "private"},
+                {"kind": "image", "name": "screenshot.png", "content": "pixels"},
+                {"kind": "file", "name": "report.md", "content": "duplicate"}
+            ]
+        });
+        let mut counter = 0;
+        let message = convert_user_message(
+            &data,
+            Some("u1"),
+            "s1",
+            "2026-07-21T12:00:00Z",
+            &mut counter,
+            ClientKind::Cli,
+        )
+        .expect("user message");
+
+        assert_eq!(
+            message.data,
+            Some(json!({"promptAttachments": [{"name": "report.md"}]}))
+        );
+        let serialized = serde_json::to_string(&message).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("pixels"));
     }
 
     #[test]

@@ -1,7 +1,10 @@
 //! Session loading functions
 
 use crate::models::{ClaudeMessage, ClaudeSession, MessagePage, RawLogEntry};
-use crate::utils::{extract_project_name, find_line_ranges, find_line_starts};
+use crate::utils::{
+    extract_project_name, find_line_ranges, find_line_starts, prompt_attachment_name,
+    prompt_attachments_data,
+};
 use chrono::{DateTime, Utc};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -1752,6 +1755,26 @@ fn queued_command_prompt(attachment: Option<&serde_json::Value>) -> Option<serde
     att.get("prompt").filter(|p| p.is_array()).cloned()
 }
 
+/// Preserve the display name of a file the user explicitly attached to a
+/// prompt, without exposing its absolute path or embedded file contents. Claude
+/// records IDE-selected context separately as `edited_text_file`; accepting only
+/// the exact `file` subtype keeps those two concepts distinct.
+fn prompt_file_attachment_data(
+    attachment: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let attachment = attachment?;
+    if attachment.get("type").and_then(serde_json::Value::as_str) != Some("file") {
+        return None;
+    }
+
+    let display_name = ["displayPath", "filename"]
+        .into_iter()
+        .filter_map(|key| attachment.get(key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())?;
+    prompt_attachments_data([prompt_attachment_name(display_name)?])
+}
+
 /// Claude Code persists local slash-command UI traffic as ordinary user
 /// messages. Recognize only a complete reserved envelope: quoted tags or a
 /// wrapper followed by authored prose must remain ordinary user content.
@@ -1984,6 +2007,8 @@ fn parse_line_simd(
             (None, None, None, None, None, None)
         };
 
+    let prompt_attachment_data = prompt_file_attachment_data(log_entry.attachment.as_ref());
+
     Some(ClaudeMessage {
         uuid,
         parent_uuid: log_entry.parent_uuid,
@@ -2008,7 +2033,7 @@ fn parse_line_simd(
         message_id: message_id.or(log_entry.message_id),
         snapshot: log_entry.snapshot,
         is_snapshot_update: log_entry.is_snapshot_update,
-        data: log_entry.data,
+        data: prompt_attachment_data.or(log_entry.data),
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
@@ -4232,5 +4257,32 @@ mod tests {
         let msg = parse_line_simd(0, &mut bytes, false).expect("record still parses");
         assert_eq!(msg.message_type, "attachment");
         assert!(msg.role.is_none());
+    }
+
+    #[test]
+    fn prompt_file_attachment_keeps_only_its_basename() {
+        let line = r#"{"type":"attachment","uuid":"a1","parentUuid":"u1","sessionId":"s1","timestamp":"2026-07-21T12:00:00Z","attachment":{"type":"file","filename":"C:\\private\\project\\report.md","displayPath":"docs\\report.md","content":{"type":"text","text":"private contents"}}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("file attachment should parse");
+
+        assert_eq!(msg.message_type, "attachment");
+        assert_eq!(msg.parent_uuid.as_deref(), Some("u1"));
+        assert_eq!(
+            msg.data,
+            Some(serde_json::json!({"promptAttachments": [{"name": "report.md"}]}))
+        );
+        let serialized = serde_json::to_string(&msg).expect("serialize normalized message");
+        assert!(!serialized.contains("private contents"));
+        assert!(!serialized.contains("private\\\\project"));
+    }
+
+    #[test]
+    fn selected_editor_file_is_not_a_prompt_attachment() {
+        let line = r#"{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"2026-07-21T12:00:00Z","attachment":{"type":"edited_text_file","filename":"C:\\project\\selected.rs","snippet":"selected context"}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("editor attachment should parse");
+
+        assert_eq!(msg.message_type, "attachment");
+        assert!(msg.data.is_none());
     }
 }

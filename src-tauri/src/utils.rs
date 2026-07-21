@@ -478,6 +478,40 @@ where
     }
 }
 
+/// Reduce a provider-supplied prompt-attachment path/display label to a file
+/// name without depending on the host platform's path separator.
+pub fn prompt_attachment_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let name = value
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .find(|part| !part.is_empty())?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Provider-neutral normalized metadata for files explicitly attached to an
+/// authored prompt. Names are de-duplicated in provider order. The data is kept
+/// separate from tool/file facts and from IDE-selected context.
+pub fn prompt_attachments_data<I>(names: I) -> Option<Value>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut unique = Vec::<String>::new();
+    for name in names {
+        if !name.is_empty() && !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    if unique.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "promptAttachments": unique
+            .into_iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect::<Vec<_>>()
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Build a `ClaudeMessage` with common defaults for provider implementations.
 ///

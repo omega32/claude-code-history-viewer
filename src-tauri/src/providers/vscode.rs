@@ -20,7 +20,8 @@
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::ProviderInfo;
 use crate::utils::{
-    build_provider_message, is_symlink, ms_to_iso, search_json_value_case_insensitive,
+    build_provider_message, is_symlink, ms_to_iso, prompt_attachment_name, prompt_attachments_data,
+    search_json_value_case_insensitive,
 };
 use serde_json::Value;
 use std::fs;
@@ -667,7 +668,7 @@ fn messages_from_state(state: &Value) -> Vec<ClaudeMessage> {
                 .map(String::from)
                 .unwrap_or_else(|| format!("vscode-req-{idx}-{counter}"));
             let content = serde_json::json!([{ "type": "text", "text": text }]);
-            messages.push(build_provider_message(
+            let mut message = build_provider_message(
                 PROVIDER_ID,
                 uuid,
                 &session_id,
@@ -676,7 +677,9 @@ fn messages_from_state(state: &Value) -> Vec<ClaudeMessage> {
                 Some("user"),
                 Some(content),
                 None,
-            ));
+            );
+            message.data = prompt_attachments_data(prompt_attachment_names(req));
+            messages.push(message);
         }
 
         if let Some(assistant) =
@@ -740,6 +743,28 @@ fn extract_user_text(req: &Value) -> Option<String> {
     } else {
         Some(joined)
     }
+}
+
+/// Explicit files attached through Copilot Chat's prompt UI. Historical
+/// requests persist them as `kind:file` variables whose id is a real `file:`
+/// URI. IDE-selected/open context uses the distinct `vscode.implicit.*` ids and
+/// therefore cannot pass this classifier.
+fn prompt_attachment_names(req: &Value) -> Vec<String> {
+    req.get("variableData")
+        .and_then(|value| value.get("variables"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|variable| variable.get("kind").and_then(Value::as_str) == Some("file"))
+        .filter(|variable| {
+            variable
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("file:"))
+        })
+        .filter_map(|variable| variable.get("name").and_then(Value::as_str))
+        .filter_map(prompt_attachment_name)
+        .collect()
 }
 
 /// The conversation-compaction summary attached to a request's result, if any.
@@ -1651,6 +1676,33 @@ mod tests {
         assert_eq!(blocks[2]["id"], "tc-1");
         assert_eq!(blocks[3]["tool_use_id"], "tc-1");
         assert!(msgs[1].tool_use.is_some());
+    }
+
+    #[test]
+    fn messages_keep_explicit_prompt_files_but_not_implicit_editor_context() {
+        let state = json!({
+            "sessionId": "sess-attachments",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "message": {"text": "Review these"},
+                "variableData": {"variables": [
+                    {"kind": "file", "id": "file:///repo/docs/report.md", "name": "report.md", "value": "private"},
+                    {"kind": "file", "id": "vscode.implicit.selection", "name": "selected.rs", "value": "selected"},
+                    {"kind": "file", "id": "vscode.implicit.file", "name": "open.rs", "value": "open"}
+                ]}
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        assert_eq!(
+            messages[0].data,
+            Some(json!({"promptAttachments": [{"name": "report.md"}]}))
+        );
+        let serialized = serde_json::to_string(&messages[0]).unwrap();
+        assert!(!serialized.contains("selected.rs"));
+        assert!(!serialized.contains("open.rs"));
+        assert!(!serialized.contains("private"));
     }
 
     #[test]
