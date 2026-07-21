@@ -1606,11 +1606,16 @@ mod tests {
         let meta = parse_flat_yaml("name: |-\n  persona line one\n  persona line two\n");
         assert!(meta.name.is_none());
         for indicator in ["|", "|+", ">", ">-", ">+"] {
-            assert!(parse_flat_yaml(&format!("name: {indicator}\n")).name.is_none());
+            assert!(parse_flat_yaml(&format!("name: {indicator}\n"))
+                .name
+                .is_none());
         }
 
         // A plain single-line name still parses.
-        assert_eq!(parse_flat_yaml("name: Fix the build\n").name.as_deref(), Some("Fix the build"));
+        assert_eq!(
+            parse_flat_yaml("name: Fix the build\n").name.as_deref(),
+            Some("Fix the build")
+        );
     }
 
     #[test]

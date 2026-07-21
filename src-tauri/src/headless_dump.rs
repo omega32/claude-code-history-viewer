@@ -153,7 +153,9 @@ async fn resolve_session_path(provider: &str, id: &str) -> Result<String, String
                 by_stem.push(s.session_id);
             } else if s.actual_session_id == id {
                 by_id.push(s.session_id);
-            } else if s.actual_session_id.starts_with(id) || stem.is_some_and(|st| st.starts_with(id)) {
+            } else if s.actual_session_id.starts_with(id)
+                || stem.is_some_and(|st| st.starts_with(id))
+            {
                 by_prefix.push(s.session_id);
             }
         }
@@ -420,10 +422,10 @@ pub fn run_hide_session(args: &[String]) -> i32 {
 //     recency are dropped *from the index only* (the file stays). So a listed
 //     session whose id is absent from this index has aged out of the visible
 //     list — we mark it **orphan**.
-//   • `agentSessions.state.cache` — an *uncapped* array of `{resource, archived}`
-//     entries. `archived:true` on a `vscode-chat-session://local/<base64-id>`
-//     resource is an explicit, reversible hide (the file is kept) — we mark it
-//     **archived**.
+//   • `agentSessions.state.cache` — an *uncapped* array of session-state entries.
+//     `archived:true` on a `vscode-chat-session://local/<base64-id>` resource is
+//     an explicit, reversible hide (the file is kept), while `pinned:true` is the
+//     independent pinned-list state — we expose both facts.
 // A user *delete* removes the file outright, so it never reaches this listing and
 // needs no marker. `archived` takes precedence over `orphan` (an archived session
 // is deliberately hidden, not merely aged out), so a session is at most one of the
@@ -442,6 +444,8 @@ struct WorkspaceChatState {
     index_ids: Option<HashSet<String>>,
     /// Session ids marked `archived:true` in `agentSessions.state.cache`.
     archived_ids: HashSet<String>,
+    /// Session ids marked `pinned:true` in `agentSessions.state.cache`.
+    pinned_ids: HashSet<String>,
 }
 
 /// The workspace `state.vscdb` for a Copilot VS Code session, derived from the
@@ -751,20 +755,18 @@ pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
     }
 }
 
-/// Read a Copilot VS Code workspace's chat state (recent-list ids + archived ids)
-/// from its `state.vscdb`. Best-effort per key — a missing/locked db or key just
-/// yields the empty/`None` default.
+/// Read a Copilot VS Code workspace's chat state (recent-list, archived, and
+/// pinned ids) from its `state.vscdb`. Best-effort per key — a missing/locked db
+/// or key just yields the empty/`None` default.
 fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
     let mut state = WorkspaceChatState::default();
     let Ok(conn) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return state;
     };
     let read_value = |key: &str| -> Option<String> {
-        conn.query_row(
-            "SELECT value FROM ItemTable WHERE key = ?1",
-            [key],
-            |row| row.get(0),
-        )
+        conn.query_row("SELECT value FROM ItemTable WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
         .ok()
     };
     if let Some(value) = read_value(COPILOT_CHAT_INDEX_KEY) {
@@ -778,9 +780,15 @@ fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
         if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&value) {
             for entry in entries {
                 let archived = entry.get("archived").and_then(|a| a.as_bool()) == Some(true);
+                let pinned = entry.get("pinned").and_then(|p| p.as_bool()) == Some(true);
                 let resource = entry.get("resource").and_then(|r| r.as_str());
-                if let (true, Some(id)) = (archived, resource.and_then(decode_local_chat_resource)) {
-                    state.archived_ids.insert(id);
+                if let Some(id) = resource.and_then(decode_local_chat_resource) {
+                    if archived {
+                        state.archived_ids.insert(id.clone());
+                    }
+                    if pinned {
+                        state.pinned_ids.insert(id);
+                    }
                 }
             }
         }
@@ -788,7 +796,7 @@ fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
     state
 }
 
-/// Classifies Copilot VS Code sessions as `orphan` / `archived`, caching each
+/// Classifies Copilot VS Code sessions as `orphan` / `archived` / `pinned`, caching each
 /// workspace's `state.vscdb` read so a workspace with many sessions is read once.
 struct CopilotClassifier {
     enabled: bool,
@@ -804,14 +812,14 @@ impl CopilotClassifier {
         }
     }
 
-    /// Returns `(is_orphan, is_archived)` for a session — `(false, false)` unless
-    /// it's a Copilot VS Code session with a readable workspace state.
-    fn classify(&self, session: &ClaudeSession) -> (bool, bool) {
+    /// Returns `(is_orphan, is_archived, is_pinned)` for a session — all false
+    /// unless it's a Copilot VS Code session with readable workspace state.
+    fn classify(&self, session: &ClaudeSession) -> (bool, bool, bool) {
         if !self.enabled || session.entrypoint.as_deref() != Some(COPILOT_VSCODE_ENTRYPOINT) {
-            return (false, false);
+            return (false, false, false);
         }
         let Some(db) = copilot_workspace_state_db(&session.file_path) else {
-            return (false, false);
+            return (false, false, false);
         };
         let mut cache = self.cache.borrow_mut();
         let state = cache
@@ -819,6 +827,7 @@ impl CopilotClassifier {
             .or_insert_with(|| read_workspace_chat_state(&db));
         let id = &session.actual_session_id;
         let archived = state.archived_ids.contains(id);
+        let pinned = state.pinned_ids.contains(id);
         // Orphan only when the index was read and this id is absent — and not when
         // already archived (archived is the more specific, deliberate state).
         let orphan = !archived
@@ -826,7 +835,7 @@ impl CopilotClassifier {
                 .index_ids
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(id));
-        (orphan, archived)
+        (orphan, archived, pinned)
     }
 }
 
@@ -854,6 +863,9 @@ struct SessionWithProjectPath {
     /// this comes from `archived:true` in `agentSessions.state.cache`; for Codex,
     /// it records that the rollout was discovered under `archived_sessions`.
     is_archived: bool,
+    /// Copilot VS Code only: `pinned:true` in `agentSessions.state.cache`.
+    /// Independent of archive/orphan state and `false` for every other surface.
+    is_pinned: bool,
     /// Claude only: this local session was "teleported" — its conversation was
     /// relocated to a cloud (web) session and the local `.jsonl` emptied to a
     /// single `teleported-from` redirect stub. The normal metadata scan drops it
@@ -940,7 +952,11 @@ fn synthesize_teleport_session(
     let project_name = project_path
         .as_deref()
         .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
-        .or_else(|| path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()))
+        .or_else(|| {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+        })
         .unwrap_or("Unknown")
         .to_string();
     SessionWithProjectPath {
@@ -968,6 +984,7 @@ fn synthesize_teleport_session(
         is_hidden: false,
         is_orphan: false,
         is_archived: false,
+        is_pinned: false,
         is_teleported: true,
         is_imported: false,
         imported_from: None,
@@ -1020,7 +1037,7 @@ async fn list_sessions(
         HashSet::new()
     };
     let is_hidden = |session: &ClaudeSession| hidden.contains(&session.actual_session_id);
-    // Copilot VS Code orphan/archived classification (inert for other providers),
+    // Copilot VS Code orphan/archive/pin classification (inert for other providers),
     // caching each workspace's state.vscdb read across its sessions. Codex's
     // archived state is cheaper and authoritative: it is the scan-root provenance.
     let copilot = CopilotClassifier::new(provider);
@@ -1032,7 +1049,7 @@ async fn list_sessions(
         HashMap::new()
     };
     let wrap = |session: ClaudeSession, project_path: Option<String>| {
-        let (is_orphan, copilot_archived) = copilot.classify(&session);
+        let (is_orphan, copilot_archived, is_pinned) = copilot.classify(&session);
         let is_archived = copilot_archived
             || (provider == "codex"
                 && codex::is_archived_session_path(Path::new(&session.file_path)));
@@ -1045,6 +1062,7 @@ async fn list_sessions(
             is_hidden: is_hidden(&session),
             is_orphan,
             is_archived,
+            is_pinned,
             is_teleported: false,
             is_imported,
             imported_from,
@@ -1062,13 +1080,19 @@ async fn list_sessions(
         }
         let sessions =
             load_provider_sessions(provider.to_string(), path.to_string(), Some(true)).await?;
-        let mut wrapped: Vec<SessionWithProjectPath> =
-            sessions.into_iter().map(|session| wrap(session, None)).collect();
+        let mut wrapped: Vec<SessionWithProjectPath> = sessions
+            .into_iter()
+            .map(|session| wrap(session, None))
+            .collect();
         // Teleport stubs (Claude only) are dropped by the metadata scan; re-surface
         // any in this storage dir that weren't already listed.
         if provider == "claude" {
             let listed = listed_paths(&wrapped);
-            wrapped.extend(scan_teleport_stubs(std::path::Path::new(path), &listed, None));
+            wrapped.extend(scan_teleport_stubs(
+                std::path::Path::new(path),
+                &listed,
+                None,
+            ));
         }
         return Ok(wrapped);
     }
@@ -1448,6 +1472,7 @@ mod tests {
             is_hidden: true,
             is_orphan: false,
             is_archived: false,
+            is_pinned: false,
             is_teleported: false,
             is_imported: false,
             imported_from: None,
@@ -1457,6 +1482,7 @@ mod tests {
         let value = serde_json::to_value(wrapped).unwrap();
         assert_eq!(value["project_path"], r"C:\work\decoded-project");
         assert_eq!(value["is_hidden"], true);
+        assert_eq!(value["is_pinned"], false);
         assert!(
             value.get("session").is_none(),
             "ClaudeSession must stay flattened"
@@ -1554,13 +1580,22 @@ mod tests {
             "{COPILOT_LOCAL_RESOURCE_PREFIX}{}",
             BASE64_STANDARD.encode("archived")
         );
+        let pinned_resource = local_chat_resource("pinned");
+        let both_resource = local_chat_resource("both");
         create_item_table(
             &db,
             &[
-                (COPILOT_CHAT_INDEX_KEY, json!({"entries":{"recent":{}}})),
+                (
+                    COPILOT_CHAT_INDEX_KEY,
+                    json!({"entries":{"recent":{},"pinned":{},"both":{}}}),
+                ),
                 (
                     COPILOT_AGENT_STATE_KEY,
-                    json!([{"resource":archived_resource,"archived":true}]),
+                    json!([
+                        {"resource":archived_resource,"archived":true},
+                        {"resource":pinned_resource,"pinned":true},
+                        {"resource":both_resource,"archived":true,"pinned":true}
+                    ]),
                 ),
             ],
         );
@@ -1572,7 +1607,7 @@ mod tests {
                 "recent",
                 Some(COPILOT_VSCODE_ENTRYPOINT)
             )),
-            (false, false)
+            (false, false, false)
         );
         assert_eq!(
             classifier.classify(&session(
@@ -1580,7 +1615,7 @@ mod tests {
                 "orphan",
                 Some(COPILOT_VSCODE_ENTRYPOINT)
             )),
-            (true, false)
+            (true, false, false)
         );
         assert_eq!(
             classifier.classify(&session(
@@ -1588,8 +1623,25 @@ mod tests {
                 "archived",
                 Some(COPILOT_VSCODE_ENTRYPOINT)
             )),
-            (false, true),
+            (false, true, false),
             "archive must take precedence over absence from the recent index"
+        );
+        assert_eq!(
+            classifier.classify(&session(
+                &chats.join("pinned.jsonl"),
+                "pinned",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (false, false, true)
+        );
+        assert_eq!(
+            classifier.classify(&session(
+                &chats.join("both.jsonl"),
+                "both",
+                Some(COPILOT_VSCODE_ENTRYPOINT)
+            )),
+            (false, true, true),
+            "pinning is independent of archive state"
         );
         assert_eq!(
             CopilotClassifier::new("claude").classify(&session(
@@ -1597,7 +1649,7 @@ mod tests {
                 "orphan",
                 Some(COPILOT_VSCODE_ENTRYPOINT)
             )),
-            (false, false)
+            (false, false, false)
         );
     }
 
@@ -1702,7 +1754,7 @@ mod tests {
             "unknown",
             Some(COPILOT_VSCODE_ENTRYPOINT),
         ));
-        assert_eq!(result, (false, false));
+        assert_eq!(result, (false, false, false));
     }
 
     #[test]

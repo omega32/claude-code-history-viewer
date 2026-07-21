@@ -1168,7 +1168,11 @@ fn probe_cached(
     let metadata = probe_session_metadata(path)?;
     next.entries.insert(
         key,
-        CachedSessionMetadata { modified_time, file_size, metadata: metadata.clone() },
+        CachedSessionMetadata {
+            modified_time,
+            file_size,
+            metadata: metadata.clone(),
+        },
     );
     Some(metadata)
 }
@@ -1210,7 +1214,8 @@ fn list_session_metadata(chat_dir: &Path) -> Result<Vec<(PathBuf, SessionMetadat
 /// Text of a VS Code message field that is either a markdown object
 /// (`{value, uris?, …}`) or a bare string.
 fn markdown_or_str(m: &Value) -> Option<&str> {
-    m.as_str().or_else(|| m.get("value").and_then(Value::as_str))
+    m.as_str()
+        .or_else(|| m.get("value").and_then(Value::as_str))
 }
 
 /// True when `text` (ignoring surrounding whitespace) is *only* a Markdown
@@ -1223,7 +1228,9 @@ fn markdown_or_str(m: &Value) -> Option<&str> {
 /// *inside* the fences (so the remainder contains a newline), and is never matched.
 fn is_fence_delimiter_only(text: &str) -> bool {
     match text.trim().strip_prefix("```") {
-        Some(rest) => rest.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+        Some(rest) => rest
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
         None => false,
     }
 }
@@ -1278,9 +1285,7 @@ fn todo_list_items(part: &Value) -> Option<Value> {
 /// 3) the decoded URI/path itself
 fn inline_reference_text(part: &Value) -> Option<String> {
     fn non_empty(v: Option<&str>) -> Option<String> {
-        v.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
+        v.map(str::trim).filter(|s| !s.is_empty()).map(String::from)
     }
 
     fn field_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -1307,7 +1312,7 @@ fn inline_reference_text(part: &Value) -> Option<String> {
         }
 
         let without_fragment = decoded.split('#').next().unwrap_or(decoded.as_str());
-        let trimmed = without_fragment.trim_end_matches(['/','\\']);
+        let trimmed = without_fragment.trim_end_matches(['/', '\\']);
         let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
         if !basename.is_empty() {
             Some(basename.to_string())
@@ -1394,7 +1399,11 @@ fn map_question_carousel(carousel: &Value) -> (Vec<Value>, String) {
             .and_then(|qid| data.and_then(|d| d.get(qid)))
             .and_then(selected_answer)
         {
-            answers.push(if title.is_empty() { ans } else { format!("{title}: {ans}") });
+            answers.push(if title.is_empty() {
+                ans
+            } else {
+                format!("{title}: {ans}")
+            });
         }
     }
     (mapped, answers.join("\n"))
@@ -1406,7 +1415,11 @@ fn selected_answer(entry: &Value) -> Option<String> {
     match entry.get("selectedValue") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         Some(Value::Array(arr)) => {
-            let joined = arr.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            let joined = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
             (!joined.is_empty()).then_some(joined)
         }
         _ => None,
@@ -1725,7 +1738,10 @@ mod tests {
             .collect();
         // Consecutive plain-text and inlineReference spans from the same response are
         // coalesced into one text block; no blank lines are inserted between them.
-        assert_eq!(texts, vec!["Main reference: README.md, secondary: Phase 1 plan"]);
+        assert_eq!(
+            texts,
+            vec!["Main reference: README.md, secondary: Phase 1 plan"]
+        );
     }
 
     #[test]
@@ -1782,18 +1798,30 @@ mod tests {
             "summaries": [{"text": "structured"}],
             "summary": "flat"
         }}});
-        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("structured"));
+        assert_eq!(
+            extract_compaction_summary(&req).as_deref(),
+            Some("structured")
+        );
         // falls back to the flat `summary`.
         let req = json!({"result": {"metadata": {"summary": "flat only"}}});
-        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("flat only"));
+        assert_eq!(
+            extract_compaction_summary(&req).as_deref(),
+            Some("flat only")
+        );
         // joins multiple non-empty summaries, skipping blanks.
         let req = json!({"result": {"metadata": {
             "summaries": [{"text": "a"}, {"text": ""}, {"text": "b"}]
         }}});
         assert_eq!(extract_compaction_summary(&req).as_deref(), Some("a\n\nb"));
         // none when absent.
-        assert_eq!(extract_compaction_summary(&json!({"result": {"metadata": {}}})), None);
-        assert_eq!(extract_compaction_summary(&json!({"message": {"text": "x"}})), None);
+        assert_eq!(
+            extract_compaction_summary(&json!({"result": {"metadata": {}}})),
+            None
+        );
+        assert_eq!(
+            extract_compaction_summary(&json!({"message": {"text": "x"}})),
+            None
+        );
     }
 
     #[test]
@@ -1867,7 +1895,10 @@ mod tests {
         let msgs = messages_from_state(&state);
         let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
         assert_eq!(blocks[0]["input"]["path"], "/e:/proj/a.ps1");
-        assert_eq!(blocks[0]["input"]["message"], "Reading [](file:///e%3A/proj/a.ps1)");
+        assert_eq!(
+            blocks[0]["input"]["message"],
+            "Reading [](file:///e%3A/proj/a.ps1)"
+        );
         assert_eq!(blocks[1]["input"]["command"], "dir /b");
         assert!(blocks[1]["input"].get("path").is_none());
         assert_eq!(blocks[2]["input"]["message"], "Apply Patch");
@@ -2122,8 +2153,18 @@ mod tests {
         // Seed a cache entry whose metadata differs from a real probe, stamped
         // with the file's actual (mtime, size) so it's considered fresh.
         let (modified_time, file_size) = file_freshness(&path).unwrap();
-        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
-        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        let mut cache = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION,
+            entries: Default::default(),
+        };
+        cache.entries.insert(
+            file,
+            CachedSessionMetadata {
+                modified_time,
+                file_size,
+                metadata: sentinel_meta(),
+            },
+        );
         save_metadata_cache(&chat, &cache);
 
         let listed = list_session_metadata(&chat).unwrap();
@@ -2138,9 +2179,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (chat, file, path) = seed_session(&tmp, "bbbb");
         let (modified_time, file_size) = file_freshness(&path).unwrap();
-        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
+        let mut cache = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION,
+            entries: Default::default(),
+        };
         // Wrong size → stale entry → real probe runs (append-only ⇒ size always moves).
-        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size: file_size + 1, metadata: sentinel_meta() });
+        cache.entries.insert(
+            file,
+            CachedSessionMetadata {
+                modified_time,
+                file_size: file_size + 1,
+                metadata: sentinel_meta(),
+            },
+        );
         save_metadata_cache(&chat, &cache);
 
         let listed = list_session_metadata(&chat).unwrap();
@@ -2153,13 +2204,23 @@ mod tests {
         let (chat, file, path) = seed_session(&tmp, "cccc");
         let (modified_time, file_size) = file_freshness(&path).unwrap();
         // Right freshness but wrong version → the whole cache is dropped.
-        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION + 1, entries: Default::default() };
-        cache.entries.insert(file, CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        let mut cache = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION + 1,
+            entries: Default::default(),
+        };
+        cache.entries.insert(
+            file,
+            CachedSessionMetadata {
+                modified_time,
+                file_size,
+                metadata: sentinel_meta(),
+            },
+        );
         save_metadata_cache(&chat, &cache);
 
         let listed = list_session_metadata(&chat).unwrap();
         assert_eq!(listed[0].1.session_id, "real"); // stale-version cache ignored
-        // …and the freshly written cache is at the current version.
+                                                    // …and the freshly written cache is at the current version.
         assert_eq!(load_metadata_cache(&chat).version, METADATA_CACHE_VERSION);
     }
 
@@ -2168,9 +2229,26 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (chat, file, path) = seed_session(&tmp, "dddd");
         let (modified_time, file_size) = file_freshness(&path).unwrap();
-        let mut cache = SessionMetadataCache { version: METADATA_CACHE_VERSION, entries: Default::default() };
-        cache.entries.insert(file.clone(), CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
-        cache.entries.insert("ghost.jsonl".into(), CachedSessionMetadata { modified_time, file_size, metadata: sentinel_meta() });
+        let mut cache = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION,
+            entries: Default::default(),
+        };
+        cache.entries.insert(
+            file.clone(),
+            CachedSessionMetadata {
+                modified_time,
+                file_size,
+                metadata: sentinel_meta(),
+            },
+        );
+        cache.entries.insert(
+            "ghost.jsonl".into(),
+            CachedSessionMetadata {
+                modified_time,
+                file_size,
+                metadata: sentinel_meta(),
+            },
+        );
         save_metadata_cache(&chat, &cache);
 
         list_session_metadata(&chat).unwrap();
@@ -2189,7 +2267,10 @@ mod tests {
         assert_eq!(listed[0].1.session_id, "real");
         let cached = load_metadata_cache(&chat);
         assert_eq!(cached.version, METADATA_CACHE_VERSION);
-        assert_eq!(cached.entries.get(&file).unwrap().metadata.session_id, "real");
+        assert_eq!(
+            cached.entries.get(&file).unwrap().metadata.session_id,
+            "real"
+        );
     }
 
     #[test]
