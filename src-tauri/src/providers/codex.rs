@@ -1971,9 +1971,7 @@ fn extract_tool_result_block(msg: &ClaudeMessage) -> Option<(String, Value)> {
 }
 
 fn matching_tool_use_name<'a>(msg: &'a ClaudeMessage, tool_use_id: &str) -> Option<&'a str> {
-    let Some(arr) = msg.content.as_ref().and_then(Value::as_array) else {
-        return None;
-    };
+    let arr = msg.content.as_ref().and_then(Value::as_array)?;
     arr.iter()
         .find(|item| {
             item.get("type").and_then(Value::as_str) == Some("tool_use")

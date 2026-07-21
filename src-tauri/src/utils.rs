@@ -482,9 +482,7 @@ where
 /// name without depending on the host platform's path separator.
 pub fn prompt_attachment_name(value: &str) -> Option<String> {
     let value = value.trim();
-    let name = value
-        .rsplit(|ch| ch == '/' || ch == '\\')
-        .find(|part| !part.is_empty())?;
+    let name = value.rsplit(['/', '\\']).find(|part| !part.is_empty())?;
     (!name.is_empty()).then(|| name.to_string())
 }
 

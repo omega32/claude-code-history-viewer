@@ -1,7 +1,7 @@
-//! Claude for PowerPoint provider.
+//! Claude for `PowerPoint` provider.
 //!
-//! The Office add-in persists chat history in the WebView2 profile's Chromium
-//! IndexedDB store (`https_pivot.claude.ai_0`). Values are V8 structured-clone
+//! The Office add-in persists chat history in the `WebView2` profile's Chromium
+//! `IndexedDB` store (`https_pivot.claude.ai_0`). Values are V8 structured-clone
 //! payloads. Chromium may Snappy-compress them and moves large values to the
 //! adjacent `.indexeddb.blob` directory.
 
@@ -182,15 +182,15 @@ fn find_stores_from(override_value: Option<&str>, data_local: Option<&Path>) -> 
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_dir() && entry.file_name() == STORE_DIR)
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .collect::<Vec<_>>();
     stores.sort();
     stores.dedup();
     stores
 }
 
-/// Copy the live LevelDB and blob directory before opening it. Chromium keeps a
-/// lock while PowerPoint is running; a snapshot avoids contending for that lock
+/// Copy the live `LevelDB` and blob directory before opening it. Chromium keeps a
+/// lock while `PowerPoint` is running; a snapshot avoids contending for that lock
 /// and guarantees that this read-only provider never mutates Office's store.
 fn snapshot_store(store: &Path) -> Result<(TempDir, PathBuf, PathBuf), String> {
     let temp = tempfile::Builder::new()
@@ -329,7 +329,7 @@ impl KeyPrefix {
 
 fn little_uint(bytes: &[u8]) -> u64 {
     bytes.iter().enumerate().fold(0, |value, (index, byte)| {
-        value | ((*byte as u64) << (index * 8))
+        value | (u64::from(*byte) << (index * 8))
     })
 }
 
@@ -429,7 +429,7 @@ fn blob_path(root: &Path, database_id: u64, blob_number: u64) -> Result<PathBuf,
         .find(|entry| {
             entry.file_type().is_file() && entry.file_name().to_string_lossy() == filename
         })
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .ok_or_else(|| format!("PowerPoint wrapper blob {database_id}/{blob_number} is missing"))
 }
 
@@ -502,7 +502,7 @@ fn parse_chat_session(root: &Value) -> Option<ChatSession> {
                 Some(Value::Array(vec![tool_use_block(object)])),
                 model.clone(),
             );
-            use_message.parent_uuid = parent.clone();
+            use_message.parent_uuid.clone_from(&parent);
             parent = Some(use_uuid);
             messages.push(use_message);
 
@@ -518,7 +518,7 @@ fn parse_chat_session(root: &Value) -> Option<ChatSession> {
                     Some(Value::Array(vec![tool_result_block(object)])),
                     None,
                 );
-                result_message.parent_uuid = parent.clone();
+                result_message.parent_uuid.clone_from(&parent);
                 parent = Some(result_uuid);
                 messages.push(result_message);
             }
@@ -552,7 +552,7 @@ fn parse_chat_session(root: &Value) -> Option<ChatSession> {
             Some(Value::Array(blocks)),
             model,
         );
-        message.parent_uuid = parent.clone();
+        message.parent_uuid.clone_from(&parent);
         parent = Some(uuid);
         messages.push(message);
     }
@@ -815,7 +815,7 @@ impl<'a> Cursor<'a> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
             let byte = self.byte()?;
-            value |= ((byte & 0x7f) as u64) << shift;
+            value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
             }
@@ -844,9 +844,9 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Minimal V8 ValueSerializer reader for the plain JS data types emitted by the
-/// PowerPoint chat store. Unsupported host objects fail the individual record;
-/// other IndexedDB object stores are then simply skipped.
+/// Minimal V8 `ValueSerializer` reader for the plain JS data types emitted by the
+/// `PowerPoint` chat store. Unsupported host objects fail the individual record;
+/// other `IndexedDB` object stores are then simply skipped.
 struct V8Reader<'a> {
     cursor: Cursor<'a>,
     references: Vec<Value>,
@@ -905,7 +905,10 @@ impl<'a> V8Reader<'a> {
             b'F' => Ok(Value::Bool(false)),
             b'I' => {
                 let encoded = self.cursor.varint()? as u32;
-                let value = ((encoded >> 1) as i32) ^ (-((encoded & 1) as i32));
+                let magnitude = i64::from(encoded >> 1);
+                let sign = -i64::from(encoded & 1);
+                let value = i32::try_from(magnitude ^ sign)
+                    .map_err(|_| "PowerPoint zigzag integer is out of range")?;
                 Ok(Value::Number(Number::from(value)))
             }
             b'U' => Ok(Value::Number(Number::from(self.cursor.varint()?))),
@@ -955,17 +958,17 @@ impl<'a> V8Reader<'a> {
             b'a' => self.sparse_array(),
             b';' => self.map(),
             b'\'' => self.set(),
-            b'y' => self.boxed(Value::Bool(true)),
-            b'x' => self.boxed(Value::Bool(false)),
+            b'y' => Ok(self.boxed(Value::Bool(true))),
+            b'x' => Ok(self.boxed(Value::Bool(false))),
             b'n' => {
                 let value = self.double_value()?;
-                self.boxed(value)
+                Ok(self.boxed(value))
             }
             b's' => {
                 let length = self.cursor.varint()? as usize;
                 let bytes = self.cursor.bytes(length)?;
                 let value = Value::String(String::from_utf8_lossy(bytes).into_owned());
-                self.boxed(value)
+                Ok(self.boxed(value))
             }
             b'B' | b'C' => self.array_buffer(false),
             b'~' => self.array_buffer(true),
@@ -1094,10 +1097,10 @@ impl<'a> V8Reader<'a> {
         Ok(value)
     }
 
-    fn boxed(&mut self, value: Value) -> Result<Value, String> {
+    fn boxed(&mut self, value: Value) -> Value {
         let id = self.reserve_reference();
         self.set_reference(id, &value);
-        Ok(value)
+        value
     }
 
     fn array_buffer(&mut self, resizable: bool) -> Result<Value, String> {

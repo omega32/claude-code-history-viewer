@@ -41,9 +41,16 @@ const HEADLESS_API_VERSION: u32 = 1;
 /// on the first poll; the `Pending` arm is defensive and never expected here.
 /// Uses the safe no-op waker (the crate denies `unsafe`).
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    use std::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
 
-    let mut cx = Context::from_waker(Waker::noop());
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
     let mut future = Box::pin(future);
     loop {
         match future.as_mut().poll(&mut cx) {
@@ -64,18 +71,17 @@ fn emit_json<T: serde::Serialize>(args: &[String], value: &T) -> i32 {
             return 1;
         }
     };
-    match extract_flag_value(args, "--output") {
-        Some(path) => match std::fs::write(&path, json.as_bytes()) {
+    if let Some(path) = extract_flag_value(args, "--output") {
+        match std::fs::write(&path, json.as_bytes()) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("Failed to write {path}: {e}");
                 1
             }
-        },
-        None => {
-            println!("{json}");
-            0
         }
+    } else {
+        println!("{json}");
+        0
     }
 }
 
@@ -219,7 +225,7 @@ project directory) when known. --provider defaults to 'claude'.";
 /// These helpers read that list so `--list-sessions` can stamp `is_hidden`,
 /// letting a caller mark such sessions instead of showing them as active.
 ///
-/// The store is `<user-data>/globalStorage/state.vscdb` (an SQLite DB with one
+/// The store is `<user-data>/globalStorage/state.vscdb` (an `SQLite` DB with one
 /// `ItemTable(key, value)`); the extension's blob lives under key
 /// `Anthropic.claude-code`. The list is global (keyed by session id, not path),
 /// so we union it across every installed editor flavor. Best-effort throughout:
@@ -437,6 +443,7 @@ const COPILOT_VSCODE_ENTRYPOINT: &str = "copilot-vscode";
 const COPILOT_LOCAL_RESOURCE_PREFIX: &str = "vscode-chat-session://local/";
 
 #[derive(Default)]
+#[allow(clippy::struct_field_names)]
 struct WorkspaceChatState {
     /// Session ids in `chat.ChatSessionStore.index` (VS Code's recent list).
     /// `None` when the index couldn't be read — so orphan is never asserted on a
@@ -655,7 +662,7 @@ fn set_copilot_archive_in_db(
             .ok_or_else(|| "Copilot session state entry is not a JSON object".to_string())?;
         let current_archived = state
             .get("archived")
-            .and_then(|value| value.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if current_archived != archived {
             state.insert("archived".to_string(), serde_json::Value::Bool(archived));
@@ -664,7 +671,7 @@ fn set_copilot_archive_in_db(
         if archived {
             let previous = state
                 .get("read")
-                .and_then(|value| value.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
             if previous < now_ms {
                 state.insert("read".to_string(), serde_json::Value::Number(now_ms.into()));
@@ -779,8 +786,9 @@ fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
     if let Some(value) = read_value(COPILOT_AGENT_STATE_KEY) {
         if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&value) {
             for entry in entries {
-                let archived = entry.get("archived").and_then(|a| a.as_bool()) == Some(true);
-                let pinned = entry.get("pinned").and_then(|p| p.as_bool()) == Some(true);
+                let archived =
+                    entry.get("archived").and_then(serde_json::Value::as_bool) == Some(true);
+                let pinned = entry.get("pinned").and_then(serde_json::Value::as_bool) == Some(true);
                 let resource = entry.get("resource").and_then(|r| r.as_str());
                 if let Some(id) = resource.and_then(decode_local_chat_resource) {
                     if archived {
@@ -845,6 +853,7 @@ impl CopilotClassifier {
 /// lossy storage-folder encoding. Omitted when not known (an explicit
 /// `--project` storage path is not resolved back to its decoded form).
 #[derive(serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct SessionWithProjectPath {
     #[serde(flatten)]
     session: ClaudeSession,
@@ -915,6 +924,7 @@ struct TeleportStubRecord {
 /// field was absent). An outer `None` means "not a teleport stub". Best-effort:
 /// any read/parse failure, or a file larger than a stub, is treated as "not a
 /// stub" (a real session is far larger and never reaches here anyway).
+#[allow(clippy::option_option)]
 fn read_teleport_stub(path: &Path) -> Option<Option<String>> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > TELEPORT_STUB_MAX_BYTES {

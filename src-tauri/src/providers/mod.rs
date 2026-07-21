@@ -75,7 +75,7 @@ pub enum ProviderId {
     Pi,
     /// oh-my-pi (`omp`) — a `pi` fork with the same session format under `~/.omp`.
     Ompi,
-    /// Claude for PowerPoint — local WebView2 IndexedDB chat history.
+    /// Claude for `PowerPoint` — local `WebView2` `IndexedDB` chat history.
     PowerPoint,
     /// Qwen Code (Gemini-CLI fork) — JSONL transcripts under `~/.qwen/projects`.
     Qwen,

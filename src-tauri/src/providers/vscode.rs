@@ -1245,8 +1245,8 @@ fn markdown_or_str(m: &Value) -> Option<&str> {
 
 /// True when `text` (ignoring surrounding whitespace) is *only* a Markdown
 /// code-fence delimiter: three backticks, optionally followed by a bare language
-/// token (letters/digits/`-`/`_`) and nothing else — e.g. `"\n```\n"` or
-/// ```"```json"```. VS Code Copilot Chat wraps a tool invocation in a fenced block
+/// token (letters/digits, hyphen, or underscore) and nothing else. VS Code
+/// Copilot Chat wraps a tool invocation in a fenced block
 /// and persists the opening/closing fences as their own standalone markdown parts;
 /// these carry no model-authored prose and would render as empty code blocks, so
 /// they are dropped. A real code block arrives as a single part with its code
@@ -1339,10 +1339,10 @@ fn inline_reference_text(part: &Value) -> Option<String> {
         let without_fragment = decoded.split('#').next().unwrap_or(decoded.as_str());
         let trimmed = without_fragment.trim_end_matches(['/', '\\']);
         let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
-        if !basename.is_empty() {
-            Some(basename.to_string())
-        } else {
+        if basename.is_empty() {
             Some(decoded)
+        } else {
+            Some(basename.to_string())
         }
     }
 
@@ -1389,7 +1389,7 @@ fn question_carousels(response: &[Value]) -> std::collections::HashMap<String, V
     map
 }
 
-/// Map a `questionCarousel` to the AskUserQuestion `input.questions` shape
+/// Map a `questionCarousel` to the `AskUserQuestion` `input.questions` shape
 /// (`{question, header, options:[{label}], multiSelect}`) and collect the user's
 /// answers as readable text. A question's answer is `carousel.data[q.id].selectedValue`;
 /// each answered question adds one `header: value` line. Returns `(questions, answers)`.
@@ -2167,7 +2167,7 @@ mod tests {
 
     // ── Metadata cache (A4) ─────────────────────────────────────────────────
 
-    /// Write one real session file and return (chat_dir, filename, path).
+    /// Write one real session file and return (`chat_dir`, filename, path).
     fn seed_session(tmp: &tempfile::TempDir, name: &str) -> (PathBuf, String, PathBuf) {
         let chat = tmp.path().join("chatSessions");
         fs::create_dir_all(&chat).unwrap();
@@ -2207,7 +2207,7 @@ mod tests {
         let (modified_time, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
-            entries: Default::default(),
+            entries: std::collections::HashMap::default(),
         };
         cache.entries.insert(
             file,
@@ -2233,7 +2233,7 @@ mod tests {
         let (modified_time, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
-            entries: Default::default(),
+            entries: std::collections::HashMap::default(),
         };
         // Wrong size → stale entry → real probe runs (append-only ⇒ size always moves).
         cache.entries.insert(
@@ -2258,7 +2258,7 @@ mod tests {
         // Right freshness but wrong version → the whole cache is dropped.
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION + 1,
-            entries: Default::default(),
+            entries: std::collections::HashMap::default(),
         };
         cache.entries.insert(
             file,
@@ -2283,7 +2283,7 @@ mod tests {
         let (modified_time, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
-            entries: Default::default(),
+            entries: std::collections::HashMap::default(),
         };
         cache.entries.insert(
             file.clone(),
