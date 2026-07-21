@@ -16,8 +16,9 @@
 //! Two companion commands share this file: `--list-sessions` (which also stamps
 //! each session with its decoded project directory, so callers can match the cwd
 //! without reproducing Claude's storage-path encoding), `--hide-session` (Claude's
-//! reversible VS Code deletion state), and `--capabilities` (a tiny version/feature
-//! probe so callers can fail fast on an incompatible build).
+//! reversible VS Code deletion state), `--archive-session` / `--unarchive-session`
+//! (Copilot VS Code's per-workspace archive state), and `--capabilities` (a tiny
+//! version/feature probe so callers can fail fast on an incompatible build).
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
@@ -27,7 +28,7 @@ use crate::models::ClaudeSession;
 use crate::providers::codex;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,8 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "dump-session",
             "list-sessions",
             "hide-session",
+            "archive-session",
+            "unarchive-session",
             "capabilities",
         ],
     };
@@ -461,6 +464,291 @@ fn copilot_workspace_state_db(file_path: &str) -> Option<PathBuf> {
 fn decode_local_chat_resource(resource: &str) -> Option<String> {
     let b64 = resource.strip_prefix(COPILOT_LOCAL_RESOURCE_PREFIX)?;
     String::from_utf8(BASE64_STANDARD.decode(b64).ok()?).ok()
+}
+
+fn local_chat_resource(session_id: &str) -> String {
+    format!(
+        "{COPILOT_LOCAL_RESOURCE_PREFIX}{}",
+        BASE64_STANDARD.encode(session_id)
+    )
+}
+
+/// VS Code-family flavor that owns one workspace-state database. The database
+/// path itself is authoritative even for custom user-data locations because the
+/// final shape remains `<flavor>/User/workspaceStorage/<hash>/state.vscdb`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorFlavor {
+    Code,
+    CodeInsiders,
+    Vscodium,
+}
+
+impl EditorFlavor {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Code => "Visual Studio Code",
+            Self::CodeInsiders => "Visual Studio Code Insiders",
+            Self::Vscodium => "VSCodium",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn process_name(self) -> &'static str {
+        match self {
+            Self::Code => "Code.exe",
+            Self::CodeInsiders => "Code - Insiders.exe",
+            Self::Vscodium => "VSCodium.exe",
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn process_needles(self) -> &'static [&'static str] {
+        match self {
+            Self::Code => &[
+                "/visual studio code.app/",
+                "/usr/share/code/code",
+                "/bin/code",
+            ],
+            Self::CodeInsiders => &[
+                "/visual studio code - insiders.app/",
+                "/usr/share/code-insiders/code-insiders",
+                "/bin/code-insiders",
+            ],
+            Self::Vscodium => &["/vscodium.app/", "/usr/share/codium/codium", "/bin/codium"],
+        }
+    }
+}
+
+fn editor_flavor_for_state_db(db: &Path) -> Option<EditorFlavor> {
+    let workspace = db.parent()?;
+    let workspace_storage = workspace.parent()?;
+    if workspace_storage.file_name()?.to_str()? != "workspaceStorage" {
+        return None;
+    }
+    let user = workspace_storage.parent()?;
+    if user.file_name()?.to_str()? != "User" {
+        return None;
+    }
+    let flavor = user.parent()?.file_name()?.to_str()?;
+    match flavor {
+        "Code" => Some(EditorFlavor::Code),
+        "Code - Insiders" => Some(EditorFlavor::CodeInsiders),
+        "VSCodium" => Some(EditorFlavor::Vscodium),
+        _ => None,
+    }
+}
+
+/// External edits to VS Code workspace state can be overwritten by the editor's
+/// in-memory cache on its next save. Refuse unless the owning flavor is stopped;
+/// an inability to inspect processes is also a refusal, never silent best effort.
+fn ensure_editor_stopped(db: &Path) -> Result<(), String> {
+    let flavor = editor_flavor_for_state_db(db).ok_or_else(|| {
+        format!(
+            "Cannot identify the VS Code flavor that owns {}",
+            db.display()
+        )
+    })?;
+
+    #[cfg(target_os = "windows")]
+    let running = {
+        let image_filter = format!("IMAGENAME eq {}", flavor.process_name());
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &image_filter, "/FO", "CSV", "/NH"])
+            .output()
+            .map_err(|e| format!("Failed to inspect running editor processes: {e}"))?;
+        if !output.status.success() {
+            return Err(
+                "Failed to inspect running editor processes; archive state was not changed"
+                    .to_string(),
+            );
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains(&flavor.process_name().to_ascii_lowercase())
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let running = {
+        let output = std::process::Command::new("ps")
+            .args(["-A", "-o", "command="])
+            .output()
+            .map_err(|e| format!("Failed to inspect running editor processes: {e}"))?;
+        if !output.status.success() {
+            return Err(
+                "Failed to inspect running editor processes; archive state was not changed"
+                    .to_string(),
+            );
+        }
+        let processes = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        flavor
+            .process_needles()
+            .iter()
+            .any(|needle| processes.contains(needle))
+    };
+
+    if running {
+        return Err(format!(
+            "{} is running and may overwrite external session-state changes. Exit every {} window completely, then try again.",
+            flavor.label(),
+            flavor.label()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CopilotArchiveOutcome {
+    session_id: String,
+    archived: bool,
+    changed: bool,
+}
+
+/// Update exactly one local Copilot session entry while preserving the other
+/// entries and every field VS Code may have added. Archiving mirrors VS Code's
+/// native behavior by marking the session read at the current timestamp.
+fn set_copilot_archive_in_db(
+    db: &Path,
+    session_id: &str,
+    archived: bool,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let mut conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [COPILOT_AGENT_STATE_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let mut entries = match stored {
+        Some(value) => serde_json::from_str::<Vec<serde_json::Value>>(&value)
+            .map_err(|e| format!("Invalid {COPILOT_AGENT_STATE_KEY} value: {e}"))?,
+        None => Vec::new(),
+    };
+    let resource = local_chat_resource(session_id);
+    let mut changed = false;
+    let mut found = false;
+    for entry in &mut entries {
+        let matches = entry
+            .get("resource")
+            .and_then(|value| value.as_str())
+            .and_then(decode_local_chat_resource)
+            .as_deref()
+            == Some(session_id);
+        if !matches {
+            continue;
+        }
+        found = true;
+        let state = entry
+            .as_object_mut()
+            .ok_or_else(|| "Copilot session state entry is not a JSON object".to_string())?;
+        let current_archived = state
+            .get("archived")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if current_archived != archived {
+            state.insert("archived".to_string(), serde_json::Value::Bool(archived));
+            changed = true;
+        }
+        if archived {
+            let previous = state
+                .get("read")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            if previous < now_ms {
+                state.insert("read".to_string(), serde_json::Value::Number(now_ms.into()));
+                changed = true;
+            }
+        }
+        break;
+    }
+    if !found && archived {
+        let mut state = serde_json::Map::new();
+        state.insert("resource".to_string(), serde_json::Value::String(resource));
+        state.insert("archived".to_string(), serde_json::Value::Bool(archived));
+        if archived {
+            state.insert("read".to_string(), serde_json::Value::Number(now_ms.into()));
+        }
+        entries.push(serde_json::Value::Object(state));
+        changed = true;
+    }
+    if changed {
+        let updated = serde_json::to_string(&entries).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)\n\
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (COPILOT_AGENT_STATE_KEY, &updated),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+const COPILOT_ARCHIVE_USAGE: &str =
+    "Usage: --archive-session <session-path> | --unarchive-session <session-path> --provider copilot [--format json] [--output <file>]\n\n\
+Update Copilot VS Code's reversible per-workspace archive state. The selected\n\
+session must be a local chatSessions/<id>.jsonl file, and its owning editor must\n\
+be fully stopped so it cannot overwrite the external state change.";
+
+/// Handle Copilot VS Code archive/unarchive. The session path is deliberately
+/// required: it identifies the exact workspace database without an ambiguous
+/// cross-workspace id scan.
+pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
+    let flag = if archived {
+        "--archive-session"
+    } else {
+        "--unarchive-session"
+    };
+    let Some(session_path) = extract_flag_value(args, flag) else {
+        eprintln!("{COPILOT_ARCHIVE_USAGE}");
+        return 2;
+    };
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "copilot".to_string());
+    if provider != "copilot" {
+        eprintln!("{flag} supports only the copilot provider (got '{provider}')");
+        return 2;
+    }
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+    let path = Path::new(&session_path);
+    let Some(db) = copilot_workspace_state_db(&session_path) else {
+        eprintln!("The selected session is not a Copilot VS Code chatSessions file with an adjacent state.vscdb");
+        return 1;
+    };
+    let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        eprintln!("The selected Copilot session path has no valid session id");
+        return 1;
+    };
+    if let Err(error) = ensure_editor_stopped(&db) {
+        eprintln!("{error}");
+        return 1;
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    match set_copilot_archive_in_db(&db, session_id, archived, now_ms) {
+        Ok(changed) => emit_json(
+            args,
+            &CopilotArchiveOutcome {
+                session_id: session_id.to_string(),
+                archived,
+                changed,
+            },
+        ),
+        Err(error) => {
+            eprintln!("Failed to update Copilot session archive state: {error}");
+            1
+        }
+    }
 }
 
 /// Read a Copilot VS Code workspace's chat state (recent-list ids + archived ids)
@@ -939,6 +1227,8 @@ mod tests {
                 "dump-session",
                 "list-sessions",
                 "hide-session",
+                "archive-session",
+                "unarchive-session",
                 "capabilities"
             ])
         );
@@ -1308,6 +1598,91 @@ mod tests {
                 Some(COPILOT_VSCODE_ENTRYPOINT)
             )),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn copilot_archive_updates_only_the_target_and_preserves_state() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("state.vscdb");
+        let target_resource = local_chat_resource("target");
+        let other_resource = local_chat_resource("other");
+        create_item_table(
+            &db,
+            &[(
+                COPILOT_AGENT_STATE_KEY,
+                json!([
+                    {
+                        "resource": target_resource,
+                        "archived": false,
+                        "pinned": true,
+                        "read": 100,
+                        "future": {"kept": true}
+                    },
+                    {"resource": other_resource, "archived": true, "read": 200}
+                ]),
+            )],
+        );
+
+        assert!(set_copilot_archive_in_db(&db, "target", true, 1_000).unwrap());
+        let conn = Connection::open(&db).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                [COPILOT_AGENT_STATE_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entries: Vec<Value> = serde_json::from_str(&value).unwrap();
+        assert_eq!(entries[0]["archived"], true);
+        assert_eq!(entries[0]["read"], 1_000);
+        assert_eq!(entries[0]["pinned"], true);
+        assert_eq!(entries[0]["future"], json!({"kept":true}));
+        assert_eq!(entries[1]["archived"], true);
+        assert_eq!(entries[1]["read"], 200);
+        drop(conn);
+
+        assert!(set_copilot_archive_in_db(&db, "target", false, 2_000).unwrap());
+        assert!(!set_copilot_archive_in_db(&db, "target", false, 3_000).unwrap());
+        let state = read_workspace_chat_state(&db);
+        assert!(!state.archived_ids.contains("target"));
+        assert!(state.archived_ids.contains("other"));
+    }
+
+    #[test]
+    fn copilot_archive_creates_missing_state_but_unarchive_is_a_noop() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("state.vscdb");
+        create_item_table(&db, &[("unrelated", json!({"kept":true}))]);
+
+        assert!(!set_copilot_archive_in_db(&db, "missing", false, 100).unwrap());
+        assert!(set_copilot_archive_in_db(&db, "missing", true, 200).unwrap());
+        let state = read_workspace_chat_state(&db);
+        assert!(state.archived_ids.contains("missing"));
+    }
+
+    #[test]
+    fn copilot_archive_identifies_the_owning_editor_from_the_state_path() {
+        let root = Path::new("root");
+        assert_eq!(
+            editor_flavor_for_state_db(&root.join("Code/User/workspaceStorage/abc/state.vscdb")),
+            Some(EditorFlavor::Code)
+        );
+        assert_eq!(
+            editor_flavor_for_state_db(
+                &root.join("Code - Insiders/User/workspaceStorage/abc/state.vscdb")
+            ),
+            Some(EditorFlavor::CodeInsiders)
+        );
+        assert_eq!(
+            editor_flavor_for_state_db(
+                &root.join("VSCodium/User/workspaceStorage/abc/state.vscdb")
+            ),
+            Some(EditorFlavor::Vscodium)
+        );
+        assert_eq!(
+            editor_flavor_for_state_db(&root.join("unknown/state.vscdb")),
+            None
         );
     }
 

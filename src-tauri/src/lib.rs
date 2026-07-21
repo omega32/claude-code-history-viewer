@@ -117,6 +117,20 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_hide_session(&args));
         }
+        // Copilot VS Code's reversible per-workspace archive state. The two
+        // directions are separate capabilities but share one transactional writer.
+        if args
+            .iter()
+            .any(|a| a == "--archive-session" || a.starts_with("--archive-session="))
+        {
+            std::process::exit(headless_dump::run_set_session_archived(&args, true));
+        }
+        if args
+            .iter()
+            .any(|a| a == "--unarchive-session" || a.starts_with("--unarchive-session="))
+        {
+            std::process::exit(headless_dump::run_set_session_archived(&args, false));
+        }
         // Headless capability/version probe (`--capabilities`), so callers can
         // confirm this build speaks the headless protocol before relying on it.
         if args.iter().any(|a| a == "--capabilities") {
