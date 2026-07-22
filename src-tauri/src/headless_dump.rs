@@ -939,11 +939,13 @@ fn read_teleport_stub(path: &Path) -> Option<Option<String>> {
 /// Build the listing entry for a teleported session. It has no local content, so
 /// the fields are synthesized: id from the filename, timestamps from the file
 /// mtime, and a placeholder summary (the original title lived in the now-relocated
-/// conversation and is not recoverable from the stub).
+/// conversation and is not recoverable from the stub). Hidden state still comes
+/// from Claude VS Code's authoritative `hiddenSessionIds`, keyed by the filename.
 fn synthesize_teleport_session(
     path: &Path,
     remote_session_id: Option<String>,
     project_path: Option<String>,
+    hidden: &HashSet<String>,
 ) -> SessionWithProjectPath {
     let file_path = path.to_string_lossy().to_string();
     let actual_session_id = path
@@ -951,6 +953,7 @@ fn synthesize_teleport_session(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown-session")
         .to_string();
+    let is_hidden = hidden.contains(&actual_session_id);
     let modified = std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -991,7 +994,7 @@ fn synthesize_teleport_session(
             entrypoint: None,
         },
         project_path,
-        is_hidden: false,
+        is_hidden,
         is_orphan: false,
         is_archived: false,
         is_pinned: false,
@@ -1005,11 +1008,13 @@ fn synthesize_teleport_session(
 /// Scan one project storage `dir` for teleport stubs not already in `listed` (the
 /// file paths of the sessions the normal scan returned — every real session is
 /// there, so only dropped/empty files are inspected, and only the tiny ones read).
-/// Claude-only; the caller gates on the provider.
+/// Claude-only; the caller gates on the provider and supplies the same live
+/// hidden-id snapshot used to wrap ordinary Claude sessions.
 fn scan_teleport_stubs(
     dir: &Path,
     listed: &HashSet<String>,
     project_path: Option<String>,
+    hidden: &HashSet<String>,
 ) -> Vec<SessionWithProjectPath> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1028,6 +1033,7 @@ fn scan_teleport_stubs(
                 &path,
                 remote_session_id,
                 project_path.clone(),
+                hidden,
             ));
         }
     }
@@ -1102,6 +1108,7 @@ async fn list_sessions(
                 std::path::Path::new(path),
                 &listed,
                 None,
+                &hidden,
             ));
         }
         return Ok(wrapped);
@@ -1128,6 +1135,7 @@ async fn list_sessions(
                     std::path::Path::new(&proj.path),
                     &listed,
                     Some(proj.actual_path.clone()),
+                    &hidden,
                 ));
             } else {
                 all.extend(wrapped);
@@ -1790,11 +1798,27 @@ mod tests {
         .unwrap();
         let listed = HashSet::from([listed_path.to_string_lossy().to_string()]);
 
-        let found = scan_teleport_stubs(temp.path(), &listed, Some(r"C:\work\project".to_string()));
+        let found = scan_teleport_stubs(
+            temp.path(),
+            &listed,
+            Some(r"C:\work\project".to_string()),
+            &HashSet::new(),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session.actual_session_id, "redirect");
         assert_eq!(found[0].remote_session_id.as_deref(), Some("remote-1"));
         assert_eq!(found[0].project_path.as_deref(), Some(r"C:\work\project"));
         assert!(found[0].is_teleported);
+        assert!(!found[0].is_hidden);
+
+        let hidden = HashSet::from(["redirect".to_string()]);
+        let found = scan_teleport_stubs(
+            temp.path(),
+            &listed,
+            Some(r"C:\work\project".to_string()),
+            &hidden,
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found[0].is_hidden);
     }
 }
