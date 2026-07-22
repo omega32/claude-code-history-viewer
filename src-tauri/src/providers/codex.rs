@@ -1353,6 +1353,73 @@ fn is_codex_auto_injected_user_text(text: &str) -> bool {
     trimmed.starts_with("<environment_context>")
 }
 
+/// Provider-neutral metadata for Codex's pasted-text prompt carrier. The Codex
+/// client writes the actual paste under `attachments/<uuid>/pasted-text.txt`
+/// and persists an exact Markdown wrapper as the authored `input_text`. Keep
+/// that text byte-verbatim, but also surface the structural artifact so
+/// consumers do not have to rediscover this provider-owned envelope.
+fn pasted_prompt_note_data(content: Option<&Value>) -> Option<Value> {
+    let text = content?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("input_text"))?
+        .get("text")?
+        .as_str()?;
+    let mut lines = text.trim_start().lines();
+    if lines.next()?.trim_end() != "# Files mentioned by the user:" {
+        return None;
+    }
+
+    let mut notes = Vec::new();
+    let mut saw_instruction = false;
+    let mut saw_request_header = false;
+    for line in lines {
+        let line = line.trim_end();
+        if line == "The attached pasted text file(s) contain the user's request. Read and act on that content." {
+            saw_instruction = true;
+            continue;
+        }
+        if line == "## My request for Codex:" {
+            saw_request_header = true;
+            break;
+        }
+        if saw_instruction || !line.starts_with("## ") {
+            continue;
+        }
+        let (label, raw_path) = line[3..].rsplit_once(": ")?;
+        let normalized = raw_path.replace('\\', "/");
+        let parts: Vec<&str> = normalized
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() < 3 || !parts[parts.len() - 3].eq_ignore_ascii_case("attachments") {
+            return None;
+        }
+        let attachment_id = parts[parts.len() - 2];
+        let name = parts[parts.len() - 1];
+        let uuid_like = attachment_id.len() == 36
+            && attachment_id.bytes().enumerate().all(|(i, b)| {
+                matches!(i, 8 | 13 | 18 | 23) && b == b'-'
+                    || !matches!(i, 8 | 13 | 18 | 23) && b.is_ascii_hexdigit()
+            });
+        if !uuid_like
+            || !name.to_ascii_lowercase().starts_with("pasted-text")
+            || !name.to_ascii_lowercase().ends_with(".txt")
+        {
+            return None;
+        }
+        notes.push(serde_json::json!({
+            "kind": "note",
+            "name": name,
+            "label": label.trim()
+        }));
+    }
+    if notes.is_empty() || !saw_instruction || !saw_request_header {
+        return None;
+    }
+    Some(serde_json::json!({ "promptArtifacts": notes }))
+}
+
 fn convert_codex_item(
     item: &Value,
     session_id: &str,
@@ -1381,7 +1448,7 @@ fn convert_codex_item(
             let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = convert_codex_content_array(item.get("content"));
 
-            Some(build_codex_message(
+            let mut message = build_codex_message(
                 uuid,
                 session_id,
                 timestamp,
@@ -1393,7 +1460,13 @@ fn convert_codex_item(
                 } else {
                     None
                 },
-            ))
+            );
+            if role == "user" {
+                if let Some(data) = pasted_prompt_note_data(item.get("content")) {
+                    message.data = Some(data);
+                }
+            }
+            Some(message)
         }
         "local_shell_call" => {
             let command = item
@@ -2309,6 +2382,63 @@ mod tests {
                 .and_then(Value::as_str),
             Some("data:image/png;base64,abc")
         );
+    }
+
+    #[test]
+    fn pasted_prompt_note_emits_safe_artifact_metadata() {
+        let content = json!([{
+            "type": "input_text",
+            "text": "\n# Files mentioned by the user:\n\n## Build output: C:\\Users\\person\\.codex/attachments/d5aa3020-8ebb-49f9-b5fd-c1cfa3374e3a/pasted-text.txt\n\nThe attached pasted text file(s) contain the user's request. Read and act on that content.\n\n## My request for Codex:\n\n"
+        }]);
+
+        assert_eq!(
+            pasted_prompt_note_data(Some(&content)),
+            Some(json!({
+                "promptArtifacts": [{
+                    "kind": "note",
+                    "name": "pasted-text.txt",
+                    "label": "Build output"
+                }]
+            }))
+        );
+        let serialized = serde_json::to_string(&pasted_prompt_note_data(Some(&content))).unwrap();
+        assert!(!serialized.contains("Users"));
+        assert!(!serialized.contains("d5aa3020"));
+
+        let mut counter = 0;
+        let message = convert_codex_item(
+            &json!({ "type": "message", "role": "user", "content": content }),
+            "session-1",
+            None,
+            "2026-07-21T12:00:00Z",
+            &mut counter,
+        )
+        .expect("user message should be converted");
+        assert_eq!(
+            message.data,
+            Some(json!({
+                "promptArtifacts": [{
+                    "kind": "note",
+                    "name": "pasted-text.txt",
+                    "label": "Build output"
+                }]
+            }))
+        );
+    }
+
+    #[test]
+    fn pasted_prompt_note_requires_the_complete_owned_wrapper() {
+        let mentioned = json!([{
+            "type": "input_text",
+            "text": "The log mentions C:\\tmp\\attachments\\d5aa3020-8ebb-49f9-b5fd-c1cfa3374e3a\\pasted-text.txt"
+        }]);
+        let outside = json!([{
+            "type": "input_text",
+            "text": "# Files mentioned by the user:\n\n## Build output: C:\\tmp\\pasted-text.txt\n\nThe attached pasted text file(s) contain the user's request. Read and act on that content.\n\n## My request for Codex:\n"
+        }]);
+
+        assert!(pasted_prompt_note_data(Some(&mentioned)).is_none());
+        assert!(pasted_prompt_note_data(Some(&outside)).is_none());
     }
 
     #[test]
