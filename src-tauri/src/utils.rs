@@ -539,6 +539,7 @@ pub fn build_provider_message(
         usage: None,
         role: role.map(String::from),
         model,
+        inference: None,
         stop_reason: None,
         cost_usd: None,
         duration_ms: None,

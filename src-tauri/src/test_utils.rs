@@ -183,6 +183,7 @@ impl MessageBuilder {
             usage: self.usage,
             role: self.role,
             model: self.model,
+            inference: None,
             stop_reason: None,
             cost_usd: None,
             duration_ms: None,

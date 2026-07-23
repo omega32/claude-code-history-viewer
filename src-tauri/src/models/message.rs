@@ -9,6 +9,71 @@ pub struct TokenUsage {
     pub service_tier: Option<String>,
 }
 
+/// Provider-neutral metadata describing the model invocation associated with a
+/// normalized message. Providers populate only fields backed by their native
+/// transcript; absent values are never inferred.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u32>,
+}
+
+impl InferenceUsage {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceMetadata {
+    /// Provider-native invocation/message id used only for exact metric de-duplication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The model/API provider, which can differ from the session provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<InferenceUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(rename = "costUSD", skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(rename = "timeToFirstTokenMs", skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
+}
+
+impl InferenceMetadata {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageContent {
     pub role: String,
@@ -133,6 +198,11 @@ pub struct ClaudeMessage {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Additive normalized invocation metadata. Legacy top-level fields remain
+    /// serialized for compatibility and are folded into this object by the
+    /// provider-loading boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference: Option<InferenceMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     // Cost and performance metrics (2025 additions)
@@ -187,6 +257,52 @@ pub struct ClaudeMessage {
     /// Provider identifier (claude, codex, opencode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+impl ClaudeMessage {
+    /// Fold the long-standing normalized message fields into the richer
+    /// inference object without replacing provider-specific values. Calling
+    /// this repeatedly is idempotent.
+    pub fn hydrate_inference(&mut self) {
+        let mut inference = self.inference.take().unwrap_or_default();
+        if inference.invocation_id.is_none() {
+            inference.invocation_id.clone_from(&self.message_id);
+        }
+        if inference.model.is_none() {
+            inference.model.clone_from(&self.model);
+        }
+        if inference.stop_reason.is_none() {
+            inference.stop_reason.clone_from(&self.stop_reason);
+        }
+        if inference.cost_usd.is_none() {
+            inference.cost_usd = self.cost_usd;
+        }
+        if inference.duration_ms.is_none() {
+            inference.duration_ms = self.duration_ms;
+        }
+        if let Some(legacy) = &self.usage {
+            if inference.service_tier.is_none() {
+                inference.service_tier.clone_from(&legacy.service_tier);
+            }
+            let usage = inference.usage.get_or_insert_with(InferenceUsage::default);
+            if usage.input_tokens.is_none() {
+                usage.input_tokens = legacy.input_tokens;
+            }
+            if usage.output_tokens.is_none() {
+                usage.output_tokens = legacy.output_tokens;
+            }
+            if usage.cached_input_tokens.is_none() {
+                usage.cached_input_tokens = legacy.cache_read_input_tokens;
+            }
+            if usage.cache_write_input_tokens.is_none() {
+                usage.cache_write_input_tokens = legacy.cache_creation_input_tokens;
+            }
+            if usage.is_empty() {
+                inference.usage = None;
+            }
+        }
+        self.inference = (!inference.is_empty()).then_some(inference);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +461,7 @@ mod tests {
             usage: None,
             role: Some("user".to_string()),
             model: None,
+            inference: None,
             stop_reason: None,
             cost_usd: None,
             duration_ms: None,
@@ -390,6 +507,7 @@ mod tests {
             usage: None,
             role: None,
             model: None,
+            inference: None,
             stop_reason: None,
             cost_usd: None,
             duration_ms: None,
@@ -437,6 +555,50 @@ mod tests {
         assert_eq!(deserialized.total_count, 100);
         assert!(deserialized.has_more);
         assert_eq!(deserialized.next_offset, 20);
+    }
+
+    #[test]
+    fn hydrate_inference_preserves_provider_fields_and_fills_legacy_metadata() {
+        let mut message: ClaudeMessage = serde_json::from_value(serde_json::json!({
+            "uuid": "a1",
+            "sessionId": "s1",
+            "timestamp": "2026-07-22T10:00:00Z",
+            "type": "assistant",
+            "role": "assistant",
+            "messageId": "native-invocation",
+            "model": "model-a",
+            "stop_reason": "end_turn",
+            "durationMs": 1200,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 40,
+                "service_tier": "priority"
+            },
+            "inference": { "reasoningEffort": "high", "modelProvider": "provider-a" }
+        }))
+        .expect("normalized message");
+
+        message.hydrate_inference();
+        message.hydrate_inference();
+        let inference = message.inference.expect("inference");
+        assert_eq!(
+            inference.invocation_id.as_deref(),
+            Some("native-invocation")
+        );
+        assert_eq!(inference.model.as_deref(), Some("model-a"));
+        assert_eq!(inference.model_provider.as_deref(), Some("provider-a"));
+        assert_eq!(inference.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(inference.service_tier.as_deref(), Some("priority"));
+        assert_eq!(inference.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(inference.duration_ms, Some(1200));
+        assert_eq!(
+            inference
+                .usage
+                .and_then(|usage| usage.cache_write_input_tokens),
+            Some(5)
+        );
     }
 
     #[test]

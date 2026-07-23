@@ -1,5 +1,7 @@
 use super::ProviderInfo;
-use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
+use crate::models::{
+    ClaudeMessage, ClaudeProject, ClaudeSession, InferenceMetadata, InferenceUsage, TokenUsage,
+};
 use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
     search_json_value_case_insensitive,
@@ -518,12 +520,15 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
     // (meta-less rollouts keep it — issue #451 follow-up).
     let mut session_id = session_id_from_rollout_filename(canonical_path).unwrap_or_default();
     let mut meta_seen = false;
-    let mut current_model: Option<String> = None;
+    let mut current_inference = InferenceMetadata::default();
     let mut prev_input_tokens: u32 = 0;
     let mut prev_output_tokens: u32 = 0;
     let mut prev_cached_tokens: u32 = 0;
+    let mut prev_cache_write_tokens: u32 = 0;
+    let mut prev_reasoning_tokens: u32 = 0;
     let mut msg_counter = 0u64;
     let mut active_turn_id: Option<String> = None;
+    let mut active_turn_message_start = 0usize;
     let mut authored_user_messages_in_turn = 0usize;
     let mut pending_user_message_index: Option<usize> = None;
 
@@ -558,7 +563,17 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
             "turn_context" => {
                 if let Some(payload) = val.get("payload") {
                     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
-                        current_model = Some(m.to_string());
+                        current_inference.model = Some(m.to_string());
+                    }
+                    if let Some(effort) = payload.get("effort").and_then(Value::as_str) {
+                        current_inference.reasoning_effort = Some(effort.to_string());
+                    }
+                    // `thread_settings_applied.reasoning_summary` is the applied
+                    // setting. Older rollouts may expose only this fallback.
+                    if current_inference.reasoning_summary.is_none() {
+                        if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
+                            current_inference.reasoning_summary = Some(summary.to_string());
+                        }
                     }
                 }
             }
@@ -570,10 +585,15 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                     if let Some(msg) = convert_codex_item(
                         payload,
                         &session_id,
-                        current_model.as_ref(),
+                        current_inference.model.as_ref(),
                         &line_timestamp,
                         &mut msg_counter,
                     ) {
+                        let mut msg = msg;
+                        if msg.message_type == "assistant" {
+                            msg.inference =
+                                (!current_inference.is_empty()).then(|| current_inference.clone());
+                        }
                         if try_merge_tool_result_into_previous(&mut messages, &msg) {
                             continue;
                         }
@@ -612,56 +632,113 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         continue;
                     }
 
+                    if event_type == "thread_settings_applied" {
+                        if let Some(settings) = payload.get("thread_settings") {
+                            current_inference = codex_inference_settings(settings);
+                        }
+                    }
+
                     if event_type == "task_started" {
                         active_turn_id = payload
                             .get("turn_id")
                             .and_then(Value::as_str)
                             .map(str::to_string);
+                        active_turn_message_start = messages.len();
+                        current_inference.context_window = payload
+                            .get("model_context_window")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        if let Some(mode) = payload
+                            .get("collaboration_mode_kind")
+                            .and_then(Value::as_str)
+                        {
+                            current_inference.interaction_mode = Some(mode.to_string());
+                        }
                         authored_user_messages_in_turn = 0;
                         pending_user_message_index = None;
                     }
 
                     if event_type == "token_count" {
-                        let usage_totals = extract_token_totals(payload)
-                            .or_else(|| extract_last_token_usage(payload));
-                        let Some((input, output, cached)) = usage_totals else {
-                            continue;
+                        let usage_totals = extract_token_totals(payload);
+                        let (usage, cumulative) = match usage_totals {
+                            Some(usage) => (usage, true),
+                            None => match extract_last_token_usage(payload) {
+                                Some(usage) => (usage, false),
+                                None => continue,
+                            },
                         };
 
-                        let (delta_input, delta_output, delta_cached) =
-                            if prev_input_tokens == 0 && prev_output_tokens == 0 {
-                                (input, output, cached)
-                            } else {
-                                (
-                                    input.saturating_sub(prev_input_tokens),
-                                    output.saturating_sub(prev_output_tokens),
-                                    cached.saturating_sub(prev_cached_tokens),
-                                )
+                        let delta = if cumulative {
+                            let delta_optional = |current: Option<u32>, previous: &mut u32| {
+                                current.map(|value| {
+                                    let delta = value.saturating_sub(*previous);
+                                    *previous = value;
+                                    delta
+                                })
                             };
-                        prev_input_tokens = input;
-                        prev_output_tokens = output;
-                        prev_cached_tokens = cached;
+                            let delta = CodexTokenUsage {
+                                input: usage.input.saturating_sub(prev_input_tokens),
+                                output: usage.output.saturating_sub(prev_output_tokens),
+                                cached: delta_optional(usage.cached, &mut prev_cached_tokens),
+                                cache_write: delta_optional(
+                                    usage.cache_write,
+                                    &mut prev_cache_write_tokens,
+                                ),
+                                reasoning: delta_optional(
+                                    usage.reasoning,
+                                    &mut prev_reasoning_tokens,
+                                ),
+                            };
+                            prev_input_tokens = usage.input;
+                            prev_output_tokens = usage.output;
+                            delta
+                        } else {
+                            usage
+                        };
+
+                        // Apply to the last assistant message without usage.
+                        let Some(last_msg) = messages[active_turn_message_start..]
+                            .iter_mut()
+                            .rev()
+                            .find(|message| {
+                                message.message_type == "assistant" && message.usage.is_none()
+                            })
+                        else {
+                            continue;
+                        };
 
                         // Separate non-cached input from cached input for correct billing.
                         // OpenAI's input_tokens includes cached_input_tokens as a subset,
                         // but they are billed at different rates (cached gets 90% discount).
-                        let non_cached_input = delta_input.saturating_sub(delta_cached);
-
-                        // Apply to last assistant message without usage
-                        if let Some(last_msg) = messages.last_mut() {
-                            if last_msg.message_type == "assistant" && last_msg.usage.is_none() {
-                                last_msg.usage = Some(TokenUsage {
-                                    input_tokens: Some(non_cached_input),
-                                    output_tokens: Some(delta_output),
-                                    cache_creation_input_tokens: None,
-                                    cache_read_input_tokens: Some(delta_cached),
-                                    service_tier: None,
-                                });
-                            }
-                        }
-                    } else if let Some(msg) =
+                        let non_cached_input =
+                            delta.input.saturating_sub(delta.cached.unwrap_or(0));
+                        last_msg.usage = Some(TokenUsage {
+                            input_tokens: Some(non_cached_input),
+                            output_tokens: Some(delta.output),
+                            cache_creation_input_tokens: delta.cache_write,
+                            cache_read_input_tokens: delta.cached,
+                            service_tier: current_inference.service_tier.clone(),
+                        });
+                        let inference = last_msg
+                            .inference
+                            .get_or_insert_with(|| current_inference.clone());
+                        inference.usage = Some(InferenceUsage {
+                            input_tokens: Some(delta.input),
+                            output_tokens: Some(delta.output),
+                            cached_input_tokens: delta.cached,
+                            cache_write_input_tokens: delta.cache_write,
+                            reasoning_output_tokens: delta.reasoning,
+                        });
+                    } else if let Some(mut msg) =
                         convert_codex_event(payload, &session_id, &line_timestamp, &mut msg_counter)
                     {
+                        if msg.message_type == "assistant" {
+                            if msg.model.is_none() {
+                                msg.model.clone_from(&current_inference.model);
+                            }
+                            msg.inference =
+                                (!current_inference.is_empty()).then(|| current_inference.clone());
+                        }
                         messages.push(msg);
                     }
 
@@ -669,6 +746,20 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         && payload.get("turn_id").and_then(Value::as_str)
                             == active_turn_id.as_deref()
                     {
+                        if let Some(last_msg) = messages[active_turn_message_start..]
+                            .iter_mut()
+                            .rev()
+                            .find(|message| message.message_type == "assistant")
+                        {
+                            let inference = last_msg
+                                .inference
+                                .get_or_insert_with(|| current_inference.clone());
+                            inference.duration_ms =
+                                payload.get("duration_ms").and_then(Value::as_u64);
+                            inference.time_to_first_token_ms = payload
+                                .get("time_to_first_token_ms")
+                                .and_then(Value::as_u64);
+                        }
                         active_turn_id = None;
                         authored_user_messages_in_turn = 0;
                         pending_user_message_index = None;
@@ -1860,28 +1951,66 @@ fn convert_codex_compacted(
     msg
 }
 
-fn extract_token_totals(payload: &Value) -> Option<(u32, u32, u32)> {
-    // Recent Codex logs store usage in payload.info.total_token_usage.
-    let total = payload.get("info")?.get("total_token_usage")?;
-    let input = total.get("input_tokens")?.as_u64()? as u32;
-    let output = total.get("output_tokens")?.as_u64()? as u32;
-    let cached = total
-        .get("cached_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    Some((input, output, cached))
+fn codex_inference_settings(settings: &Value) -> InferenceMetadata {
+    let string = |name: &str| {
+        settings
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let interaction_mode = settings
+        .get("collaboration_mode")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("mode").and_then(Value::as_str))
+        })
+        .map(str::to_string);
+    InferenceMetadata {
+        model: string("model"),
+        model_provider: string("model_provider_id"),
+        reasoning_effort: string("reasoning_effort"),
+        reasoning_summary: string("reasoning_summary"),
+        service_tier: string("service_tier"),
+        interaction_mode,
+        personality: string("personality"),
+        ..InferenceMetadata::default()
+    }
 }
 
-fn extract_last_token_usage(payload: &Value) -> Option<(u32, u32, u32)> {
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct CodexTokenUsage {
+    input: u32,
+    output: u32,
+    cached: Option<u32>,
+    cache_write: Option<u32>,
+    reasoning: Option<u32>,
+}
+
+fn codex_token_usage(value: &Value) -> Option<CodexTokenUsage> {
+    let number = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+    };
+    Some(CodexTokenUsage {
+        input: u32::try_from(value.get("input_tokens")?.as_u64()?).ok()?,
+        output: u32::try_from(value.get("output_tokens")?.as_u64()?).ok()?,
+        cached: number("cached_input_tokens"),
+        cache_write: number("cache_write_input_tokens"),
+        reasoning: number("reasoning_output_tokens"),
+    })
+}
+
+fn extract_token_totals(payload: &Value) -> Option<CodexTokenUsage> {
+    // Recent Codex logs store usage in payload.info.total_token_usage.
+    codex_token_usage(payload.get("info")?.get("total_token_usage")?)
+}
+
+fn extract_last_token_usage(payload: &Value) -> Option<CodexTokenUsage> {
     // Fallback for older/newer variants that only include last token usage.
-    let last = payload.get("info")?.get("last_token_usage")?;
-    let input = last.get("input_tokens")?.as_u64()? as u32;
-    let output = last.get("output_tokens")?.as_u64()? as u32;
-    let cached = last
-        .get("cached_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    Some((input, output, cached))
+    codex_token_usage(payload.get("info")?.get("last_token_usage")?)
 }
 
 fn map_codex_tool_name(name: &str) -> &str {
@@ -2329,7 +2458,73 @@ mod tests {
                 }
             }
         });
-        assert_eq!(extract_token_totals(&payload), Some((120, 30, 0)));
+        assert_eq!(
+            extract_token_totals(&payload),
+            Some(CodexTokenUsage {
+                input: 120,
+                output: 30,
+                ..CodexTokenUsage::default()
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_authoritative_turn_inference_metadata() {
+        let tmp = TempDir::new().expect("temp dir");
+        let rollout_path = tmp.path().join("rollout-2026-07-22-test-session.jsonl");
+        let lines = [
+            json!({"timestamp":"2026-07-22T10:00:00Z","type":"session_meta","payload":{"id":"test-session"}}),
+            json!({"timestamp":"2026-07-22T10:00:01Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{
+                "model":"gpt-test","model_provider_id":"openai","service_tier":"default",
+                "reasoning_effort":"high","reasoning_summary":"none","personality":"pragmatic",
+                "collaboration_mode":{"mode":"default"}
+            }}}),
+            json!({"timestamp":"2026-07-22T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":258400,"collaboration_mode_kind":"default"}}),
+            json!({"timestamp":"2026-07-22T10:00:03Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-test","effort":"high","summary":"auto"}}),
+            json!({"timestamp":"2026-07-22T10:00:04Z","type":"response_item","payload":{"id":"a1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}),
+            json!({"timestamp":"2026-07-22T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{
+                "input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":3,
+                "output_tokens":20,"reasoning_output_tokens":7
+            }}}}),
+            json!({"timestamp":"2026-07-22T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":1500,"time_to_first_token_ms":250}}),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("write rollout");
+
+        let messages = parse_rollout_file(&rollout_path).expect("parse rollout");
+        let assistant = messages
+            .iter()
+            .find(|message| message.message_type == "assistant")
+            .expect("assistant");
+        let inference = assistant.inference.as_ref().expect("inference metadata");
+        assert_eq!(inference.model.as_deref(), Some("gpt-test"));
+        assert_eq!(inference.model_provider.as_deref(), Some("openai"));
+        assert_eq!(inference.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(inference.reasoning_summary.as_deref(), Some("none"));
+        assert_eq!(inference.service_tier.as_deref(), Some("default"));
+        assert_eq!(inference.context_window, Some(258_400));
+        assert_eq!(inference.interaction_mode.as_deref(), Some("default"));
+        assert_eq!(inference.personality.as_deref(), Some("pragmatic"));
+        assert_eq!(inference.duration_ms, Some(1500));
+        assert_eq!(inference.time_to_first_token_ms, Some(250));
+        assert_eq!(
+            inference
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens),
+            Some(100)
+        );
+        assert_eq!(
+            inference
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.reasoning_output_tokens),
+            Some(7)
+        );
     }
 
     #[test]

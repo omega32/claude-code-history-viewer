@@ -154,6 +154,30 @@ export interface RawClaudeMessage {
 /** Provider-neutral categories derived from normalized session messages. */
 export type MessageCategory = "parallel-task";
 
+/** Provider-neutral model invocation metadata; every field is independently optional. */
+export interface InferenceMetadata {
+  invocationId?: string;
+  model?: string;
+  modelProvider?: string;
+  reasoningEffort?: string;
+  reasoningSummary?: string;
+  serviceTier?: string;
+  contextWindow?: number;
+  interactionMode?: string;
+  personality?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    cacheWriteInputTokens?: number;
+    reasoningOutputTokens?: number;
+  };
+  stopReason?: string;
+  costUSD?: number;
+  durationMs?: number;
+  timeToFirstTokenMs?: number;
+}
+
 export interface BaseClaudeMessage {
   uuid: string;
   parentUuid?: string;
@@ -165,6 +189,7 @@ export interface BaseClaudeMessage {
   provider?: import("./session").ProviderId;
   isSidechain?: boolean;
   content?: string | ContentItem[] | Record<string, unknown>;
+  inference?: InferenceMetadata;
 }
 
 /** Represents input from the human user */

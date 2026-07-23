@@ -234,6 +234,7 @@ fn search_in_file(file_path: &PathBuf, matcher: &AhoCorasick) -> Vec<ClaudeMessa
             usage: message_content.usage.clone(),
             role: Some(message_content.role.clone()),
             model: message_content.model.clone(),
+            inference: None,
             stop_reason: message_content.stop_reason.clone(),
             cost_usd: log_entry.cost_usd,
             duration_ms: log_entry.duration_ms,

@@ -478,7 +478,17 @@ pub async fn load_provider_messages(
         load_non_claude_messages(&provider, &session_path)?
     };
 
-    Ok(merge_tool_execution_messages(messages))
+    let mut messages = merge_tool_execution_messages(messages);
+    hydrate_inference_metadata(&mut messages);
+    Ok(messages)
+}
+
+fn hydrate_inference_metadata(messages: &mut [ClaudeMessage]) {
+    for message in messages {
+        if message.message_type == "assistant" {
+            message.hydrate_inference();
+        }
+    }
 }
 
 /// Chat-style slice over an already-materialized, chronologically ordered
@@ -541,11 +551,13 @@ pub async fn load_provider_messages_paginated(
             }
         }
         page.messages = merge_tool_execution_messages(page.messages);
+        hydrate_inference_metadata(&mut page.messages);
         return Ok(page);
     }
 
     let messages = load_non_claude_messages(&provider, &session_path)?;
     let mut merged = merge_tool_execution_messages(messages);
+    hydrate_inference_metadata(&mut merged);
     if exclude_sidechain.unwrap_or(false) {
         merged.retain(|m| !m.is_sidechain.unwrap_or(false));
     }
@@ -1070,6 +1082,7 @@ pub async fn search_all_providers(
     });
     all_results.truncate(max_results);
 
+    hydrate_inference_metadata(&mut all_results);
     Ok(all_results)
 }
 
@@ -1215,6 +1228,7 @@ mod tests {
             usage: None,
             role: Some(message_type.to_string()),
             model: None,
+            inference: None,
             stop_reason: None,
             cost_usd: None,
             duration_ms: None,
