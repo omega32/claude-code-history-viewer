@@ -1516,45 +1516,65 @@ fn pasted_prompt_note(raw_path: &str) -> Option<Value> {
 
 /// Provider-neutral metadata for Codex's generated prompt-file carrier. Codex
 /// persists both ordinary attached files and externalized pasted text inside an
-/// exact Markdown wrapper rather than structured attachment blocks. Keep that
-/// authored text byte-verbatim, but also surface safe structural artifacts so
-/// consumers do not have to rediscover this provider-owned envelope.
-fn codex_prompt_artifact_data(content: Option<&Value>) -> Option<Value> {
-    let text = content?
-        .as_array()?
-        .iter()
-        .find(|item| item.get("type").and_then(Value::as_str) == Some("input_text"))?
-        .get("text")?
-        .as_str()?;
-    let mut lines = text.trim_start().lines();
-    if lines.next()?.trim_end() != "# Files mentioned by the user:" {
+/// exact Markdown wrapper rather than structured attachment blocks. Once the
+/// complete wrapper is verified, retain only the authored request body and
+/// surface safe structural artifacts.
+struct CodexPromptArtifactCarrier {
+    data: Value,
+    input_text_index: usize,
+    request_body: String,
+}
+
+fn codex_prompt_artifact_carrier(content: Option<&Value>) -> Option<CodexPromptArtifactCarrier> {
+    let content = content?.as_array()?;
+    let (input_text_index, text) = content.iter().enumerate().find_map(|(index, item)| {
+        (item.get("type").and_then(Value::as_str) == Some("input_text"))
+            .then(|| item.get("text")?.as_str().map(|text| (index, text)))
+            .flatten()
+    })?;
+
+    let trimmed = text.trim_start();
+    let leading_bytes = text.len() - trimmed.len();
+    let mut lines = trimmed.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end() != "# Files mentioned by the user:" {
         return None;
     }
 
     let mut entries = Vec::new();
     let mut saw_instruction = false;
-    let mut saw_request_header = false;
-    for line in lines {
-        let line = line.trim_end();
+    let mut request_body = None;
+    let mut cursor = leading_bytes + first.len();
+    for raw_line in lines {
+        let next_cursor = cursor + raw_line.len();
+        let line = raw_line.trim_end();
         if line.is_empty() {
+            cursor = next_cursor;
             continue;
         }
         if line == "The attached pasted text file(s) contain the user's request. Read and act on that content." {
             saw_instruction = true;
+            cursor = next_cursor;
             continue;
         }
         if line == "## My request for Codex:" {
-            saw_request_header = true;
+            request_body = Some(
+                text[next_cursor..]
+                    .trim_start_matches(['\r', '\n'])
+                    .to_string(),
+            );
             break;
         }
         if saw_instruction {
             return None;
         }
         entries.push(prompt_wrapper_entry(line)?);
+        cursor = next_cursor;
     }
-    if entries.is_empty() || !saw_request_header {
+    if entries.is_empty() {
         return None;
     }
+    let request_body = request_body?;
 
     let artifacts = if saw_instruction {
         entries
@@ -1581,7 +1601,11 @@ fn codex_prompt_artifact_data(content: Option<&Value>) -> Option<Value> {
             })
             .collect::<Option<Vec<_>>>()?
     };
-    Some(serde_json::json!({ "promptArtifacts": artifacts }))
+    Some(CodexPromptArtifactCarrier {
+        data: serde_json::json!({ "promptArtifacts": artifacts }),
+        input_text_index,
+        request_body,
+    })
 }
 
 fn convert_codex_item(
@@ -1610,7 +1634,13 @@ fn convert_codex_item(
     match item_type {
         "message" => {
             let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = convert_codex_content_array(item.get("content"));
+            let artifact_carrier = if role == "user" {
+                codex_prompt_artifact_carrier(item.get("content"))
+            } else {
+                None
+            };
+            let content =
+                convert_codex_content_array(item.get("content"), artifact_carrier.as_ref());
 
             let mut message = build_codex_message(
                 uuid,
@@ -1625,10 +1655,8 @@ fn convert_codex_item(
                     None
                 },
             );
-            if role == "user" {
-                if let Some(data) = codex_prompt_artifact_data(item.get("content")) {
-                    message.data = Some(data);
-                }
+            if let Some(carrier) = artifact_carrier {
+                message.data = Some(carrier.data);
             }
             Some(message)
         }
@@ -2278,16 +2306,27 @@ fn extract_first_tool_use(content: Option<&Value>) -> Option<Value> {
         .cloned()
 }
 
-fn convert_codex_content_array(content: Option<&Value>) -> Option<Value> {
+fn convert_codex_content_array(
+    content: Option<&Value>,
+    artifact_carrier: Option<&CodexPromptArtifactCarrier>,
+) -> Option<Value> {
     let arr = content?.as_array()?;
 
     let items: Vec<Value> = arr
         .iter()
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(index, item)| {
             let ctype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match ctype {
                 "input_text" | "output_text" | "text" => {
-                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let replacement = artifact_carrier
+                        .filter(|carrier| carrier.input_text_index == index)
+                        .map(|carrier| carrier.request_body.as_str());
+                    let text = replacement
+                        .unwrap_or_else(|| item.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                    if replacement.is_some() && text.is_empty() {
+                        return None;
+                    }
                     Some(serde_json::json!({
                         "type": "text",
                         "text": text
@@ -2630,12 +2669,15 @@ mod tests {
 
     #[test]
     fn convert_content_array_maps_input_image_to_image() {
-        let converted = convert_codex_content_array(Some(&json!([
-            {
-                "type": "input_image",
-                "image_url": "data:image/png;base64,abc"
-            }
-        ])))
+        let converted = convert_codex_content_array(
+            Some(&json!([
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,abc"
+                }
+            ])),
+            None,
+        )
         .expect("content should be converted");
 
         let arr = converted
@@ -2659,18 +2701,20 @@ mod tests {
             "text": "\n# Files mentioned by the user:\n\n## Build output: C:\\Users\\person\\.codex/attachments/d5aa3020-8ebb-49f9-b5fd-c1cfa3374e3a/pasted-text.txt\n\nThe attached pasted text file(s) contain the user's request. Read and act on that content.\n\n## My request for Codex:\n\n"
         }]);
 
+        let carrier = codex_prompt_artifact_carrier(Some(&content))
+            .expect("complete pasted-note wrapper should be detected");
         assert_eq!(
-            codex_prompt_artifact_data(Some(&content)),
-            Some(json!({
+            carrier.data,
+            json!({
                 "promptArtifacts": [{
                     "kind": "note",
                     "name": "pasted-text.txt",
                     "label": "Build output"
                 }]
-            }))
+            })
         );
-        let serialized =
-            serde_json::to_string(&codex_prompt_artifact_data(Some(&content))).unwrap();
+        assert_eq!(carrier.request_body, "");
+        let serialized = serde_json::to_string(&carrier.data).unwrap();
         assert!(!serialized.contains("Users"));
         assert!(!serialized.contains("d5aa3020"));
 
@@ -2693,6 +2737,7 @@ mod tests {
                 }]
             }))
         );
+        assert!(message.content.is_none());
     }
 
     #[test]
@@ -2702,9 +2747,11 @@ mod tests {
             "text": "\n# Files mentioned by the user:\n\n## Claude-Rust vs Go compilation speed.md: e:\\Programas\\Artificial Intelligence (Ai)\\Claude\\My Commit Message Generator\\Claude-Rust vs Go compilation speed.md\n\n## schema.sql: /home/person/project/schema.sql\n\n## My request for Codex:\nUse these files.\n"
         }]);
 
+        let carrier = codex_prompt_artifact_carrier(Some(&content))
+            .expect("complete file wrapper should be detected");
         assert_eq!(
-            codex_prompt_artifact_data(Some(&content)),
-            Some(json!({
+            carrier.data,
+            json!({
                 "promptArtifacts": [
                     {
                         "kind": "file",
@@ -2715,10 +2762,10 @@ mod tests {
                         "name": "schema.sql"
                     }
                 ]
-            }))
+            })
         );
-        let serialized =
-            serde_json::to_string(&codex_prompt_artifact_data(Some(&content))).unwrap();
+        assert_eq!(carrier.request_body, "Use these files.\n");
+        let serialized = serde_json::to_string(&carrier.data).unwrap();
         assert!(!serialized.contains("Programas"));
         assert!(!serialized.contains("/home/person"));
 
@@ -2746,6 +2793,13 @@ mod tests {
                 ]
             }))
         );
+        assert_eq!(
+            message.content,
+            Some(json!([{
+                "type": "text",
+                "text": "Use these files.\n"
+            }]))
+        );
     }
 
     #[test]
@@ -2771,11 +2825,32 @@ mod tests {
             "text": "# Files mentioned by the user:\n\n## report.md: C:\\project\\report.md\n"
         }]);
 
-        assert!(codex_prompt_artifact_data(Some(&mentioned)).is_none());
-        assert!(codex_prompt_artifact_data(Some(&outside)).is_none());
-        assert!(codex_prompt_artifact_data(Some(&relative)).is_none());
-        assert!(codex_prompt_artifact_data(Some(&mismatched)).is_none());
-        assert!(codex_prompt_artifact_data(Some(&incomplete)).is_none());
+        assert!(codex_prompt_artifact_carrier(Some(&mentioned)).is_none());
+        assert!(codex_prompt_artifact_carrier(Some(&outside)).is_none());
+        assert!(codex_prompt_artifact_carrier(Some(&relative)).is_none());
+        assert!(codex_prompt_artifact_carrier(Some(&mismatched)).is_none());
+        assert!(codex_prompt_artifact_carrier(Some(&incomplete)).is_none());
+
+        let original_text = mismatched[0]["text"]
+            .as_str()
+            .expect("test input should contain text");
+        let mut counter = 0;
+        let message = convert_codex_item(
+            &json!({ "type": "message", "role": "user", "content": mismatched }),
+            "session-1",
+            None,
+            "2026-07-22T21:11:44Z",
+            &mut counter,
+        )
+        .expect("unrecognized user prose should still be converted");
+        assert_eq!(message.data, None);
+        assert_eq!(
+            message.content,
+            Some(json!([{
+                "type": "text",
+                "text": original_text
+            }]))
+        );
     }
 
     #[test]
