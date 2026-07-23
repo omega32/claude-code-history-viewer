@@ -1444,12 +1444,82 @@ fn is_codex_auto_injected_user_text(text: &str) -> bool {
     trimmed.starts_with("<environment_context>")
 }
 
-/// Provider-neutral metadata for Codex's pasted-text prompt carrier. The Codex
-/// client writes the actual paste under `attachments/<uuid>/pasted-text.txt`
-/// and persists an exact Markdown wrapper as the authored `input_text`. Keep
-/// that text byte-verbatim, but also surface the structural artifact so
+fn absolute_prompt_path_basename(raw_path: &str) -> Option<String> {
+    let normalized = raw_path.replace('\\', "/");
+    let absolute = normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && normalized
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            && normalized
+                .as_bytes()
+                .get(2)
+                .is_some_and(|slash| *slash == b'/');
+    if !absolute {
+        return None;
+    }
+    normalized
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
+}
+
+/// One entry from Codex's generated `# Files mentioned by the user` wrapper.
+/// Requiring an absolute path keeps ordinary user-authored Markdown from
+/// becoming attachment metadata; ordinary files add a basename/heading check
+/// after pasted-note entries have been classified.
+fn prompt_wrapper_entry(line: &str) -> Option<(&str, &str)> {
+    let (label, raw_path) = line.strip_prefix("## ")?.rsplit_once(": ")?;
+    let label = label.trim();
+    let raw_path = raw_path.trim();
+    if label.is_empty() || absolute_prompt_path_basename(raw_path).is_none() {
+        return None;
+    }
+    Some((label, raw_path))
+}
+
+/// Whether a Codex wrapper entry is the provider's externalized pasted-text
+/// carrier. This classification remains intentionally narrower than an
+/// ordinary attached file: both the owned attachment directory and generated
+/// filename must be present.
+fn pasted_prompt_note(raw_path: &str) -> Option<Value> {
+    let normalized = raw_path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 3 || !parts[parts.len() - 3].eq_ignore_ascii_case("attachments") {
+        return None;
+    }
+    let attachment_id = parts[parts.len() - 2];
+    let name = parts[parts.len() - 1];
+    let uuid_like = attachment_id.len() == 36
+        && attachment_id.bytes().enumerate().all(|(i, b)| {
+            matches!(i, 8 | 13 | 18 | 23) && b == b'-'
+                || !matches!(i, 8 | 13 | 18 | 23) && b.is_ascii_hexdigit()
+        });
+    if !uuid_like
+        || !name.to_ascii_lowercase().starts_with("pasted-text")
+        || !name.to_ascii_lowercase().ends_with(".txt")
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": "note",
+        "name": name
+    }))
+}
+
+/// Provider-neutral metadata for Codex's generated prompt-file carrier. Codex
+/// persists both ordinary attached files and externalized pasted text inside an
+/// exact Markdown wrapper rather than structured attachment blocks. Keep that
+/// authored text byte-verbatim, but also surface safe structural artifacts so
 /// consumers do not have to rediscover this provider-owned envelope.
-fn pasted_prompt_note_data(content: Option<&Value>) -> Option<Value> {
+fn codex_prompt_artifact_data(content: Option<&Value>) -> Option<Value> {
     let text = content?
         .as_array()?
         .iter()
@@ -1461,11 +1531,14 @@ fn pasted_prompt_note_data(content: Option<&Value>) -> Option<Value> {
         return None;
     }
 
-    let mut notes = Vec::new();
+    let mut entries = Vec::new();
     let mut saw_instruction = false;
     let mut saw_request_header = false;
     for line in lines {
         let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
         if line == "The attached pasted text file(s) contain the user's request. Read and act on that content." {
             saw_instruction = true;
             continue;
@@ -1474,41 +1547,41 @@ fn pasted_prompt_note_data(content: Option<&Value>) -> Option<Value> {
             saw_request_header = true;
             break;
         }
-        if saw_instruction || !line.starts_with("## ") {
-            continue;
-        }
-        let (label, raw_path) = line[3..].rsplit_once(": ")?;
-        let normalized = raw_path.replace('\\', "/");
-        let parts: Vec<&str> = normalized
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.len() < 3 || !parts[parts.len() - 3].eq_ignore_ascii_case("attachments") {
+        if saw_instruction {
             return None;
         }
-        let attachment_id = parts[parts.len() - 2];
-        let name = parts[parts.len() - 1];
-        let uuid_like = attachment_id.len() == 36
-            && attachment_id.bytes().enumerate().all(|(i, b)| {
-                matches!(i, 8 | 13 | 18 | 23) && b == b'-'
-                    || !matches!(i, 8 | 13 | 18 | 23) && b.is_ascii_hexdigit()
-            });
-        if !uuid_like
-            || !name.to_ascii_lowercase().starts_with("pasted-text")
-            || !name.to_ascii_lowercase().ends_with(".txt")
-        {
-            return None;
-        }
-        notes.push(serde_json::json!({
-            "kind": "note",
-            "name": name,
-            "label": label.trim()
-        }));
+        entries.push(prompt_wrapper_entry(line)?);
     }
-    if notes.is_empty() || !saw_instruction || !saw_request_header {
+    if entries.is_empty() || !saw_request_header {
         return None;
     }
-    Some(serde_json::json!({ "promptArtifacts": notes }))
+
+    let artifacts = if saw_instruction {
+        entries
+            .into_iter()
+            .map(|(label, raw_path)| {
+                let mut artifact = pasted_prompt_note(raw_path)?;
+                artifact
+                    .as_object_mut()?
+                    .insert("label".to_string(), Value::String(label.to_string()));
+                Some(artifact)
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        entries
+            .into_iter()
+            .map(|(label, raw_path)| {
+                let name = absolute_prompt_path_basename(raw_path)?;
+                (label == name).then(|| {
+                    serde_json::json!({
+                        "kind": "file",
+                        "name": name
+                    })
+                })
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some(serde_json::json!({ "promptArtifacts": artifacts }))
 }
 
 fn convert_codex_item(
@@ -1553,7 +1626,7 @@ fn convert_codex_item(
                 },
             );
             if role == "user" {
-                if let Some(data) = pasted_prompt_note_data(item.get("content")) {
+                if let Some(data) = codex_prompt_artifact_data(item.get("content")) {
                     message.data = Some(data);
                 }
             }
@@ -2587,7 +2660,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            pasted_prompt_note_data(Some(&content)),
+            codex_prompt_artifact_data(Some(&content)),
             Some(json!({
                 "promptArtifacts": [{
                     "kind": "note",
@@ -2596,7 +2669,8 @@ mod tests {
                 }]
             }))
         );
-        let serialized = serde_json::to_string(&pasted_prompt_note_data(Some(&content))).unwrap();
+        let serialized =
+            serde_json::to_string(&codex_prompt_artifact_data(Some(&content))).unwrap();
         assert!(!serialized.contains("Users"));
         assert!(!serialized.contains("d5aa3020"));
 
@@ -2622,7 +2696,60 @@ mod tests {
     }
 
     #[test]
-    fn pasted_prompt_note_requires_the_complete_owned_wrapper() {
+    fn ordinary_prompt_files_emit_safe_artifact_metadata() {
+        let content = json!([{
+            "type": "input_text",
+            "text": "\n# Files mentioned by the user:\n\n## Claude-Rust vs Go compilation speed.md: e:\\Programas\\Artificial Intelligence (Ai)\\Claude\\My Commit Message Generator\\Claude-Rust vs Go compilation speed.md\n\n## schema.sql: /home/person/project/schema.sql\n\n## My request for Codex:\nUse these files.\n"
+        }]);
+
+        assert_eq!(
+            codex_prompt_artifact_data(Some(&content)),
+            Some(json!({
+                "promptArtifacts": [
+                    {
+                        "kind": "file",
+                        "name": "Claude-Rust vs Go compilation speed.md"
+                    },
+                    {
+                        "kind": "file",
+                        "name": "schema.sql"
+                    }
+                ]
+            }))
+        );
+        let serialized =
+            serde_json::to_string(&codex_prompt_artifact_data(Some(&content))).unwrap();
+        assert!(!serialized.contains("Programas"));
+        assert!(!serialized.contains("/home/person"));
+
+        let mut counter = 0;
+        let message = convert_codex_item(
+            &json!({ "type": "message", "role": "user", "content": content }),
+            "session-1",
+            None,
+            "2026-07-22T21:11:44Z",
+            &mut counter,
+        )
+        .expect("user message should be converted");
+        assert_eq!(
+            message.data,
+            Some(json!({
+                "promptArtifacts": [
+                    {
+                        "kind": "file",
+                        "name": "Claude-Rust vs Go compilation speed.md"
+                    },
+                    {
+                        "kind": "file",
+                        "name": "schema.sql"
+                    }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn prompt_artifacts_require_the_complete_owned_wrapper() {
         let mentioned = json!([{
             "type": "input_text",
             "text": "The log mentions C:\\tmp\\attachments\\d5aa3020-8ebb-49f9-b5fd-c1cfa3374e3a\\pasted-text.txt"
@@ -2631,9 +2758,24 @@ mod tests {
             "type": "input_text",
             "text": "# Files mentioned by the user:\n\n## Build output: C:\\tmp\\pasted-text.txt\n\nThe attached pasted text file(s) contain the user's request. Read and act on that content.\n\n## My request for Codex:\n"
         }]);
+        let relative = json!([{
+            "type": "input_text",
+            "text": "# Files mentioned by the user:\n\n## report.md: docs/report.md\n\n## My request for Codex:\n"
+        }]);
+        let mismatched = json!([{
+            "type": "input_text",
+            "text": "# Files mentioned by the user:\n\n## report.md: C:\\project\\other.md\n\n## My request for Codex:\n"
+        }]);
+        let incomplete = json!([{
+            "type": "input_text",
+            "text": "# Files mentioned by the user:\n\n## report.md: C:\\project\\report.md\n"
+        }]);
 
-        assert!(pasted_prompt_note_data(Some(&mentioned)).is_none());
-        assert!(pasted_prompt_note_data(Some(&outside)).is_none());
+        assert!(codex_prompt_artifact_data(Some(&mentioned)).is_none());
+        assert!(codex_prompt_artifact_data(Some(&outside)).is_none());
+        assert!(codex_prompt_artifact_data(Some(&relative)).is_none());
+        assert!(codex_prompt_artifact_data(Some(&mismatched)).is_none());
+        assert!(codex_prompt_artifact_data(Some(&incomplete)).is_none());
     }
 
     #[test]
