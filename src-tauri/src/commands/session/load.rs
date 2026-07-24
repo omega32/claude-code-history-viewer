@@ -74,7 +74,9 @@ struct SessionMetadataCache {
 // are no longer counted as authored conversation.
 // Bumped 13 -> 14: agent-invoking `/init` envelopes now count as conversational
 // boundaries instead of generic local-command plumbing.
-const CACHE_VERSION: u32 = 14;
+// Bumped 14 -> 15: provider-generated task-notification user records no longer
+// count as authored conversation or participate in title fallbacks.
+const CACHE_VERSION: u32 = 15;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -214,6 +216,7 @@ struct SessionMetadataEntry {
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
     attachment: Option<serde_json::Value>,
+    origin: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -239,6 +242,7 @@ struct QuickLineClassifier {
     custom_title: Option<String>,
     attachment: Option<serde_json::Value>,
     message: Option<SessionMetadataMessage>,
+    origin: Option<serde_json::Value>,
 }
 
 /// Fast session metadata extraction result
@@ -424,7 +428,8 @@ fn extract_session_metadata_internal(
                     )
                 });
                 let is_conversational = (entry.message_type == "user"
-                    && command_subtype != Some("local_command"))
+                    && command_subtype != Some("local_command")
+                    && !is_task_notification_origin(entry.origin.as_ref()))
                     || entry.message_type == "assistant"
                     || (entry.message_type == "attachment"
                         && queued_command_prompt(entry.attachment.as_ref()).is_some());
@@ -507,7 +512,9 @@ fn extract_session_metadata_internal(
                 // Extract first user message for summary fallback
                 // Note: last_user_content is tracked only within METADATA_PHASE_LINES (first 100 lines).
                 // For longer sessions, the actual last user message may be beyond this limit.
-                if entry.message_type == "user" {
+                if entry.message_type == "user"
+                    && !is_task_notification_origin(entry.origin.as_ref())
+                {
                     if let Some(ref msg) = entry.message {
                         if let Some(ref content) = msg.content {
                             let user_text = extract_user_text(content);
@@ -592,7 +599,8 @@ fn extract_session_metadata_internal(
                 )
             });
             let is_conversational = (classifier.message_type == "user"
-                && command_subtype != Some("local_command"))
+                && command_subtype != Some("local_command")
+                && !is_task_notification_origin(classifier.origin.as_ref()))
                 || classifier.message_type == "assistant"
                 || (classifier.message_type == "attachment"
                     && queued_command_prompt(classifier.attachment.as_ref()).is_some());
@@ -1691,6 +1699,8 @@ fn parse_line_to_message(
         (None, None, None, None, None)
     };
 
+    let is_task_notification = is_task_notification_origin(log_entry.origin.as_ref());
+
     Some(ClaudeMessage {
         uuid,
         parent_uuid: log_entry.parent_uuid,
@@ -1724,7 +1734,9 @@ fn parse_line_to_message(
         // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
         // so consumers can tell it apart from an authored user turn. Content and
         // type stay as-is — this only tags "what this record is".
-        subtype: if log_entry.is_compact_summary.unwrap_or(false) {
+        subtype: if is_task_notification {
+            Some("task_notification".to_string())
+        } else if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
         } else {
             log_entry.subtype
@@ -1754,7 +1766,24 @@ fn queued_command_prompt(attachment: Option<&serde_json::Value>) -> Option<serde
     if att.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
         return None;
     }
+    // Claude also transports background-task completions through a
+    // `queued_command` attachment, but marks them structurally. They are SDK
+    // plumbing, not text typed by the user, even if a future version stores the
+    // prompt in the usual content-block array shape.
+    if att.get("commandMode").and_then(|v| v.as_str()) == Some("task-notification") {
+        return None;
+    }
     att.get("prompt").filter(|p| p.is_array()).cloned()
+}
+
+/// Claude Code persists completed background-task notifications as synthetic
+/// user records. Trust its provider-owned origin metadata rather than matching
+/// the XML-shaped message text, which a user could legitimately quote.
+fn is_task_notification_origin(origin: Option<&serde_json::Value>) -> bool {
+    origin
+        .and_then(|value| value.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("task-notification")
 }
 
 /// Preserve the display name of a file the user explicitly attached to a
@@ -1978,6 +2007,7 @@ fn parse_line_simd(
         }
     }
 
+    let is_task_notification = is_task_notification_origin(log_entry.origin.as_ref());
     let command_subtype = log_entry.message.as_ref().and_then(|message| {
         local_command_subtype(
             &log_entry.message_type,
@@ -2046,7 +2076,9 @@ fn parse_line_simd(
         // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
         // so consumers can tell it apart from an authored user turn. Content and
         // type stay as-is — this only tags "what this record is".
-        subtype: if log_entry.is_compact_summary.unwrap_or(false) {
+        subtype: if is_task_notification {
+            Some("task_notification".to_string())
+        } else if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
         } else if let Some(subtype) = command_subtype {
             Some(subtype.to_string())
@@ -4128,6 +4160,8 @@ mod tests {
             r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
             r#"{"type":"user","uuid":"init","sessionId":"session-1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"<command-message>init</command-message>\n<command-name>/init</command-name>"}}"#.to_string(),
             r#"{"type":"attachment","uuid":"q1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued prompt"}]}}"#.to_string(),
+            r#"{"type":"user","uuid":"task1","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>completed</task-notification>"}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"task2","sessionId":"session-1","timestamp":"2026-01-01T00:00:05Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":[{"type":"text","text":"synthetic completion"}]}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:06Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             create_sample_user_message("u1", "session-1", "authored prompt"),
         ];
@@ -4135,6 +4169,7 @@ mod tests {
 
         let result = extract_session_metadata_from_file(&path).unwrap();
         assert_eq!(result.session.message_count, 4);
+        assert_eq!(result.session.summary.as_deref(), Some("authored prompt"));
     }
 
     #[test]
@@ -4153,6 +4188,8 @@ mod tests {
             r#"{"type":"user","uuid":"cmd","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>default</command-args>"}}"#.to_string(),
             r#"{"type":"user","uuid":"stdout","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<local-command-stdout>Set model to default</local-command-stdout>"}}"#.to_string(),
             r#"{"type":"user","uuid":"init","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","message":{"role":"user","content":"<command-message>init</command-message>\n<command-name>/init</command-name>"}}"#.to_string(),
+            r#"{"type":"user","uuid":"task1","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>completed</task-notification>"}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"task2","sessionId":"session-1","timestamp":"2026-01-01T00:00:09Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":[{"type":"text","text":"synthetic completion"}]}}"#.to_string(),
             r#"{"type":"attachment","uuid":"r1","sessionId":"session-1","timestamp":"2026-01-01T00:00:10Z","attachment":{"type":"todo_reminder"}}"#.to_string(),
             r#"{"type":"user","sessionId":"session-1","timestamp":"2026-01-01T00:00:11Z","isMeta":true,"message":{"role":"user","content":"internal"}}"#.to_string(),
             r#"{"type":"user","message":{"role":"user","content":"invalid without identity or time"}}"#.to_string(),
@@ -4222,6 +4259,27 @@ mod tests {
     }
 
     #[test]
+    fn task_notification_user_record_gets_provenance_subtype() {
+        let line = r#"{"type":"user","uuid":"task1","parentUuid":"a1","sessionId":"s1","timestamp":"2026-07-23T23:07:25Z","origin":{"kind":"task-notification"},"promptSource":"sdk","userType":"external","message":{"role":"user","content":"<task-notification>\n<summary>Background command completed</summary>\n</task-notification>"}}"#;
+        let mut bytes = line.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("task notification should parse");
+        assert_eq!(msg.message_type, "user");
+        assert_eq!(msg.role.as_deref(), Some("user"));
+        assert_eq!(msg.subtype.as_deref(), Some("task_notification"));
+        let fallback =
+            parse_line_to_message(0, line, false).expect("fallback parser should classify it");
+        assert_eq!(fallback.subtype.as_deref(), Some("task_notification"));
+
+        // Classification comes from provider metadata, not from XML-like text
+        // that an authored prompt could legitimately quote.
+        let quoted = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-07-23T23:08:00Z","message":{"role":"user","content":"Please explain this literal <task-notification> tag."}}"#;
+        let mut quoted_bytes = quoted.as_bytes().to_vec();
+        let quoted_msg =
+            parse_line_simd(0, &mut quoted_bytes, false).expect("quoted text should parse");
+        assert_eq!(quoted_msg.subtype, None);
+    }
+
+    #[test]
     fn local_command_user_records_get_provenance_subtype() {
         let cases = [
             r#"{"type":"user","uuid":"cmd","sessionId":"s1","timestamp":"2026-07-15T22:19:17Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-fable-5[1m]</command-args>"}}"#,
@@ -4256,6 +4314,12 @@ mod tests {
             &serde_json::json!({"type":"queued_command","prompt":[{"type":"text","text":"x"}]})
         ))
         .is_some());
+        assert!(queued_command_prompt(Some(&serde_json::json!({
+            "type": "queued_command",
+            "commandMode": "task-notification",
+            "prompt": [{"type":"text","text":"<task-notification>synthetic</task-notification>"}]
+        })))
+        .is_none());
 
         let line = r#"{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"2026-06-23T19:27:37.044Z","attachment":{"type":"todo_reminder"}}"#;
         let mut bytes = line.as_bytes().to_vec();

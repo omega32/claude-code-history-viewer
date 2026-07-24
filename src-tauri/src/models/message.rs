@@ -136,6 +136,11 @@ pub struct RawLogEntry {
     // Queue operation fields (for type: "queue-operation")
     pub operation: Option<String>,
 
+    // Provider-owned provenance for synthetic user records. Claude Code uses
+    // `origin.kind = "task-notification"` for background-task completions that
+    // must not be mistaken for authored user prompts by normalized consumers.
+    pub origin: Option<serde_json::Value>,
+
     // System message fields
     pub subtype: Option<String>,
     pub level: Option<String>,
