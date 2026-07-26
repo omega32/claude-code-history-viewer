@@ -119,6 +119,11 @@ pub struct RawLogEntry {
     #[serde(rename = "durationMs")]
     pub duration_ms: Option<u64>,
 
+    // Reasoning-effort level Claude Code stamps on assistant records (top-level
+    // `effort`, e.g. "high"/"xhigh"; present since ~v2.1.214). Mapped into the
+    // normalized `inference.reasoningEffort`; older sessions simply lack it.
+    pub effort: Option<String>,
+
     // File history snapshot fields (for type: "file-history-snapshot")
     #[serde(rename = "messageId")]
     pub message_id: Option<String>,

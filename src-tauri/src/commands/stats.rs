@@ -3562,7 +3562,15 @@ impl TryFrom<RawLogEntry> for ClaudeMessage {
             usage,
             role,
             model,
-            inference: None,
+            // Claude Code's top-level `effort` (reasoning-effort level on
+            // assistant records) seeds the normalized inference object; the
+            // provider-loading boundary folds the legacy fields in later.
+            inference: log_entry
+                .effort
+                .map(|effort| crate::models::InferenceMetadata {
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                }),
             stop_reason,
             cost_usd: log_entry.cost_usd,
             duration_ms: log_entry.duration_ms,
@@ -4137,6 +4145,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4201,6 +4210,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4257,6 +4267,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4310,6 +4321,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
 
         let result = ClaudeMessage::try_from(raw);
@@ -4363,6 +4375,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
 
         // Should succeed with timestamp even without session_id
@@ -6072,6 +6085,7 @@ mod tests {
             is_meta: None,
             is_compact_summary: None,
             attachment: None,
+            effort: None,
         };
         ClaudeMessage::try_from(raw).expect("test message construction")
     }

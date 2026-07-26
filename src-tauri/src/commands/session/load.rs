@@ -1719,7 +1719,7 @@ fn parse_line_to_message(
         usage,
         role,
         model,
-        inference: None,
+        inference: inference_from_effort(log_entry.effort),
         stop_reason,
         cost_usd: log_entry.cost_usd,
         duration_ms: log_entry.duration_ms,
@@ -1876,6 +1876,18 @@ fn local_command_subtype(
     } else {
         Some("local_command")
     }
+}
+
+/// Seed the normalized inference object from Claude Code's top-level `effort`
+/// field (the reasoning-effort level stamped on assistant records since
+/// ~v2.1.214). The provider-loading boundary's `hydrate_inference` later folds
+/// the legacy top-level model/stop/usage fields into the same object while
+/// preserving this provider-set value; records without `effort` stay `None`.
+fn inference_from_effort(effort: Option<String>) -> Option<crate::models::InferenceMetadata> {
+    effort.map(|effort| crate::models::InferenceMetadata {
+        reasoning_effort: Some(effort),
+        ..Default::default()
+    })
 }
 
 fn parse_line_simd(
@@ -2061,7 +2073,7 @@ fn parse_line_simd(
         usage,
         role,
         model,
-        inference: None,
+        inference: inference_from_effort(log_entry.effort),
         stop_reason,
         cost_usd: log_entry.cost_usd,
         duration_ms: log_entry.duration_ms,
@@ -3473,6 +3485,34 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(50));
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
         assert_eq!(usage.cache_read_input_tokens, Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_assistant_effort_maps_to_inference_reasoning_effort() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Claude Code stamps a top-level `effort` beside `message` on assistant
+        // records; a user record without one must not grow an inference object.
+        let content = r#"{"uuid":"uuid-1","sessionId":"session-1","timestamp":"2026-07-26T10:00:00Z","type":"user","message":{"role":"user","content":"hi"}}
+{"uuid":"uuid-2","parentUuid":"uuid-1","sessionId":"session-1","timestamp":"2026-07-26T10:00:01Z","type":"assistant","effort":"high","message":{"role":"assistant","content":[{"type":"text","text":"Hello!"}],"id":"msg_1","model":"claude-fable-5"}}
+"#;
+
+        let file_path = temp_dir.path().join("test.jsonl");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+
+        let result = load_session_messages(file_path.to_string_lossy().to_string()).await;
+
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].inference.is_none());
+
+        let inference = messages[1].inference.as_ref().expect("inference seeded");
+        assert_eq!(inference.reasoning_effort.as_deref(), Some("high"));
+        // The legacy top-level model stays where it was; hydration folds it in
+        // at the provider-loading boundary, not here.
+        assert_eq!(messages[1].model.as_deref(), Some("claude-fable-5"));
     }
 
     #[tokio::test]
