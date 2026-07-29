@@ -420,9 +420,10 @@ pub fn run_hide_session(args: &[String]) -> i32 {
 
 // ── Copilot (VS Code) session lifecycle: `orphan` and `archived` ─────────────
 //
-// VS Code Copilot Chat writes each session to
-// `workspaceStorage/<hash>/chatSessions/<id>.jsonl` and tracks two independent
-// per-workspace states in that workspace's own `state.vscdb`:
+// VS Code Copilot Chat writes each session to either
+// `workspaceStorage/<hash>/chatSessions/<id>.jsonl` or
+// `globalStorage/emptyWindowChatSessions/<id>.jsonl`, and tracks two independent
+// states in the owning workspace/global `state.vscdb`:
 //   • `chat.ChatSessionStore.index` — the recent-session list, hard-capped at 50
 //     (VS Code's `trimEntries`). When a workspace exceeds 50, the oldest by
 //     recency are dropped *from the index only* (the file stays). So a listed
@@ -435,7 +436,7 @@ pub fn run_hide_session(args: &[String]) -> i32 {
 // A user *delete* removes the file outright, so it never reaches this listing and
 // needs no marker. `archived` takes precedence over `orphan` (an archived session
 // is deliberately hidden, not merely aged out), so a session is at most one of the
-// two. Both are read live from the workspace `state.vscdb`; best-effort — an
+// two. Both are read live from the owning `state.vscdb`; best-effort — an
 // unreadable store just yields neither mark. VS Code surface only.
 const COPILOT_CHAT_INDEX_KEY: &str = "chat.ChatSessionStore.index";
 const COPILOT_AGENT_STATE_KEY: &str = "agentSessions.state.cache";
@@ -455,17 +456,16 @@ struct WorkspaceChatState {
     pinned_ids: HashSet<String>,
 }
 
-/// The workspace `state.vscdb` for a Copilot VS Code session, derived from the
-/// session's own absolute file path `…/workspaceStorage/<hash>/chatSessions/
-/// <id>.jsonl` — so it works regardless of where the editor's user-data dir lives
-/// (default or a custom/portable location). `None` if the shape doesn't match or
-/// the db is absent.
+/// The owning `state.vscdb` for a Copilot VS Code session, derived from either
+/// `…/workspaceStorage/<hash>/chatSessions/<id>.jsonl` or
+/// `…/globalStorage/emptyWindowChatSessions/<id>.jsonl`. `None` if the shape
+/// doesn't match or the database is absent.
 fn copilot_workspace_state_db(file_path: &str) -> Option<PathBuf> {
-    let chat_sessions = Path::new(file_path).parent()?;
-    if chat_sessions.file_name()?.to_str()? != "chatSessions" {
-        return None;
-    }
-    let db = chat_sessions.parent()?.join("state.vscdb");
+    let sessions = Path::new(file_path).parent()?;
+    let db = match sessions.file_name()?.to_str()? {
+        "chatSessions" | "emptyWindowChatSessions" => sessions.parent()?.join("state.vscdb"),
+        _ => return None,
+    };
     db.is_file().then_some(db)
 }
 
@@ -484,9 +484,8 @@ fn local_chat_resource(session_id: &str) -> String {
     )
 }
 
-/// VS Code-family flavor that owns one workspace-state database. The database
-/// path itself is authoritative even for custom user-data locations because the
-/// final shape remains `<flavor>/User/workspaceStorage/<hash>/state.vscdb`.
+/// VS Code-family flavor that owns one workspace/global-state database. The
+/// database path itself is authoritative even for custom user-data locations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditorFlavor {
     Code,
@@ -530,23 +529,54 @@ impl EditorFlavor {
     }
 }
 
-fn editor_flavor_for_state_db(db: &Path) -> Option<EditorFlavor> {
-    let workspace = db.parent()?;
-    let workspace_storage = workspace.parent()?;
-    if workspace_storage.file_name()?.to_str()? != "workspaceStorage" {
-        return None;
-    }
-    let user = workspace_storage.parent()?;
-    if user.file_name()?.to_str()? != "User" {
-        return None;
-    }
-    let flavor = user.parent()?.file_name()?.to_str()?;
-    match flavor {
+fn editor_flavor_for_user_data_root(user: &Path) -> Option<EditorFlavor> {
+    match user.parent()?.file_name()?.to_str()? {
         "Code" => Some(EditorFlavor::Code),
         "Code - Insiders" => Some(EditorFlavor::CodeInsiders),
         "VSCodium" => Some(EditorFlavor::Vscodium),
         _ => None,
     }
+}
+
+fn known_editor_user_data_roots() -> Vec<(PathBuf, EditorFlavor)> {
+    crate::providers::vscode::get_base_paths()
+        .into_iter()
+        .filter_map(|root| {
+            let flavor = editor_flavor_for_user_data_root(&root)?;
+            Some((root.canonicalize().ok()?, flavor))
+        })
+        .collect()
+}
+
+fn editor_flavor_for_state_db_in(
+    db: &Path,
+    known_roots: &[(PathBuf, EditorFlavor)],
+) -> Option<EditorFlavor> {
+    let owner = db.parent()?;
+    let user = if owner.file_name()?.to_str()? == "globalStorage" {
+        owner.parent()?
+    } else {
+        let workspace_storage = owner.parent()?;
+        if workspace_storage.file_name()?.to_str()? != "workspaceStorage" {
+            return None;
+        }
+        workspace_storage.parent()?
+    };
+    if user.file_name()?.to_str()? != "User" {
+        return None;
+    }
+    if let Some(flavor) = editor_flavor_for_user_data_root(user) {
+        return Some(flavor);
+    }
+
+    let canonical_user = user.canonicalize().ok()?;
+    known_roots
+        .iter()
+        .find_map(|(root, flavor)| (root == &canonical_user).then_some(*flavor))
+}
+
+fn editor_flavor_for_state_db(db: &Path) -> Option<EditorFlavor> {
+    editor_flavor_for_state_db_in(db, &known_editor_user_data_roots())
 }
 
 /// External edits to VS Code workspace state can be overwritten by the editor's
@@ -705,8 +735,8 @@ fn set_copilot_archive_in_db(
 
 const COPILOT_ARCHIVE_USAGE: &str =
     "Usage: --archive-session <session-path> | --unarchive-session <session-path> --provider copilot [--format json] [--output <file>]\n\n\
-Update Copilot VS Code's reversible per-workspace archive state. The selected\n\
-session must be a local chatSessions/<id>.jsonl file, and its owning editor must\n\
+Update Copilot VS Code's reversible archive state. The selected session must be\n\
+a local chatSessions or emptyWindowChatSessions JSONL file, and its editor must\n\
 be fully stopped so it cannot overwrite the external state change.";
 
 /// Handle Copilot VS Code archive/unarchive. The session path is deliberately
@@ -734,7 +764,7 @@ pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
     }
     let path = Path::new(&session_path);
     let Some(db) = copilot_workspace_state_db(&session_path) else {
-        eprintln!("The selected session is not a Copilot VS Code chatSessions file with an adjacent state.vscdb");
+        eprintln!("The selected session is not a managed Copilot VS Code chat file with an owning state.vscdb");
         return 1;
     };
     let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -762,9 +792,9 @@ pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
     }
 }
 
-/// Read a Copilot VS Code workspace's chat state (recent-list, archived, and
-/// pinned ids) from its `state.vscdb`. Best-effort per key — a missing/locked db
-/// or key just yields the empty/`None` default.
+/// Read a Copilot VS Code store's chat state (recent-list, archived, and pinned
+/// ids) from its workspace/global `state.vscdb`. Best-effort per key — a
+/// missing/locked db or key just yields the empty/`None` default.
 fn read_workspace_chat_state(db: &Path) -> WorkspaceChatState {
     let mut state = WorkspaceChatState::default();
     let Ok(conn) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
@@ -1751,8 +1781,44 @@ mod tests {
             Some(EditorFlavor::Vscodium)
         );
         assert_eq!(
+            editor_flavor_for_state_db(&root.join("Code/User/globalStorage/state.vscdb")),
+            Some(EditorFlavor::Code)
+        );
+        assert_eq!(
             editor_flavor_for_state_db(&root.join("unknown/state.vscdb")),
             None
+        );
+    }
+
+    #[test]
+    fn copilot_archive_identifies_a_redirected_editor_user_data_root() {
+        let temp = TempDir::new().unwrap();
+        let physical_user = temp.path().join("Visual Studio Code").join("User");
+        let db = physical_user.join("globalStorage").join("state.vscdb");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, "").unwrap();
+        let known_roots = vec![(physical_user.canonicalize().unwrap(), EditorFlavor::Code)];
+
+        assert_eq!(
+            editor_flavor_for_state_db_in(&db, &known_roots),
+            Some(EditorFlavor::Code)
+        );
+    }
+
+    #[test]
+    fn copilot_empty_window_session_resolves_global_state_database() {
+        let temp = TempDir::new().unwrap();
+        let global = temp.path().join("User").join("globalStorage");
+        let chats = global.join("emptyWindowChatSessions");
+        std::fs::create_dir_all(&chats).unwrap();
+        let db = global.join("state.vscdb");
+        create_item_table(&db, &[]);
+        let session = chats.join("session.jsonl");
+        std::fs::write(&session, "{}").unwrap();
+
+        assert_eq!(
+            copilot_workspace_state_db(&session.to_string_lossy()),
+            Some(db)
         );
     }
 

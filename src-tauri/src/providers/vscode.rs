@@ -1,7 +1,9 @@
 //! VS Code Copilot Chat history provider.
 //!
-//! VS Code stores Copilot Chat conversations per workspace, under
-//! `<UserData>/workspaceStorage/<hash>/chatSessions/<sessionUuid>.jsonl`.
+//! VS Code stores Copilot Chat conversations either per workspace under
+//! `<UserData>/workspaceStorage/<hash>/chatSessions/<sessionUuid>.jsonl`, or
+//! without a workspace under
+//! `<UserData>/globalStorage/emptyWindowChatSessions/<sessionUuid>.jsonl`.
 //! Each `.jsonl` file is *not* a stream of messages — it's an append-only
 //! patch log on top of an initial snapshot:
 //!
@@ -32,6 +34,8 @@ use std::path::{Path, PathBuf};
 /// disambiguation lives in `entrypoint = "copilot-vscode"`.
 const PROVIDER_ID: &str = "copilot";
 const ENTRYPOINT: &str = "copilot-vscode";
+const EMPTY_WINDOW_DIR: &str = "emptyWindowChatSessions";
+const EMPTY_WINDOW_PROJECT_SCHEME: &str = "vscode-empty-window://";
 
 #[derive(Debug, Clone)]
 struct UserDataRoot {
@@ -43,9 +47,9 @@ struct UserDataRoot {
 pub fn detect() -> Option<ProviderInfo> {
     let roots = get_user_data_roots();
     let base = roots.first()?.path.clone();
-    let is_available = roots
-        .iter()
-        .any(|root| root.path.join("workspaceStorage").is_dir());
+    let is_available = roots.iter().any(|root| {
+        root.path.join("workspaceStorage").is_dir() || empty_window_chat_dir(&root.path).is_dir()
+    });
     Some(ProviderInfo {
         id: PROVIDER_ID.to_string(),
         display_name: "VS Code".to_string(),
@@ -134,6 +138,55 @@ fn get_workspace_storage_roots() -> Result<Vec<PathBuf>, String> {
     }
 }
 
+fn empty_window_chat_dir(user_data_path: &Path) -> PathBuf {
+    user_data_path.join("globalStorage").join(EMPTY_WINDOW_DIR)
+}
+
+fn empty_window_project_path(user_data_path: &Path) -> String {
+    format!(
+        "{EMPTY_WINDOW_PROJECT_SCHEME}{}",
+        user_data_path.to_string_lossy()
+    )
+}
+
+fn empty_window_project_identity(custom_directory_label: Option<&str>) -> String {
+    let id = match custom_directory_label {
+        None | Some("VS Code") => "code",
+        Some("VS Code Insiders") => "code-insiders",
+        Some("VSCodium") => "vscodium",
+        Some(label) => label,
+    };
+    format!("{EMPTY_WINDOW_PROJECT_SCHEME}{id}")
+}
+
+fn empty_window_project_name(
+    user_data_path: &Path,
+    custom_directory_label: Option<&str>,
+) -> String {
+    let flavor = custom_directory_label
+        .map(ToString::to_string)
+        .or_else(|| {
+            user_data_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(|name| match name {
+                    "Code - Insiders" => "VS Code Insiders".to_string(),
+                    "VSCodium" => "VSCodium".to_string(),
+                    _ => "VS Code".to_string(),
+                })
+        })
+        .unwrap_or_else(|| "VS Code".to_string());
+    format!("{flavor} — Empty Window")
+}
+
+fn user_data_roots_from_workspace_roots(workspace_storage_roots: &[PathBuf]) -> Vec<PathBuf> {
+    workspace_storage_roots
+        .iter()
+        .filter_map(|root| root.parent().map(Path::to_path_buf))
+        .collect()
+}
+
 fn is_wsl_unc_path(path: &Path) -> bool {
     let path = path.to_string_lossy();
     path.starts_with(r"\\wsl.localhost\")
@@ -167,6 +220,34 @@ fn is_wsl_workspace_storage_path(path: &Path) -> bool {
     ]
     .iter()
     .any(|segment| path.contains(segment))
+}
+
+fn is_wsl_empty_window_path(path: &Path) -> bool {
+    if !is_wsl_unc_path(path) {
+        return false;
+    }
+    let path = path.to_string_lossy().replace('/', "\\");
+    [
+        r"\.vscode-server\data\User\globalStorage\emptyWindowChatSessions\",
+        r"\.vscode-server-insiders\data\User\globalStorage\emptyWindowChatSessions\",
+        r"\.vscodium-server\data\User\globalStorage\emptyWindowChatSessions\",
+    ]
+    .iter()
+    .any(|segment| path.contains(segment))
+}
+
+fn is_wsl_user_data_path(path: &Path) -> bool {
+    if !is_wsl_unc_path(path) {
+        return false;
+    }
+    let path = path.to_string_lossy().replace('/', "\\");
+    [
+        r"\.vscode-server\data\User",
+        r"\.vscode-server-insiders\data\User",
+        r"\.vscodium-server\data\User",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
 }
 
 fn validate_workspace_path_in(
@@ -209,23 +290,33 @@ fn validate_session_path_in(
     {
         return Err("VS Code session path must be a JSONL file".to_string());
     }
-    if path
+    let parent_name = path
         .parent()
         .and_then(Path::file_name)
-        .and_then(|n| n.to_str())
-        != Some("chatSessions")
-    {
-        return Err("VS Code session path must be inside a chatSessions directory".to_string());
+        .and_then(|n| n.to_str());
+    if parent_name != Some("chatSessions") && parent_name != Some(EMPTY_WINDOW_DIR) {
+        return Err(
+            "VS Code session path must be inside chatSessions or emptyWindowChatSessions"
+                .to_string(),
+        );
     }
 
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("Failed to resolve VS Code session path: {e}"))?;
 
-    if !is_within_any_root(&canonical, workspace_storage_roots)
-        && !is_wsl_workspace_storage_path(&canonical)
-    {
-        return Err("VS Code session path is outside workspaceStorage".to_string());
+    let managed_workspace = parent_name == Some("chatSessions")
+        && (is_within_any_root(&canonical, workspace_storage_roots)
+            || is_wsl_workspace_storage_path(&canonical));
+    let user_data_roots = user_data_roots_from_workspace_roots(workspace_storage_roots);
+    let managed_empty_window = parent_name == Some(EMPTY_WINDOW_DIR)
+        && (user_data_roots.iter().any(|root| {
+            empty_window_chat_dir(root)
+                .canonicalize()
+                .is_ok_and(|dir| canonical.starts_with(dir))
+        }) || is_wsl_empty_window_path(&canonical));
+    if !managed_workspace && !managed_empty_window {
+        return Err("VS Code session path is outside managed chat storage".to_string());
     }
 
     Ok(canonical)
@@ -251,10 +342,15 @@ pub fn scan_projects_from_user_data_path(
     user_data_path: &Path,
     custom_directory_label: Option<&str>,
 ) -> Result<Vec<ClaudeProject>, String> {
-    scan_projects_in(
+    let mut projects = scan_projects_in(
         &user_data_path.join("workspaceStorage"),
         custom_directory_label,
-    )
+    )?;
+    if let Some(project) = scan_empty_window_project(user_data_path, custom_directory_label)? {
+        projects.push(project);
+    }
+    projects.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(projects)
 }
 
 fn scan_projects_in(
@@ -350,6 +446,44 @@ fn scan_workspace(
     }))
 }
 
+fn scan_empty_window_project(
+    user_data_path: &Path,
+    custom_directory_label: Option<&str>,
+) -> Result<Option<ClaudeProject>, String> {
+    let chat_dir = empty_window_chat_dir(user_data_path);
+    if !chat_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut session_count = 0usize;
+    let mut message_count = 0usize;
+    let mut last_modified_ms = 0u64;
+    for (_, info) in list_session_metadata(&chat_dir)? {
+        if info.message_count == 0 {
+            continue;
+        }
+        session_count += 1;
+        message_count += info.message_count;
+        last_modified_ms = last_modified_ms.max(info.last_modified_ms);
+    }
+    if session_count == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(ClaudeProject {
+        name: empty_window_project_name(user_data_path, custom_directory_label),
+        path: empty_window_project_path(user_data_path),
+        actual_path: empty_window_project_identity(custom_directory_label),
+        session_count,
+        message_count,
+        last_modified: ms_to_iso(last_modified_ms),
+        git_info: None,
+        provider: Some(PROVIDER_ID.to_string()),
+        storage_type: None,
+        custom_directory_label: custom_directory_label.map(ToString::to_string),
+    }))
+}
+
 /// Sessions for a single workspace.
 pub fn load_sessions(
     project_path: &str,
@@ -363,6 +497,28 @@ fn load_sessions_in(
     project_path: &str,
     workspace_storage_roots: &[PathBuf],
 ) -> Result<Vec<ClaudeSession>, String> {
+    if let Some(raw_user_data_path) = project_path.strip_prefix(EMPTY_WINDOW_PROJECT_SCHEME) {
+        let raw = PathBuf::from(raw_user_data_path);
+        if !raw.is_absolute() {
+            return Err("VS Code empty-window user-data path must be absolute".to_string());
+        }
+        let canonical = raw
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve VS Code user-data path: {e}"))?;
+        let allowed = user_data_roots_from_workspace_roots(workspace_storage_roots);
+        let managed = allowed.iter().any(|root| {
+            root.canonicalize()
+                .is_ok_and(|allowed| canonical == allowed)
+        }) || is_wsl_user_data_path(&canonical);
+        if !managed {
+            return Err("VS Code empty-window path is outside managed user data".to_string());
+        }
+        return load_sessions_from_chat_dir(
+            &empty_window_chat_dir(&canonical),
+            &empty_window_project_name(&canonical, None),
+        );
+    }
+
     let ws_path_buf = validate_workspace_path_in(project_path, workspace_storage_roots)?;
 
     let chat_dir = ws_path_buf.join("chatSessions");
@@ -380,8 +536,19 @@ fn load_sessions_in(
         })
         .unwrap_or_else(|| "VS Code".to_string());
 
+    load_sessions_from_chat_dir(&chat_dir, &project_name)
+}
+
+fn load_sessions_from_chat_dir(
+    chat_dir: &Path,
+    project_name: &str,
+) -> Result<Vec<ClaudeSession>, String> {
+    if !chat_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
     let mut sessions = Vec::new();
-    for (session_path, info) in list_session_metadata(&chat_dir)? {
+    for (session_path, info) in list_session_metadata(chat_dir)? {
         // Skip empty sessions (e.g., chat panels opened but never used).
         if info.message_count == 0 {
             continue;
@@ -391,7 +558,7 @@ fn load_sessions_in(
             session_id: session_path.to_string_lossy().to_string(),
             actual_session_id: info.session_id,
             file_path: session_path.to_string_lossy().to_string(),
-            project_name: project_name.clone(),
+            project_name: project_name.to_string(),
             message_count: info.message_count,
             first_message_time: ms_to_iso(info.first_message_ms),
             last_message_time: ms_to_iso(info.last_modified_ms),
@@ -415,6 +582,10 @@ fn load_sessions_in(
 /// Replay the patch log, then convert each request into messages.
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let path = validate_session_path(session_path)?;
+    load_messages_from_path(&path)
+}
+
+fn load_messages_from_path(path: &Path) -> Result<Vec<ClaudeMessage>, String> {
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let state = replay_session(&raw)?;
     Ok(messages_from_state(&state))
@@ -427,6 +598,12 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     for root in get_user_data_roots() {
         search_workspace_storage(
             &root.path.join("workspaceStorage"),
+            &query_lower,
+            limit,
+            &mut results,
+        )?;
+        search_chat_dir(
+            &empty_window_chat_dir(&root.path),
             &query_lower,
             limit,
             &mut results,
@@ -447,6 +624,12 @@ pub fn search_from_user_data_path(
     let mut results = Vec::new();
     search_workspace_storage(
         &user_data_path.join("workspaceStorage"),
+        &query_lower,
+        limit,
+        &mut results,
+    )?;
+    search_chat_dir(
+        &empty_window_chat_dir(user_data_path),
         &query_lower,
         limit,
         &mut results,
@@ -474,39 +657,52 @@ fn search_workspace_storage(
             continue;
         }
 
-        for entry in fs::read_dir(&chat_dir)
-            .map_err(|e| e.to_string())?
-            .flatten()
-        {
-            let session_path = entry.path();
-            if is_symlink(&session_path) || !session_path.is_file() {
-                continue;
-            }
-            if session_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-                != Some("jsonl")
-            {
-                continue;
-            }
+        search_chat_dir(&chat_dir, query_lower, limit, results)?;
+        if results.len() >= limit {
+            return Ok(());
+        }
+    }
 
-            if let Ok(messages) = load_messages(&session_path.to_string_lossy()) {
-                for msg in messages {
-                    if results.len() >= limit {
-                        return Ok(());
-                    }
-                    if let Some(content) = &msg.content {
-                        if search_json_value_case_insensitive(content, query_lower) {
-                            results.push(msg);
-                        }
+    Ok(())
+}
+
+fn search_chat_dir(
+    chat_dir: &Path,
+    query_lower: &str,
+    limit: usize,
+    results: &mut Vec<ClaudeMessage>,
+) -> Result<(), String> {
+    if !chat_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(chat_dir).map_err(|e| e.to_string())?.flatten() {
+        let session_path = entry.path();
+        if is_symlink(&session_path) || !session_path.is_file() {
+            continue;
+        }
+        if session_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            != Some("jsonl")
+        {
+            continue;
+        }
+
+        if let Ok(messages) = load_messages_from_path(&session_path) {
+            for msg in messages {
+                if results.len() >= limit {
+                    return Ok(());
+                }
+                if let Some(content) = &msg.content {
+                    if search_json_value_case_insensitive(content, query_lower) {
+                        results.push(msg);
                     }
                 }
             }
         }
     }
-
     Ok(())
 }
 
@@ -2460,6 +2656,66 @@ mod tests {
     }
 
     #[test]
+    fn scan_and_load_empty_window_sessions_as_a_synthetic_project() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let chat_dir = user_data
+            .path()
+            .join("globalStorage")
+            .join("emptyWindowChatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+
+        fs::write(
+            chat_dir.join("empty-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"),
+            json!({"kind": 0, "v": {
+                "sessionId": "empty-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "creationDate": 1779490058917u64,
+                "requests": []
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            chat_dir.join("used-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"),
+            json!({"kind": 0, "v": {
+                "sessionId": "used-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "creationDate": 1779490058917u64,
+                "requests": [{
+                    "message": {"text": "hello from an empty window"},
+                    "response": []
+                }]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let projects = scan_projects_from_user_data_path(user_data.path(), None).unwrap();
+        let project = projects
+            .iter()
+            .find(|project| project.name == "VS Code — Empty Window")
+            .expect("a non-empty empty-window chat must create a synthetic project");
+        assert_eq!(project.actual_path, "vscode-empty-window://code");
+        assert_eq!(project.session_count, 1);
+        assert_eq!(project.message_count, 1);
+
+        let workspace_roots = vec![user_data.path().join("workspaceStorage")];
+        let sessions = load_sessions_in(&project.path, &workspace_roots).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].actual_session_id,
+            "used-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(sessions[0].project_name, "VS Code — Empty Window");
+        assert_eq!(sessions[0].entrypoint.as_deref(), Some(ENTRYPOINT));
+
+        let matches =
+            search_from_user_data_path(user_data.path(), "hello from an empty window", 10).unwrap();
+        assert!(
+            !matches.is_empty(),
+            "global search must include empty-window chat messages"
+        );
+    }
+
+    #[test]
     fn path_validation_rejects_paths_outside_workspace_storage() {
         let ws_root = tempfile::TempDir::new().unwrap();
         let workspace = ws_root.path().join("hash-used");
@@ -2485,5 +2741,46 @@ mod tests {
         assert!(validate_session_path_in(&session_path.to_string_lossy(), &roots).is_ok());
         assert!(validate_workspace_path_in(&outside_workspace.to_string_lossy(), &roots).is_err());
         assert!(validate_session_path_in(&outside_session.to_string_lossy(), &roots).is_err());
+    }
+
+    #[test]
+    fn session_validation_accepts_only_managed_empty_window_storage() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let managed = user_data
+            .path()
+            .join("globalStorage")
+            .join("emptyWindowChatSessions")
+            .join("managed.jsonl");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "{}").unwrap();
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let unmanaged = outside
+            .path()
+            .join("globalStorage")
+            .join("emptyWindowChatSessions")
+            .join("unmanaged.jsonl");
+        fs::create_dir_all(unmanaged.parent().unwrap()).unwrap();
+        fs::write(&unmanaged, "{}").unwrap();
+
+        let roots = vec![user_data.path().join("workspaceStorage")];
+        assert!(validate_session_path_in(&managed.to_string_lossy(), &roots).is_ok());
+        assert!(validate_session_path_in(&unmanaged.to_string_lossy(), &roots).is_err());
+    }
+
+    #[test]
+    fn wsl_user_data_validation_requires_a_known_server_root() {
+        assert!(is_wsl_user_data_path(Path::new(
+            r"\\wsl.localhost\Ubuntu\home\me\.vscode-server\data\User"
+        )));
+        assert!(is_wsl_user_data_path(Path::new(
+            r"\\wsl$\Ubuntu\home\me\.vscodium-server\data\User"
+        )));
+        assert!(!is_wsl_user_data_path(Path::new(
+            r"\\wsl.localhost\Ubuntu\home\me\other\data\User"
+        )));
+        assert!(!is_wsl_user_data_path(Path::new(
+            r"\\wsl.localhost\Ubuntu\home\me\.vscode-server\data\User\extra"
+        )));
     }
 }

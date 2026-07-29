@@ -32,6 +32,7 @@ pub const PROVIDER_ID: &str = "copilot";
 
 /// Synthetic URL scheme for merged Copilot projects.
 const PROJECT_SCHEME: &str = "copilot://";
+const VSCODE_EMPTY_WINDOW_PROJECT_SCHEME: &str = "vscode-empty-window://";
 
 /// Which sub-provider a source path belongs to. Stored inside the merged
 /// project URL so `load_sessions` can dispatch directly without rescanning
@@ -152,10 +153,14 @@ fn merge_projects(parts: Vec<(SourceKind, ClaudeProject)>) -> Vec<ClaudeProject>
                 .find(|p| !p.starts_with("file://"))
                 .unwrap_or(&template.actual_path)
                 .to_string();
-            let name = Path::new(&actual_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| template.name.clone());
+            let name = if actual_path.starts_with(VSCODE_EMPTY_WINDOW_PROJECT_SCHEME) {
+                template.name.clone()
+            } else {
+                Path::new(&actual_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| template.name.clone())
+            };
 
             let sources: Vec<SourceRef> = group
                 .iter()
@@ -296,8 +301,10 @@ fn load_sessions_fallback(project_path: &str, exclude: bool) -> Vec<ClaudeSessio
 
 /// Heuristic: does this look like a VS Code chat session file path?
 fn is_vscode_session_path(session_path: &str) -> bool {
-    (session_path.contains("/workspaceStorage/") || session_path.contains("\\workspaceStorage\\"))
-        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\"))
+    ((session_path.contains("/workspaceStorage/") || session_path.contains("\\workspaceStorage\\"))
+        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\")))
+        || session_path.contains("/globalStorage/emptyWindowChatSessions/")
+        || session_path.contains("\\globalStorage\\emptyWindowChatSessions\\")
 }
 
 fn sort_and_truncate_results(results: &mut Vec<ClaudeMessage>, limit: usize) {
@@ -482,6 +489,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_preserves_empty_window_project_identity_and_name() {
+        let mut empty = project(
+            "vscode-empty-window://code",
+            "vscode-empty-window:///Users/me/Library/Application Support/Code/User",
+            1,
+            2,
+        );
+        empty.name = "VS Code — Empty Window".to_string();
+
+        let merged = merge_projects(vec![(SourceKind::VsCode, empty)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "VS Code — Empty Window");
+        assert_eq!(merged[0].actual_path, "vscode-empty-window://code");
+    }
+
+    #[test]
     fn project_ref_round_trips() {
         let r = ProjectRef {
             actual: "/Users/me/repo".to_string(),
@@ -532,6 +555,12 @@ mod tests {
         ));
         assert!(is_vscode_session_path(
             r"C:\Users\me\AppData\Roaming\Code\User\workspaceStorage\abc\chatSessions\x.jsonl"
+        ));
+        assert!(is_vscode_session_path(
+            "/Users/me/Library/Application Support/Code/User/globalStorage/emptyWindowChatSessions/x.jsonl"
+        ));
+        assert!(is_vscode_session_path(
+            r"C:\Users\me\AppData\Roaming\Code\User\globalStorage\emptyWindowChatSessions\x.jsonl"
         ));
         assert!(!is_vscode_session_path(
             "/Users/me/.copilot/session-state/abc/events.jsonl"

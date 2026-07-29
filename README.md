@@ -68,7 +68,7 @@ AI coding assistants generate thousands of conversation messages, but none of th
 | Provider | Data Location | What You Get |
 |----------|--------------|--------------|
 | **Claude Code** | `~/.claude/projects/` | Full conversation history, tool use, thinking, costs |
-| **GitHub Copilot** | `~/.copilot/session-state/` (CLI & Desktop), VS Code `workspaceStorage/.../chatSessions/` | Copilot CLI, Copilot Desktop, and VS Code Copilot Chat history (read-only, WSL-aware) |
+| **GitHub Copilot** | `~/.copilot/session-state/` (CLI & Desktop), VS Code `workspaceStorage/.../chatSessions/` and `globalStorage/emptyWindowChatSessions/` | Copilot CLI, Copilot Desktop, and workspace-backed or projectless VS Code Copilot Chat history (read-only, WSL-aware) |
 | **Gemini CLI** | `~/.gemini/history/` | Conversation history with tool calls |
 | **Antigravity** | `~/.gemini/antigravity/` | Conversation state under `brain/` plus token monitor data under `.token-monitor/rpc-cache/v1/` |
 | **Codex CLI** | `~/.codex/sessions/` | Session rollouts with agent responses |
@@ -156,7 +156,7 @@ Antigravity note: the viewer resolves the Antigravity root as `~/.gemini/antigra
 
 | Feature | Description |
 |---------|-------------|
-| **GitHub Copilot Provider** | Read-only history from **Copilot CLI** (`~/.copilot/session-state`), **Copilot Desktop**, and **VS Code Copilot Chat** (`workspaceStorage/.../chatSessions`) — WSL-aware, with global search |
+| **GitHub Copilot Provider** | Read-only history from **Copilot CLI** (`~/.copilot/session-state`), **Copilot Desktop**, and **VS Code Copilot Chat** (`workspaceStorage/.../chatSessions` plus `globalStorage/emptyWindowChatSessions`) — WSL-aware, with global search |
 | **Headless Session Export** | New `--export <session-id\|/abs/path.jsonl> [--format html\|json] [--output <file>]` flag renders an HTML or JSON report and exits without launching the GUI — for SSH/CI use |
 | **One-Click Full Backup** | An Archive Manager "Full Backup" card copies every session from all Claude Code projects into archives in one action, so history survives Claude Code's automatic cleanup |
 | **Skill & Subagent Analytics** | New "Most Used Skills" / "Most Used Subagents" sections break Claude `Skill` and `Agent` calls out by name, at project and global scope |

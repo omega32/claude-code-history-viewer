@@ -21,7 +21,7 @@ never as a mandatory first step.
 
 ## Project Overview
 
-Claude Code History Viewer is a Tauri-based desktop application that allows users to browse and analyze conversation history from multiple AI coding assistants: Claude Code (`~/.claude`), Codex CLI (`~/.codex`), OpenCode (`~/.local/share/opencode/`), GitHub Copilot CLI (`~/.copilot/session-state/`), and VS Code Copilot Chat (`<UserData>/workspaceStorage/<hash>/chatSessions/`).
+Claude Code History Viewer is a Tauri-based desktop application that allows users to browse and analyze conversation history from multiple AI coding assistants: Claude Code (`~/.claude`), Codex CLI (`~/.codex`), OpenCode (`~/.local/share/opencode/`), GitHub Copilot CLI (`~/.copilot/session-state/`), and VS Code Copilot Chat (`<UserData>/workspaceStorage/<hash>/chatSessions/` plus projectless chats in `<UserData>/globalStorage/emptyWindowChatSessions/`).
 
 ## Development Commands
 
@@ -251,7 +251,8 @@ Codex CLI:          ~/.codex/sessions/**/rollout-*.jsonl                        
 OpenCode:           ~/.local/share/opencode/storage/                                   │
 Copilot CLI:        ~/.copilot/session-state/<id>/events.jsonl   (workspace.yaml:      ├→ Rust Backend → Tauri IPC → React Frontend → Virtual List
 Copilot Desktop:    ~/.copilot/session-state/<id>/events.jsonl    client_name routes)  │
-VS Code Copilot:    <UserData>/workspaceStorage/<hash>/chatSessions/*.jsonl            ─┘
+VS Code Copilot:    <UserData>/{workspaceStorage/<hash>/chatSessions,                  │
+                              globalStorage/emptyWindowChatSessions}/*.jsonl           ─┘
 ```
 
 ### Frontend (React + TypeScript)
