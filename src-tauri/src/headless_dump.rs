@@ -146,6 +146,8 @@ enum SessionSnapshotEnvelope {
         messages: Vec<ClaudeMessage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+        #[serde(rename = "cursorReplaceFrom", skip_serializing_if = "Option::is_none")]
+        cursor_replace_from: Option<usize>,
     },
     Unchanged {
         cursor: String,
@@ -155,6 +157,8 @@ enum SessionSnapshotEnvelope {
         replace_from: usize,
         messages: Vec<ClaudeMessage>,
         cursor: String,
+        #[serde(rename = "cursorReplaceFrom")]
+        cursor_replace_from: usize,
     },
 }
 
@@ -268,6 +272,7 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
                 reason: "unsupported-provider".to_string(),
                 messages,
                 cursor: None,
+                cursor_replace_from: None,
             });
         }
 
@@ -280,10 +285,15 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
                 let original_len = messages.len();
                 let messages = finalize_loaded_messages(messages);
                 let cursor = (messages.len() == original_len).then_some(cursor).flatten();
+                let cursor_replace_from = cursor
+                    .as_deref()
+                    .map(codex::snapshot_cursor_replace_from)
+                    .transpose()?;
                 Ok(SessionSnapshotEnvelope::Full {
                     reason,
                     messages,
                     cursor,
+                    cursor_replace_from,
                 })
             }
             codex::SessionSnapshotLoad::Unchanged { cursor } => {
@@ -302,12 +312,15 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
                         reason: "post-normalization-count-changed".to_string(),
                         messages,
                         cursor: None,
+                        cursor_replace_from: None,
                     });
                 }
+                let cursor_replace_from = codex::snapshot_cursor_replace_from(&cursor)?;
                 Ok(SessionSnapshotEnvelope::Replace {
                     replace_from,
                     messages,
                     cursor,
+                    cursor_replace_from,
                 })
             }
         }
@@ -1522,6 +1535,7 @@ mod tests {
         assert_eq!(initial["reason"], "initial");
         let initial_count = initial["messages"].as_array().unwrap().len();
         assert_eq!(initial_count, 4);
+        assert_eq!(initial["cursorReplaceFrom"], initial_count);
         let cursor = initial["cursor"].as_str().unwrap().to_string();
 
         use std::io::Write as _;
@@ -1529,9 +1543,7 @@ mod tests {
             .append(true)
             .open(&input)
             .unwrap();
-        writeln!(
-            file,
-            "{}",
+        for line in [
             json!({
                 "timestamp": "2026-07-29T10:01:00Z",
                 "type": "response_item",
@@ -1540,9 +1552,35 @@ mod tests {
                     "role": "user",
                     "content": [{ "type": "input_text", "text": "second" }]
                 }
-            })
-        )
-        .unwrap();
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:01:01Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "second" }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:01:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-2" }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:01:03Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "assistant-2",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "second answer" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:01:04Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-2" }
+            }),
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
         file.sync_all().unwrap();
 
         let refresh_args = args(&[
@@ -1560,7 +1598,12 @@ mod tests {
         let refresh: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(refresh["kind"], "replace");
         assert_eq!(refresh["replaceFrom"], initial_count);
-        assert_eq!(refresh["messages"].as_array().unwrap().len(), 1);
+        let replacement_count = refresh["messages"].as_array().unwrap().len();
+        assert_eq!(replacement_count, 4);
+        assert_eq!(
+            refresh["cursorReplaceFrom"],
+            initial_count + replacement_count
+        );
         assert!(refresh["cursor"].is_string());
     }
 

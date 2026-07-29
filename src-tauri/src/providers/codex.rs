@@ -917,6 +917,11 @@ fn decode_snapshot_cursor(encoded: &str) -> Result<CodexSnapshotCursor, String> 
         .map_err(|error| format!("Invalid Codex snapshot cursor payload: {error}"))
 }
 
+/** Authoritative normalized replacement boundary carried by a provider cursor. */
+pub(crate) fn snapshot_cursor_replace_from(encoded: &str) -> Result<usize, String> {
+    Ok(decode_snapshot_cursor(encoded)?.checkpoint.replace_from)
+}
+
 fn cursor_for(
     canonical_path: &Path,
     bytes: &[u8],
