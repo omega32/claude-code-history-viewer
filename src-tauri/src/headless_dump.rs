@@ -1,4 +1,5 @@
-//! Headless normalized session dump (`--dump-session`).
+//! Headless normalized session dumps (`--dump-session` and
+//! `--dump-session-snapshot`).
 //!
 //! Routes a session id (or provider-scoped session path) through the
 //! multi-provider registry and prints the normalized `Vec<ClaudeMessage>` as
@@ -13,18 +14,25 @@
 //! other, never a reactor — so a trivial inline `block_on` drives them with no
 //! Tokio dependency and no GUI/webview.
 //!
-//! Two companion commands share this file: `--list-sessions` (which also stamps
-//! each session with its decoded project directory, so callers can match the cwd
-//! without reproducing Claude's storage-path encoding), `--hide-session` (Claude's
-//! reversible VS Code deletion state), `--archive-session` / `--unarchive-session`
-//! (Copilot VS Code's per-workspace archive state), and `--capabilities` (a tiny
-//! version/feature probe so callers can fail fast on an incompatible build).
+//! The snapshot command is additive: providers without an incremental
+//! implementation return a complete normalized array inside a `full` envelope.
+//! Codex plain rollouts can instead prove the accepted byte prefix and return an
+//! exact replacement suffix from a completed-turn checkpoint. The ordinary
+//! `--dump-session` array contract remains unchanged.
+//!
+//! Other companion commands share this file: `--list-sessions` (which also
+//! stamps each session with its decoded project directory, so callers can match
+//! the cwd without reproducing Claude's storage-path encoding),
+//! `--hide-session` (Claude's reversible VS Code deletion state),
+//! `--archive-session` / `--unarchive-session` (Copilot VS Code's per-workspace
+//! archive state), and `--capabilities` (a tiny version/feature probe so callers
+//! can fail fast on an incompatible build).
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
-    load_provider_messages, load_provider_sessions, scan_all_projects,
+    finalize_loaded_messages, load_provider_messages, load_provider_sessions, scan_all_projects,
 };
-use crate::models::ClaudeSession;
+use crate::models::{ClaudeMessage, ClaudeSession};
 use crate::providers::codex;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
@@ -105,6 +113,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
         version: env!("CARGO_PKG_VERSION"),
         commands: vec![
             "dump-session",
+            "dump-session-snapshot",
             "list-sessions",
             "hide-session",
             "archive-session",
@@ -122,6 +131,32 @@ provider's sessions (full id, or an unambiguous id prefix); an absolute path or\
 a provider-scoped path (e.g. cursor://<id>) is used directly. --provider\n\
 defaults to 'claude'. With --output the JSON is written to <file> (so the\n\
 caller is unaffected by anything else on stdout); otherwise it goes to stdout.";
+
+const SNAPSHOT_USAGE: &str = "Usage: --dump-session-snapshot <session-id|session-path> [--provider <name>] [--cursor <opaque-token>] [--format json] [--output <file>]\n\n\
+Return a normalized session envelope. A provider-owned cursor may produce an\n\
+unchanged result or an exact normalized replacement suffix; unsupported or\n\
+unverifiable transitions return the complete message array. The established\n\
+--dump-session array contract remains unchanged.";
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum SessionSnapshotEnvelope {
+    Full {
+        reason: String,
+        messages: Vec<ClaudeMessage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    Unchanged {
+        cursor: String,
+    },
+    Replace {
+        #[serde(rename = "replaceFrom")]
+        replace_from: usize,
+        messages: Vec<ClaudeMessage>,
+        cursor: String,
+    },
+}
 
 /// A value that already names a concrete session location, so no id resolution
 /// is needed: an absolute filesystem path, or a provider scheme like
@@ -209,6 +244,82 @@ pub fn run_dump_session(args: &[String]) -> i32 {
         }
     };
     emit_json(args, &messages)
+}
+
+/// Handle the cursor-aware normalized session refresh command.
+pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
+    let Some(id) = extract_flag_value(args, "--dump-session-snapshot") else {
+        eprintln!("{SNAPSHOT_USAGE}");
+        return 2;
+    };
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+    let cursor = extract_flag_value(args, "--cursor");
+
+    let result: Result<SessionSnapshotEnvelope, String> = block_on(async {
+        let session_path = resolve_session_path(&provider, &id).await?;
+        if provider != "codex" {
+            let messages = load_provider_messages(provider.clone(), session_path).await?;
+            return Ok(SessionSnapshotEnvelope::Full {
+                reason: "unsupported-provider".to_string(),
+                messages,
+                cursor: None,
+            });
+        }
+
+        match codex::load_session_snapshot(&session_path, cursor.as_deref())? {
+            codex::SessionSnapshotLoad::Full {
+                reason,
+                messages,
+                cursor,
+            } => {
+                let original_len = messages.len();
+                let messages = finalize_loaded_messages(messages);
+                let cursor = (messages.len() == original_len).then_some(cursor).flatten();
+                Ok(SessionSnapshotEnvelope::Full {
+                    reason,
+                    messages,
+                    cursor,
+                })
+            }
+            codex::SessionSnapshotLoad::Unchanged { cursor } => {
+                Ok(SessionSnapshotEnvelope::Unchanged { cursor })
+            }
+            codex::SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+            } => {
+                let original_len = messages.len();
+                let messages = finalize_loaded_messages(messages);
+                if messages.len() != original_len {
+                    let messages = load_provider_messages(provider.clone(), session_path).await?;
+                    return Ok(SessionSnapshotEnvelope::Full {
+                        reason: "post-normalization-count-changed".to_string(),
+                        messages,
+                        cursor: None,
+                    });
+                }
+                Ok(SessionSnapshotEnvelope::Replace {
+                    replace_from,
+                    messages,
+                    cursor,
+                })
+            }
+        }
+    });
+
+    match result {
+        Ok(snapshot) => emit_json(args, &snapshot),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
 }
 
 const LIST_USAGE: &str = "Usage: --list-sessions [--provider <name>] [--project <path>] [--format json] [--output <file>]\n\n\
@@ -1297,6 +1408,7 @@ mod tests {
             value["commands"],
             json!([
                 "dump-session",
+                "dump-session-snapshot",
                 "list-sessions",
                 "hide-session",
                 "archive-session",
@@ -1337,6 +1449,119 @@ mod tests {
         assert_eq!(messages[0]["type"], "user");
         assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["parentUuid"], "u1");
+    }
+
+    #[test]
+    #[serial]
+    fn dump_session_snapshot_command_emits_codex_replacement_envelopes() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let input = sessions_dir.join("rollout-snapshot-command.jsonl");
+        let output = temp.path().join("snapshot.json");
+        std::fs::write(
+            &input,
+            [
+                json!({
+                    "timestamp": "2026-07-29T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "snapshot-command", "cwd": "C:/repo" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "first" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-1" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "assistant-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "answer" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-1" }
+                }),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let initial_args = args(&[
+            "viewer",
+            "--dump-session-snapshot",
+            input.to_str().unwrap(),
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_snapshot(&initial_args), 0);
+        let initial: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(initial["kind"], "full");
+        assert_eq!(initial["reason"], "initial");
+        let initial_count = initial["messages"].as_array().unwrap().len();
+        assert_eq!(initial_count, 4);
+        let cursor = initial["cursor"].as_str().unwrap().to_string();
+
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "timestamp": "2026-07-29T10:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "second" }]
+                }
+            })
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let refresh_args = args(&[
+            "viewer",
+            "--dump-session-snapshot",
+            input.to_str().unwrap(),
+            "--provider",
+            "codex",
+            "--cursor",
+            &cursor,
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_snapshot(&refresh_args), 0);
+        let refresh: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(refresh["kind"], "replace");
+        assert_eq!(refresh["replaceFrom"], initial_count);
+        assert_eq!(refresh["messages"].as_array().unwrap().len(), 1);
+        assert!(refresh["cursor"].is_string());
     }
 
     #[test]

@@ -102,6 +102,14 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_dump_session(&args));
         }
+        // Cursor-aware normalized refresh. This is a separate command so the
+        // established `--dump-session` array contract remains unchanged.
+        if args
+            .iter()
+            .any(|a| a == "--dump-session-snapshot" || a.starts_with("--dump-session-snapshot="))
+        {
+            std::process::exit(headless_dump::run_dump_session_snapshot(&args));
+        }
         // Headless session listing (`--list-sessions [--provider <name>]
         // [--project <path>]`), used to search/select a session by title.
         if args

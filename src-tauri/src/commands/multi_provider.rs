@@ -478,9 +478,15 @@ pub async fn load_provider_messages(
         load_non_claude_messages(&provider, &session_path)?
     };
 
+    Ok(finalize_loaded_messages(messages))
+}
+
+/// Apply the provider-neutral post-load normalization shared by the GUI and
+/// headless complete/delta session surfaces.
+pub(crate) fn finalize_loaded_messages(messages: Vec<ClaudeMessage>) -> Vec<ClaudeMessage> {
     let mut messages = merge_tool_execution_messages(messages);
     hydrate_inference_metadata(&mut messages);
-    Ok(messages)
+    messages
 }
 
 fn hydrate_inference_metadata(messages: &mut [ClaudeMessage]) {

@@ -6,12 +6,14 @@ use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
     search_json_value_case_insensitive,
 };
+use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use memchr::{memchr_iter, memmem};
 use memmap2::Mmap;
 use rusqlite::{Connection, OpenFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
@@ -24,6 +26,76 @@ const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const STEER_SUBTYPE: &str = "steer";
+const SNAPSHOT_CURSOR_VERSION: u32 = 1;
+
+/// Provider result consumed by the headless snapshot envelope.
+pub(crate) enum SessionSnapshotLoad {
+    Full {
+        reason: String,
+        messages: Vec<ClaudeMessage>,
+        cursor: Option<String>,
+    },
+    Unchanged {
+        cursor: String,
+    },
+    Replace {
+        replace_from: usize,
+        messages: Vec<ClaudeMessage>,
+        cursor: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexParserState {
+    session_id: String,
+    meta_seen: bool,
+    current_inference: InferenceMetadata,
+    prev_input_tokens: u32,
+    prev_output_tokens: u32,
+    prev_cached_tokens: u32,
+    prev_cache_write_tokens: u32,
+    prev_reasoning_tokens: u32,
+    msg_counter: u64,
+}
+
+impl CodexParserState {
+    fn initial(path: &Path) -> Self {
+        Self {
+            session_id: session_id_from_rollout_filename(path).unwrap_or_default(),
+            meta_seen: false,
+            current_inference: InferenceMetadata::default(),
+            prev_input_tokens: 0,
+            prev_output_tokens: 0,
+            prev_cached_tokens: 0,
+            prev_cache_write_tokens: 0,
+            prev_reasoning_tokens: 0,
+            msg_counter: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexParserCheckpoint {
+    byte_offset: u64,
+    replace_from: usize,
+    state: CodexParserState,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CodexSnapshotCursor {
+    version: u32,
+    provider: String,
+    canonical_path: String,
+    accepted_len: u64,
+    accepted_digest: String,
+    checkpoint: CodexParserCheckpoint,
+}
+
+struct CodexParseOutcome {
+    messages: Vec<ClaudeMessage>,
+    checkpoint: CodexParserCheckpoint,
+    accepted_len: usize,
+}
 
 #[derive(Debug, Clone)]
 struct NativeTitle {
@@ -514,30 +586,46 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
     let mmap = read_rollout_bytes(canonical_path)?;
     let ranges = find_line_ranges(&mmap);
+    let state = CodexParserState::initial(canonical_path);
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        state: state.clone(),
+    };
+    parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
+        .map(|outcome| outcome.messages)
+        .map_err(|()| "Codex rollout unexpectedly referenced an earlier prefix".to_string())
+}
 
+fn parse_rollout_slice(
+    bytes: &[u8],
+    ranges: &[(usize, usize)],
+    mut state: CodexParserState,
+    mut checkpoint: CodexParserCheckpoint,
+    resumed: bool,
+) -> Result<CodexParseOutcome, ()> {
     let mut messages = Vec::new();
-    // Filename-derived fallback id; the first session_meta overrides it
-    // (meta-less rollouts keep it — issue #451 follow-up).
-    let mut session_id = session_id_from_rollout_filename(canonical_path).unwrap_or_default();
-    let mut meta_seen = false;
-    let mut current_inference = InferenceMetadata::default();
-    let mut prev_input_tokens: u32 = 0;
-    let mut prev_output_tokens: u32 = 0;
-    let mut prev_cached_tokens: u32 = 0;
-    let mut prev_cache_write_tokens: u32 = 0;
-    let mut prev_reasoning_tokens: u32 = 0;
-    let mut msg_counter = 0u64;
+    let slice_base_replace_from = checkpoint.replace_from;
+    let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
     let mut active_turn_id: Option<String> = None;
     let mut active_turn_message_start = 0usize;
     let mut authored_user_messages_in_turn = 0usize;
     let mut pending_user_message_index: Option<usize> = None;
 
-    for &(start, end) in &ranges {
-        let line = &mmap[start..end];
+    for (range_index, &(start, end)) in ranges.iter().enumerate() {
+        if start < usize::try_from(checkpoint.byte_offset).map_err(|_| ())? {
+            continue;
+        }
+        let line = &bytes[start..end];
         let mut buf = line.to_vec();
         let val: Value = match simd_json::from_slice(&mut buf) {
             Ok(v) => v,
             Err(_) => continue,
+        };
+        accepted_len = if bytes.get(end) == Some(&b'\n') {
+            end + 1
+        } else {
+            end
         };
         let line_timestamp = val
             .get("timestamp")
@@ -550,10 +638,10 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
         match line_type {
             // First session_meta only — later ones are history replayed by
             // `codex fork` and must not re-tag messages with the source's id.
-            "session_meta" if !meta_seen => {
-                meta_seen = true;
+            "session_meta" if !state.meta_seen => {
+                state.meta_seen = true;
                 if let Some(payload) = val.get("payload") {
-                    session_id = payload
+                    state.session_id = payload
                         .get("id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
@@ -563,16 +651,16 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
             "turn_context" => {
                 if let Some(payload) = val.get("payload") {
                     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
-                        current_inference.model = Some(m.to_string());
+                        state.current_inference.model = Some(m.to_string());
                     }
                     if let Some(effort) = payload.get("effort").and_then(Value::as_str) {
-                        current_inference.reasoning_effort = Some(effort.to_string());
+                        state.current_inference.reasoning_effort = Some(effort.to_string());
                     }
                     // `thread_settings_applied.reasoning_summary` is the applied
                     // setting. Older rollouts may expose only this fallback.
-                    if current_inference.reasoning_summary.is_none() {
+                    if state.current_inference.reasoning_summary.is_none() {
                         if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
-                            current_inference.reasoning_summary = Some(summary.to_string());
+                            state.current_inference.reasoning_summary = Some(summary.to_string());
                         }
                     }
                 }
@@ -584,18 +672,23 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         && payload.get("role").and_then(Value::as_str) == Some("user");
                     if let Some(msg) = convert_codex_item(
                         payload,
-                        &session_id,
-                        current_inference.model.as_ref(),
+                        &state.session_id,
+                        state.current_inference.model.as_ref(),
                         &line_timestamp,
-                        &mut msg_counter,
+                        &mut state.msg_counter,
                     ) {
                         let mut msg = msg;
                         if msg.message_type == "assistant" {
-                            msg.inference =
-                                (!current_inference.is_empty()).then(|| current_inference.clone());
+                            msg.inference = (!state.current_inference.is_empty())
+                                .then(|| state.current_inference.clone());
                         }
                         if try_merge_tool_result_into_previous(&mut messages, &msg) {
                             continue;
+                        }
+                        if resumed && extract_tool_result_block(&msg).is_some() {
+                            // A fresh complete parse may merge this result into a
+                            // tool call before the retained prefix. Never guess.
+                            return Err(());
                         }
                         messages.push(msg);
                         if is_user_message && active_turn_id.is_some() {
@@ -634,7 +727,7 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
 
                     if event_type == "thread_settings_applied" {
                         if let Some(settings) = payload.get("thread_settings") {
-                            current_inference = codex_inference_settings(settings);
+                            state.current_inference = codex_inference_settings(settings);
                         }
                     }
 
@@ -644,7 +737,7 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                             .and_then(Value::as_str)
                             .map(str::to_string);
                         active_turn_message_start = messages.len();
-                        current_inference.context_window = payload
+                        state.current_inference.context_window = payload
                             .get("model_context_window")
                             .and_then(Value::as_u64)
                             .and_then(|value| u32::try_from(value).ok());
@@ -652,7 +745,7 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                             .get("collaboration_mode_kind")
                             .and_then(Value::as_str)
                         {
-                            current_inference.interaction_mode = Some(mode.to_string());
+                            state.current_inference.interaction_mode = Some(mode.to_string());
                         }
                         authored_user_messages_in_turn = 0;
                         pending_user_message_index = None;
@@ -677,26 +770,29 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                                 })
                             };
                             let delta = CodexTokenUsage {
-                                input: usage.input.saturating_sub(prev_input_tokens),
-                                output: usage.output.saturating_sub(prev_output_tokens),
-                                cached: delta_optional(usage.cached, &mut prev_cached_tokens),
+                                input: usage.input.saturating_sub(state.prev_input_tokens),
+                                output: usage.output.saturating_sub(state.prev_output_tokens),
+                                cached: delta_optional(usage.cached, &mut state.prev_cached_tokens),
                                 cache_write: delta_optional(
                                     usage.cache_write,
-                                    &mut prev_cache_write_tokens,
+                                    &mut state.prev_cache_write_tokens,
                                 ),
                                 reasoning: delta_optional(
                                     usage.reasoning,
-                                    &mut prev_reasoning_tokens,
+                                    &mut state.prev_reasoning_tokens,
                                 ),
                             };
-                            prev_input_tokens = usage.input;
-                            prev_output_tokens = usage.output;
+                            state.prev_input_tokens = usage.input;
+                            state.prev_output_tokens = usage.output;
                             delta
                         } else {
                             usage
                         };
 
                         // Apply to the last assistant message without usage.
+                        if resumed && active_turn_id.is_none() {
+                            return Err(());
+                        }
                         let Some(last_msg) = messages[active_turn_message_start..]
                             .iter_mut()
                             .rev()
@@ -717,11 +813,11 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                             output_tokens: Some(delta.output),
                             cache_creation_input_tokens: delta.cache_write,
                             cache_read_input_tokens: delta.cached,
-                            service_tier: current_inference.service_tier.clone(),
+                            service_tier: state.current_inference.service_tier.clone(),
                         });
                         let inference = last_msg
                             .inference
-                            .get_or_insert_with(|| current_inference.clone());
+                            .get_or_insert_with(|| state.current_inference.clone());
                         inference.usage = Some(InferenceUsage {
                             input_tokens: Some(delta.input),
                             output_tokens: Some(delta.output),
@@ -729,15 +825,18 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                             cache_write_input_tokens: delta.cache_write,
                             reasoning_output_tokens: delta.reasoning,
                         });
-                    } else if let Some(mut msg) =
-                        convert_codex_event(payload, &session_id, &line_timestamp, &mut msg_counter)
-                    {
+                    } else if let Some(mut msg) = convert_codex_event(
+                        payload,
+                        &state.session_id,
+                        &line_timestamp,
+                        &mut state.msg_counter,
+                    ) {
                         if msg.message_type == "assistant" {
                             if msg.model.is_none() {
-                                msg.model.clone_from(&current_inference.model);
+                                msg.model.clone_from(&state.current_inference.model);
                             }
-                            msg.inference =
-                                (!current_inference.is_empty()).then(|| current_inference.clone());
+                            msg.inference = (!state.current_inference.is_empty())
+                                .then(|| state.current_inference.clone());
                         }
                         messages.push(msg);
                     }
@@ -753,7 +852,7 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         {
                             let inference = last_msg
                                 .inference
-                                .get_or_insert_with(|| current_inference.clone());
+                                .get_or_insert_with(|| state.current_inference.clone());
                             inference.duration_ms =
                                 payload.get("duration_ms").and_then(Value::as_u64);
                             inference.time_to_first_token_ms = payload
@@ -763,6 +862,14 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                         active_turn_id = None;
                         authored_user_messages_in_turn = 0;
                         pending_user_message_index = None;
+                        let next_offset = ranges
+                            .get(range_index + 1)
+                            .map_or(bytes.len(), |&(next_start, _)| next_start);
+                        checkpoint = CodexParserCheckpoint {
+                            byte_offset: u64::try_from(next_offset).map_err(|_| ())?,
+                            replace_from: slice_base_replace_from + messages.len(),
+                            state: state.clone(),
+                        };
                     }
                 }
             }
@@ -770,9 +877,9 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
                 if let Some(payload) = val.get("payload") {
                     let msg = convert_codex_compacted(
                         payload,
-                        &session_id,
+                        &state.session_id,
                         &line_timestamp,
-                        &mut msg_counter,
+                        &mut state.msg_counter,
                     );
                     messages.push(msg);
                 }
@@ -781,7 +888,240 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
         }
     }
 
-    Ok(messages)
+    Ok(CodexParseOutcome {
+        messages,
+        checkpoint,
+        accepted_len,
+    })
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+}
+
+fn encode_snapshot_cursor(cursor: &CodexSnapshotCursor) -> Result<String, String> {
+    serde_json::to_vec(cursor)
+        .map(|bytes| BASE64_URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| format!("Failed to encode Codex snapshot cursor: {error}"))
+}
+
+fn decode_snapshot_cursor(encoded: &str) -> Result<CodexSnapshotCursor, String> {
+    const MAX_CURSOR_BYTES: usize = 64 * 1024;
+    if encoded.len() > MAX_CURSOR_BYTES {
+        return Err("Codex snapshot cursor is too large".to_string());
+    }
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("Invalid Codex snapshot cursor encoding: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid Codex snapshot cursor payload: {error}"))
+}
+
+fn cursor_for(
+    canonical_path: &Path,
+    bytes: &[u8],
+    checkpoint: CodexParserCheckpoint,
+) -> Result<String, String> {
+    encode_snapshot_cursor(&CodexSnapshotCursor {
+        version: SNAPSHOT_CURSOR_VERSION,
+        provider: "codex".to_string(),
+        canonical_path: canonical_path.to_string_lossy().into_owned(),
+        accepted_len: u64::try_from(bytes.len())
+            .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
+        accepted_digest: digest_bytes(bytes),
+        checkpoint,
+    })
+}
+
+fn is_plain_rollout(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
+#[allow(unsafe_code)] // Required for mmap performance optimization
+fn map_plain_rollout(path: &Path) -> Result<(Mmap, std::fs::Metadata), String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    // SAFETY: The file is opened read-only and the mapping is only read.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|error| error.to_string())?;
+    Ok((mmap, metadata))
+}
+
+fn source_stayed_stable(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+    mapped_len: usize,
+) -> bool {
+    let (Ok(before_modified), Ok(after_modified)) = (before.modified(), after.modified()) else {
+        return false;
+    };
+    before.len() == u64::try_from(mapped_len).unwrap_or(u64::MAX)
+        && after.len() == before.len()
+        && after_modified == before_modified
+}
+
+fn complete_snapshot_from_path(
+    canonical_path: &Path,
+    reason: impl Into<String>,
+) -> Result<SessionSnapshotLoad, String> {
+    let reason = reason.into();
+    if !is_plain_rollout(canonical_path) {
+        return Ok(SessionSnapshotLoad::Full {
+            reason,
+            messages: parse_rollout_file(canonical_path)?,
+            cursor: None,
+        });
+    }
+
+    let (mmap, before) = map_plain_rollout(canonical_path)?;
+    let ranges = find_line_ranges(&mmap);
+    let state = CodexParserState::initial(canonical_path);
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        state: state.clone(),
+    };
+    let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
+        .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
+    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
+    let cursor = if source_stayed_stable(&before, &after, mmap.len()) {
+        Some(cursor_for(
+            canonical_path,
+            &mmap[..outcome.accepted_len],
+            outcome.checkpoint.clone(),
+        )?)
+    } else {
+        None
+    };
+
+    Ok(SessionSnapshotLoad::Full {
+        reason,
+        messages: outcome.messages,
+        cursor,
+    })
+}
+
+fn cursor_checkpoint_is_valid(cursor: &CodexSnapshotCursor, bytes: &[u8]) -> bool {
+    let Ok(offset) = usize::try_from(cursor.checkpoint.byte_offset) else {
+        return false;
+    };
+    let Ok(accepted_len) = usize::try_from(cursor.accepted_len) else {
+        return false;
+    };
+    if offset > accepted_len || accepted_len > bytes.len() {
+        return false;
+    }
+    offset == 0
+        || offset == accepted_len
+        || bytes
+            .get(offset.wrapping_sub(1))
+            .is_some_and(|byte| *byte == b'\n')
+}
+
+/// Load a cursor-aware normalized Codex snapshot.
+///
+/// A valid cursor proves the complete previously accepted byte prefix before
+/// the parser resumes from its provider-owned completed-turn checkpoint. Any
+/// uncertainty returns the ordinary complete result instead.
+pub(crate) fn load_session_snapshot(
+    session_path: &str,
+    encoded_cursor: Option<&str>,
+) -> Result<SessionSnapshotLoad, String> {
+    let path = Path::new(session_path);
+    if !path.exists() {
+        return Err(format!("Session file not found: {session_path}"));
+    }
+    let canonical_path = validate_session_path(path, session_path)?;
+
+    let Some(encoded_cursor) = encoded_cursor else {
+        return complete_snapshot_from_path(&canonical_path, "initial");
+    };
+    if !is_plain_rollout(&canonical_path) {
+        return complete_snapshot_from_path(&canonical_path, "unsupported-source");
+    }
+
+    let cursor = match decode_snapshot_cursor(encoded_cursor) {
+        Ok(cursor) => cursor,
+        Err(_) => return complete_snapshot_from_path(&canonical_path, "invalid-cursor"),
+    };
+    if cursor.version != SNAPSHOT_CURSOR_VERSION
+        || cursor.provider != "codex"
+        || cursor.canonical_path != canonical_path.to_string_lossy()
+    {
+        return complete_snapshot_from_path(&canonical_path, "incompatible-cursor");
+    }
+
+    let (mmap, before) = map_plain_rollout(&canonical_path)?;
+    let Ok(accepted_len) = usize::try_from(cursor.accepted_len) else {
+        return complete_snapshot_from_path(&canonical_path, "invalid-cursor");
+    };
+    if accepted_len > mmap.len() {
+        return complete_snapshot_from_path(&canonical_path, "source-shrank");
+    }
+    if !cursor_checkpoint_is_valid(&cursor, &mmap) {
+        return complete_snapshot_from_path(&canonical_path, "invalid-checkpoint");
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&mmap[..accepted_len]);
+    let accepted_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize());
+    if accepted_digest != cursor.accepted_digest {
+        return complete_snapshot_from_path(&canonical_path, "prefix-mismatch");
+    }
+
+    if accepted_len == mmap.len() {
+        let after = fs::metadata(&canonical_path).map_err(|error| error.to_string())?;
+        if source_stayed_stable(&before, &after, mmap.len()) {
+            return Ok(SessionSnapshotLoad::Unchanged {
+                cursor: encoded_cursor.to_string(),
+            });
+        }
+        return complete_snapshot_from_path(&canonical_path, "source-changed-during-read");
+    }
+
+    let replace_from = cursor.checkpoint.replace_from;
+    let ranges = find_line_ranges(&mmap);
+    let outcome = match parse_rollout_slice(
+        &mmap,
+        &ranges,
+        cursor.checkpoint.state.clone(),
+        cursor.checkpoint.clone(),
+        true,
+    ) {
+        Ok(outcome) => outcome,
+        Err(()) => {
+            return complete_snapshot_from_path(&canonical_path, "unsafe-backward-reference");
+        }
+    };
+    let after = fs::metadata(&canonical_path).map_err(|error| error.to_string())?;
+    if !source_stayed_stable(&before, &after, mmap.len()) {
+        return complete_snapshot_from_path(&canonical_path, "source-changed-during-read");
+    }
+
+    if outcome.accepted_len == accepted_len {
+        return Ok(SessionSnapshotLoad::Unchanged {
+            cursor: encoded_cursor.to_string(),
+        });
+    }
+
+    hasher.update(&mmap[accepted_len..outcome.accepted_len]);
+    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize());
+    let next_cursor = encode_snapshot_cursor(&CodexSnapshotCursor {
+        version: SNAPSHOT_CURSOR_VERSION,
+        provider: "codex".to_string(),
+        canonical_path: canonical_path.to_string_lossy().into_owned(),
+        accepted_len: u64::try_from(outcome.accepted_len)
+            .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
+        accepted_digest: full_digest,
+        checkpoint: outcome.checkpoint,
+    })?;
+
+    Ok(SessionSnapshotLoad::Replace {
+        replace_from,
+        messages: outcome.messages,
+        cursor: next_cursor,
+    })
 }
 
 /// Search Codex sessions for a query string
@@ -2403,6 +2743,7 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Write;
     use tempfile::TempDir;
 
     struct EnvVarGuard {
@@ -2480,6 +2821,647 @@ mod tests {
         fs::write(&rollout_path, format!("{content}\n"))
             .expect("rollout fixture should be written");
         rollout_path
+    }
+
+    fn append_rollout_lines(path: &Path, lines: &[Value]) {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("rollout should open for append");
+        for line in lines {
+            writeln!(file, "{line}").expect("rollout line should append");
+        }
+        file.sync_all().expect("appended rollout should flush");
+    }
+
+    fn snapshot_fixture_prefix(session_id: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "timestamp": "2026-07-29T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": session_id, "cwd": "C:/repo", "source": "cli" }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:01Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-test", "effort": "high" }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "first prompt" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "first prompt" }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-1",
+                    "model_context_window": 128000,
+                    "collaboration_mode_kind": "default"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "assistant-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "first answer" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:06Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "cached_input_tokens": 3,
+                            "reasoning_output_tokens": 2
+                        }
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-29T10:00:07Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-1",
+                    "duration_ms": 100,
+                    "time_to_first_token_ms": 10
+                }
+            }),
+        ]
+    }
+
+    fn write_snapshot_fixture(sessions_dir: &Path, session_id: &str) -> PathBuf {
+        let path = sessions_dir.join(format!("rollout-2026-07-29T10-00-00-{session_id}.jsonl"));
+        let lines = snapshot_fixture_prefix(session_id);
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{body}\n")).expect("snapshot fixture should be written");
+        path
+    }
+
+    fn message_values(messages: &[ClaudeMessage]) -> Value {
+        serde_json::to_value(messages).expect("messages should serialize")
+    }
+
+    fn assert_snapshot_matches_fresh(messages: &[ClaudeMessage], path: &Path) {
+        let fresh = parse_rollout_file(path).expect("fresh complete parse should succeed");
+        assert_eq!(message_values(messages), message_values(&fresh));
+
+        let finalized_snapshot =
+            crate::commands::multi_provider::finalize_loaded_messages(messages.to_vec());
+        let finalized_fresh = crate::commands::multi_provider::finalize_loaded_messages(fresh);
+        assert_eq!(
+            message_values(&finalized_snapshot),
+            message_values(&finalized_fresh)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replacements_equal_fresh_complete_parses() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-equality");
+        let path_text = path.to_string_lossy();
+
+        let (mut cached, initial_cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    reason,
+                    messages,
+                    cursor: Some(cursor),
+                } => {
+                    assert_eq!(reason, "initial");
+                    (messages, cursor)
+                }
+                _ => panic!("initial Codex snapshot should be complete and cursor-bearing"),
+            };
+        let initial_len = cached.len();
+        assert_snapshot_matches_fresh(&cached, &path);
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-07-29T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "second prompt" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "second prompt" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-2",
+                        "model_context_window": 128000,
+                        "collaboration_mode_kind": "default"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "tool-2",
+                        "type": "function_call",
+                        "call_id": "call-2",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo hi\"}"
+                    }
+                }),
+            ],
+        );
+
+        let active_cursor =
+            match load_session_snapshot(&path_text, Some(&initial_cursor)).expect("active delta") {
+                SessionSnapshotLoad::Replace {
+                    replace_from,
+                    messages,
+                    cursor,
+                } => {
+                    assert_eq!(replace_from, initial_len);
+                    cached.truncate(replace_from);
+                    cached.extend(messages);
+                    cursor
+                }
+                _ => panic!("an appended active turn should return a replacement suffix"),
+            };
+        assert_snapshot_matches_fresh(&cached, &path);
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-07-29T10:01:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "result-2",
+                        "type": "function_call_output",
+                        "call_id": "call-2",
+                        "output": "hi"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:05Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 50,
+                                "output_tokens": 15,
+                                "cached_input_tokens": 8,
+                                "reasoning_output_tokens": 4
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:06Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-2",
+                        "duration_ms": 200,
+                        "time_to_first_token_ms": 20
+                    }
+                }),
+            ],
+        );
+
+        let completed_cursor = match load_session_snapshot(&path_text, Some(&active_cursor))
+            .expect("completion delta")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+            } => {
+                assert_eq!(replace_from, initial_len);
+                cached.truncate(replace_from);
+                cached.extend(messages);
+                cursor
+            }
+            _ => panic!("an appended completion should replace the active turn"),
+        };
+        assert_snapshot_matches_fresh(&cached, &path);
+
+        match load_session_snapshot(&path_text, Some(&completed_cursor))
+            .expect("unchanged snapshot")
+        {
+            SessionSnapshotLoad::Unchanged { cursor } => {
+                assert_eq!(cursor, completed_cursor);
+            }
+            _ => panic!("an identical source should return unchanged"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_falls_back_when_the_verified_prefix_changes_or_shrinks() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-prefix");
+        let path_text = path.to_string_lossy();
+        let cursor = match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("initial snapshot should carry a cursor"),
+        };
+
+        let original = fs::read_to_string(&path).expect("fixture should be readable");
+        let changed = original.replace("first prompt", "FIRST prompt");
+        assert_eq!(changed.len(), original.len());
+        fs::write(&path, changed).expect("same-length rewrite should succeed");
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("rewrite fallback") {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "prefix-mismatch");
+                assert_eq!(
+                    message_values(&messages),
+                    message_values(&parse_rollout_file(&path).unwrap())
+                );
+            }
+            _ => panic!("a rewritten prefix must force a complete snapshot"),
+        }
+
+        fs::write(
+            &path,
+            format!("{}\n", snapshot_fixture_prefix("snapshot-prefix")[0]),
+        )
+        .expect("truncation should succeed");
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("shrink fallback") {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "source-shrank");
+            }
+            _ => panic!("a shrunk source must force a complete snapshot"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_falls_back_for_a_tool_result_targeting_the_retained_prefix() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-backward");
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-07-29T10:00:05.1Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "late-tool",
+                        "type": "function_call",
+                        "call_id": "late-call",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo late\"}"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:08Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "turn-late"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:00:09Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-late"
+                    }
+                }),
+            ],
+        );
+        let path_text = path.to_string_lossy();
+        let cursor = match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("initial snapshot should carry a cursor"),
+        };
+
+        append_rollout_lines(
+            &path,
+            &[json!({
+                "timestamp": "2026-07-29T10:00:10Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "late-result",
+                    "type": "function_call_output",
+                    "call_id": "late-call",
+                    "output": "late"
+                }
+            })],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("safe fallback") {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "unsafe-backward-reference");
+                assert_eq!(
+                    message_values(&messages),
+                    message_values(&parse_rollout_file(&path).unwrap())
+                );
+            }
+            _ => panic!("a backward tool result must force a complete snapshot"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replays_compaction_fork_metadata_and_steers_exactly() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-structural");
+        let path_text = path.to_string_lossy();
+
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-07-29T10:01:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "replayed-source-id", "cwd": "C:/old-repo" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:01Z",
+                    "type": "compacted",
+                    "payload": { "replacement_history": [{ "type": "message" }] }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-2" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "first mid-turn input" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "first mid-turn input" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "second mid-turn input" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:06Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "second mid-turn input" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:07Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-2" }
+                }),
+            ],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("structural delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("append-only structural records should produce a replacement"),
+        }
+        assert_snapshot_matches_fresh(&cached, &path);
+        assert!(
+            cached
+                .iter()
+                .all(|message| message.session_id == "snapshot-structural"),
+            "replayed fork metadata must not replace the destination session id"
+        );
+        assert!(cached
+            .iter()
+            .any(|message| message.subtype.as_deref() == Some("compact_boundary")));
+        assert!(cached
+            .iter()
+            .any(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE)));
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_rejects_invalid_and_incompatible_cursors() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-cursor");
+        let path_text = path.to_string_lossy();
+
+        match load_session_snapshot(&path_text, Some("not-base64")).expect("invalid fallback") {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "invalid-cursor");
+            }
+            _ => panic!("an invalid cursor must force a complete snapshot"),
+        }
+
+        let encoded = match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("initial snapshot should carry a cursor"),
+        };
+        let mut cursor = decode_snapshot_cursor(&encoded).expect("cursor should decode");
+        cursor.version += 1;
+        let incompatible = encode_snapshot_cursor(&cursor).expect("cursor should encode");
+        match load_session_snapshot(&path_text, Some(&incompatible)).expect("incompatible fallback")
+        {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "incompatible-cursor");
+            }
+            _ => panic!("an incompatible cursor must force a complete snapshot"),
+        }
+
+        let archived_dir = codex_home.join("archived_sessions");
+        fs::create_dir_all(&archived_dir).expect("archive directory should be created");
+        let archived_path =
+            archived_dir.join(path.file_name().expect("fixture should have a name"));
+        fs::rename(&path, &archived_path).expect("fixture should move to the archive");
+        match load_session_snapshot(&archived_path.to_string_lossy(), Some(&encoded))
+            .expect("archive transition fallback")
+        {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "incompatible-cursor");
+            }
+            _ => panic!("moving a rollout must invalidate its source-bound cursor"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_excludes_an_incomplete_trailing_record_until_it_is_completed() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-partial-line");
+        let path_text = path.to_string_lossy();
+
+        let partial = r#"{"timestamp":"2026-07-29T10:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second"#;
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("rollout should open for append");
+            write!(file, "{partial}").expect("partial record should append");
+            file.sync_all().expect("partial rollout should flush");
+        }
+
+        let (initial_messages, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("a stable plain rollout should carry a cursor"),
+            };
+        assert_snapshot_matches_fresh(&initial_messages, &path);
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("unchanged partial tail") {
+            SessionSnapshotLoad::Unchanged {
+                cursor: unchanged_cursor,
+            } => assert_eq!(unchanged_cursor, cursor),
+            _ => panic!("an unchanged incomplete tail must not advance the cursor"),
+        }
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("rollout should open for completion");
+            writeln!(file, " prompt\"}}]}}}}").expect("record completion should append");
+            file.sync_all().expect("completed rollout should flush");
+        }
+
+        let mut reconstructed = initial_messages;
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("completed tail delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                reconstructed.truncate(replace_from);
+                reconstructed.extend(messages);
+            }
+            _ => panic!("completing the trailing record should produce a replacement"),
+        }
+        assert_snapshot_matches_fresh(&reconstructed, &path);
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_returns_a_cursorless_full_result_for_compressed_rollouts() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let plain = write_snapshot_fixture(&sessions_dir, "snapshot-compressed");
+        let body = fs::read(&plain).expect("plain rollout should be readable");
+        let compressed =
+            sessions_dir.join("rollout-2026-07-29T10-00-00-snapshot-compressed.jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::encode_all(&body[..], 3).expect("fixture should compress"),
+        )
+        .expect("compressed rollout should be written");
+        fs::remove_file(&plain).expect("plain rollout should be removed");
+
+        match load_session_snapshot(&compressed.to_string_lossy(), Some("ignored"))
+            .expect("compressed fallback")
+        {
+            SessionSnapshotLoad::Full {
+                reason,
+                messages,
+                cursor,
+            } => {
+                assert_eq!(reason, "unsupported-source");
+                assert!(cursor.is_none());
+                assert_snapshot_matches_fresh(&messages, &compressed);
+            }
+            _ => panic!("compressed rollouts must use a cursorless complete snapshot"),
+        }
     }
 
     fn create_codex_state_db(codex_home: &Path, rows: &[(&str, &str, &str)]) {
