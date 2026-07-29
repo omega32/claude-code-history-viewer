@@ -1003,6 +1003,10 @@ fn build_assistant_message(
     // separate `questionCarousel` response part; pre-scan them (keyed by the owning
     // tool-call id) so the invocation below can fold them into the tool's input.
     let carousels = question_carousels(response);
+    // A completed question interaction remains in the response alongside its
+    // initial snapshot. Both serialized invocations share one toolCallId; emit
+    // the logical question call once, using the resolved carousel selected above.
+    let mut emitted_question_calls = std::collections::HashSet::new();
     // Track whether the previous visible block was plain prose or an inline
     // reference, so consecutive spans from the same response (split at every
     // inlineReference boundary) can be coalesced into one text block. Thinking,
@@ -1067,6 +1071,11 @@ fn build_assistant_message(
                         *counter += 1;
                         format!("vscode-tool-{idx}-{counter}")
                     });
+                if tool_id == "vscode_askQuestions"
+                    && !emitted_question_calls.insert(call_id.clone())
+                {
+                    continue;
+                }
                 // `invocationMessage` is a markdown object ({value, uris?}) for
                 // most tools, but a bare string for some (e.g. copilot_applyPatch).
                 let invocation_text = part
@@ -1113,10 +1122,17 @@ fn build_assistant_message(
                 // the user's `selectedValue`s into the paired answer text — so the whole
                 // Q&A normalizes to Claude's prompt+reply shape and the consumer
                 // reconstructs it with no provider-specific code.
-                let question_answer = carousels.get(&call_id).map(|carousel| {
+                let has_question_carousel = carousels.contains_key(&call_id);
+                let question_answer = carousels.get(&call_id).and_then(|carousel| {
                     let (mapped, answers) = map_question_carousel(carousel);
                     input.insert("questions".to_string(), Value::Array(mapped));
-                    answers
+                    if !answers.is_empty() {
+                        Some(answers)
+                    } else if question_carousel_was_skipped(carousel) {
+                        Some("User skipped question".to_string())
+                    } else {
+                        None
+                    }
                 });
                 let tool_use = serde_json::json!({
                     "type": "tool_use",
@@ -1130,17 +1146,16 @@ fn build_assistant_message(
                 blocks.push(tool_use);
 
                 // The paired result: the user's answers for a questions tool (even when
-                // the invocation isn't flagged complete), else the prose past-tense line.
-                // Unanswered questions emit no result (the prompt still shows, answerless).
+                // the invocation isn't flagged complete), or an explicit result for a
+                // confirmed skip; otherwise use the prose past-tense line. A pending
+                // unanswered question remains answerless.
                 if let Some(answers) = question_answer {
-                    if !answers.is_empty() {
-                        blocks.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": answers,
-                        }));
-                    }
-                } else if is_complete && !past_text.is_empty() {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": answers,
+                    }));
+                } else if !has_question_carousel && is_complete && !past_text.is_empty() {
                     blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": call_id,
@@ -1630,12 +1645,31 @@ fn map_question_carousel(carousel: &Value) -> (Vec<Value>, String) {
     (mapped, answers.join("\n"))
 }
 
-/// The chosen answer in a carousel `data` entry — `selectedValue` as text (a string
-/// for `singleSelect`, comma-joined for a `multiSelect` array). `None` when unanswered.
+/// Whether a resolved, skippable carousel was dismissed without an answer.
+fn question_carousel_was_skipped(carousel: &Value) -> bool {
+    carousel.get("isUsed").and_then(Value::as_bool) == Some(true)
+        && carousel.get("allowSkip").and_then(Value::as_bool) == Some(true)
+        && carousel
+            .get("data")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+}
+
+/// The chosen answer in a carousel `data` entry. VS Code uses `selectedValue`
+/// for single choice, `selectedValues` for multiple choice, and a bare string
+/// for free-form input. Arrays are rendered as comma-separated text.
 fn selected_answer(entry: &Value) -> Option<String> {
-    match entry.get("selectedValue") {
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(Value::Array(arr)) => {
+    entry
+        .get("selectedValue")
+        .and_then(answer_text)
+        .or_else(|| entry.get("selectedValues").and_then(answer_text))
+        .or_else(|| answer_text(entry))
+}
+
+fn answer_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(arr) => {
             let joined = arr
                 .iter()
                 .filter_map(Value::as_str)
@@ -2227,13 +2261,16 @@ mod tests {
                              "options": [{"id":"y","label":"Yes","value":"Yes"},{"id":"n","label":"No","value":"No"}]},
                             {"id": "call_x:1", "type": "multiSelect", "title": "B", "message": "Pick B?",
                              "options": [{"id":"1","label":"One","value":"One"},{"id":"2","label":"Two","value":"Two"}]},
-                            {"id": "call_x:2", "type": "singleSelect", "title": "C", "message": "Pick C?",
-                             "options": [{"id":"a","label":"A","value":"A"}]}
+                            {"id": "call_x:2", "type": "text", "title": "C", "message": "Type C?",
+                             "allowFreeformInput": true}
                         ],
                         "data": {
                             "call_x:0": {"selectedValue": "Yes"},
-                            "call_x:1": {"selectedValue": ["One", "Two"]},
-                            "call_x:2": {"selectedValue": null}
+                            "call_x:1": {
+                                "selectedValue": null,
+                                "selectedValues": ["One", "Two"]
+                            },
+                            "call_x:2": "typed response"
                         }
                     }
                 ]
@@ -2251,11 +2288,128 @@ mod tests {
         assert_eq!(qs[0]["multiSelect"], false);
         assert_eq!(qs[0]["options"][0]["label"], "Yes");
         assert_eq!(qs[1]["multiSelect"], true);
-        // The paired result carries the user's answers (unanswered C omitted);
-        // multiSelect joins its array; the prose past-tense line is NOT used.
+        // The paired result carries all three native answer carriers:
+        // selectedValue, selectedValues, and a direct free-form string.
         let result = blocks.iter().find(|b| b["type"] == "tool_result").unwrap();
         assert_eq!(result["tool_use_id"], "call_x");
-        assert_eq!(result["content"], "A: Yes\nB: One, Two");
+        assert_eq!(result["content"], "A: Yes\nB: One, Two\nC: typed response");
+    }
+
+    #[test]
+    fn askquestions_deduplicates_snapshots_and_marks_confirmed_skip() {
+        let initial_tool = json!({
+            "kind": "toolInvocationSerialized",
+            "toolId": "vscode_askQuestions",
+            "toolCallId": "call_x",
+            "isComplete": true,
+            "invocationMessage": {"value": "Asking a question"}
+        });
+        let questions = json!([{
+            "id": "call_x:0",
+            "type": "singleSelect",
+            "title": "choice",
+            "message": "Choose?",
+            "options": [{"id": "a", "label": "A", "value": "A"}]
+        }]);
+        let state = json!({
+            "sessionId": "s",
+            "creationDate": 1,
+            "requests": [{
+                "requestId": "r",
+                "message": {"text": "ask me"},
+                "response": [
+                    initial_tool,
+                    {
+                        "kind": "questionCarousel",
+                        "resolveId": "call_x",
+                        "questions": questions,
+                        "allowSkip": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "vscode_askQuestions",
+                        "toolCallId": "call_x",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Asking a question"}
+                    },
+                    {
+                        "kind": "questionCarousel",
+                        "resolveId": "call_x",
+                        "questions": questions,
+                        "allowSkip": true,
+                        "data": {"call_x:0": {"selectedValue": "A"}},
+                        "isUsed": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "vscode_askQuestions",
+                        "toolCallId": "call_skip",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Asking another question"}
+                    },
+                    {
+                        "kind": "questionCarousel",
+                        "resolveId": "call_skip",
+                        "questions": [{
+                            "id": "call_skip:0",
+                            "type": "singleSelect",
+                            "title": "skip",
+                            "message": "Skip?",
+                            "options": [{"id": "a", "label": "A", "value": "A"}]
+                        }],
+                        "allowSkip": true,
+                        "data": {},
+                        "isUsed": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "vscode_askQuestions",
+                        "toolCallId": "call_pending",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Asking a pending question"},
+                        "pastTenseMessage": {"value": "Asked a pending question"}
+                    },
+                    {
+                        "kind": "questionCarousel",
+                        "resolveId": "call_pending",
+                        "questions": [{
+                            "id": "call_pending:0",
+                            "type": "singleSelect",
+                            "title": "pending",
+                            "message": "Pending?",
+                            "options": [{"id": "a", "label": "A", "value": "A"}]
+                        }],
+                        "allowSkip": true
+                    }
+                ]
+            }]
+        });
+
+        let msgs = messages_from_state(&state);
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let tools: Vec<&Value> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        let results: Vec<&Value> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .collect();
+
+        assert_eq!(tools.len(), 3, "one tool_use per logical question call");
+        assert_eq!(
+            tools.iter().filter(|block| block["id"] == "call_x").count(),
+            1
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["content"], "choice: A");
+        assert_eq!(results[1]["content"], "User skipped question");
+        assert!(
+            results
+                .iter()
+                .all(|block| block["tool_use_id"] != "call_pending"),
+            "a pending unanswered question must remain answerless"
+        );
     }
 
     #[test]
