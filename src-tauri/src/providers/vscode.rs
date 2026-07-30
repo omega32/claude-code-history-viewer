@@ -884,15 +884,14 @@ fn messages_from_state(state: &Value) -> Vec<ClaudeMessage> {
             messages.push(assistant);
         }
 
-        // Compaction summary: VS Code records a background conversation summary on
+        // Compaction summaries: VS Code records background conversation summaries on
         // `requests[n].result.metadata.summaries[].text` (flattened to
-        // `metadata.summary`) when it compresses context. Surface it as a synthetic
-        // user record stamped `subtype: "compact_summary"` — mirroring how the Claude
-        // parser marks Claude Code's compaction summary — so the consumer detects it
-        // structurally (never by sniffing text) and labels it, instead of treating it
-        // as an authored turn. Emitted after the request's own turn, at the point the
-        // earlier context was compressed.
-        if let Some(summary) = extract_compaction_summary(req) {
+        // `metadata.summary`). Surface each logical event as a synthetic user record
+        // stamped `subtype: "compact_summary"` — mirroring how the Claude parser marks
+        // Claude Code's compaction summary — so consumers detect it structurally
+        // (never by sniffing text) instead of treating it as an authored turn. Emitted
+        // after the request's own turn, at the point the earlier context was compressed.
+        for summary in extract_compaction_summaries(req) {
             counter += 1;
             let uuid = format!("vscode-compact-{idx}-{counter}");
             let content = serde_json::json!([{ "type": "text", "text": summary }]);
@@ -963,30 +962,51 @@ fn prompt_attachment_names(req: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The conversation-compaction summary attached to a request's result, if any.
+/// The logical conversation-compaction summaries attached to a request's result.
 /// VS Code writes a background summary under `result.metadata.summaries[].text`
-/// (also flattened to `result.metadata.summary`). Returns the summary text, or
-/// `None` when the request carries no compaction. Prefers the structured
-/// `summaries[]` (the source of truth; joins multiple non-empty entries), falling
-/// back to the flat `summary` string.
-fn extract_compaction_summary(req: &Value) -> Option<String> {
-    let metadata = req.get("result")?.get("metadata")?;
+/// (also flattened to `result.metadata.summary`). Structured entries are the source
+/// of truth and remain independent, except for exact duplicates that share the same
+/// non-empty `toolCallRoundId`; that pair is authoritative evidence of one event.
+/// Missing ids or conflicting text remain lossless rather than being guessed at.
+/// The flat `summary` is used only when no non-empty structured entry exists.
+fn extract_compaction_summaries(req: &Value) -> Vec<String> {
+    let Some(metadata) = req.get("result").and_then(|result| result.get("metadata")) else {
+        return Vec::new();
+    };
+
     if let Some(arr) = metadata.get("summaries").and_then(Value::as_array) {
-        let joined = arr
-            .iter()
-            .filter_map(|s| s.get("text").and_then(Value::as_str))
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !joined.is_empty() {
-            return Some(joined);
+        let mut summaries = Vec::new();
+        let mut seen_identified = std::collections::HashSet::new();
+        for value in arr {
+            let Some(text) = value
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let tool_call_round_id = value
+                .get("toolCallRoundId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if let Some(id) = tool_call_round_id {
+                if !seen_identified.insert((id, text)) {
+                    continue;
+                }
+            }
+            summaries.push(text.to_string());
+        }
+        if !summaries.is_empty() {
+            return summaries;
         }
     }
+
     metadata
         .get("summary")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(String::from)
+        .map(|text| vec![text.to_string()])
+        .unwrap_or_default()
 }
 
 fn build_assistant_message(
@@ -2074,36 +2094,96 @@ mod tests {
     }
 
     #[test]
-    fn extract_compaction_summary_prefers_summaries_then_flat() {
+    fn extract_compaction_summaries_preserve_logical_events() {
         // structured summaries[] wins over the flat string.
         let req = json!({"result": {"metadata": {
-            "summaries": [{"text": "structured"}],
+            "summaries": [{"toolCallRoundId": "round-1", "text": "structured"}],
             "summary": "flat"
         }}});
         assert_eq!(
-            extract_compaction_summary(&req).as_deref(),
-            Some("structured")
+            extract_compaction_summaries(&req),
+            vec!["structured".to_string()]
         );
         // falls back to the flat `summary`.
         let req = json!({"result": {"metadata": {"summary": "flat only"}}});
         assert_eq!(
-            extract_compaction_summary(&req).as_deref(),
-            Some("flat only")
+            extract_compaction_summaries(&req),
+            vec!["flat only".to_string()]
         );
-        // joins multiple non-empty summaries, skipping blanks.
+        // An exact duplicate carrying the same non-empty event id is one event.
         let req = json!({"result": {"metadata": {
-            "summaries": [{"text": "a"}, {"text": ""}, {"text": "b"}]
+            "summaries": [
+                {"toolCallRoundId": "round-1", "text": "same"},
+                {"toolCallRoundId": "round-1", "text": "same"}
+            ]
         }}});
-        assert_eq!(extract_compaction_summary(&req).as_deref(), Some("a\n\nb"));
+        assert_eq!(extract_compaction_summaries(&req).len(), 1);
+
+        // Distinct ids are distinct events, even when their text is identical.
+        let req = json!({"result": {"metadata": {
+            "summaries": [
+                {"toolCallRoundId": "round-1", "text": "same"},
+                {"toolCallRoundId": "round-2", "text": "same"}
+            ]
+        }}});
+        assert_eq!(extract_compaction_summaries(&req).len(), 2);
+
+        // The same id with different text is ambiguous and remains lossless.
+        let req = json!({"result": {"metadata": {
+            "summaries": [
+                {"toolCallRoundId": "round-1", "text": "first"},
+                {"toolCallRoundId": "round-1", "text": "second"}
+            ]
+        }}});
+        assert_eq!(extract_compaction_summaries(&req).len(), 2);
+
+        // Missing ids provide no authoritative identity, so identical entries
+        // remain independent. Empty entries are ignored.
+        let req = json!({"result": {"metadata": {
+            "summaries": [{"text": "same"}, {"text": ""}, {"text": "same"}]
+        }}});
+        assert_eq!(extract_compaction_summaries(&req).len(), 2);
+
         // none when absent.
-        assert_eq!(
-            extract_compaction_summary(&json!({"result": {"metadata": {}}})),
-            None
-        );
-        assert_eq!(
-            extract_compaction_summary(&json!({"message": {"text": "x"}})),
-            None
-        );
+        assert!(extract_compaction_summaries(&json!({"result": {"metadata": {}}})).is_empty());
+        assert!(extract_compaction_summaries(&json!({"message": {"text": "x"}})).is_empty());
+    }
+
+    #[test]
+    fn messages_emit_one_compaction_record_per_logical_summary() {
+        let state = json!({
+            "sessionId": "sess-1",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "timestamp": 1700000005000u64,
+                "message": {"text": "Analyze the script"},
+                "response": [{"value": "Working on it."}],
+                "result": {"metadata": {
+                    "summaries": [
+                        {"toolCallRoundId": "round-1", "text": "first"},
+                        {"toolCallRoundId": "round-1", "text": "first"},
+                        {"toolCallRoundId": "round-2", "text": "second"}
+                    ]
+                }}
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        let compact: Vec<&ClaudeMessage> = messages
+            .iter()
+            .filter(|message| message.subtype.as_deref() == Some("compact_summary"))
+            .collect();
+        assert_eq!(compact.len(), 2);
+        let texts: Vec<&str> = compact
+            .iter()
+            .map(|message| {
+                message.content.as_ref().unwrap().as_array().unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second"]);
     }
 
     #[test]
