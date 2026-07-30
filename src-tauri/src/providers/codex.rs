@@ -1,4 +1,5 @@
-use super::ProviderInfo;
+use super::{ProviderInfo, SessionSnapshotLoad};
+use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{
     ClaudeMessage, ClaudeProject, ClaudeSession, InferenceMetadata, InferenceUsage, TokenUsage,
 };
@@ -27,23 +28,6 @@ const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const STEER_SUBTYPE: &str = "steer";
 const SNAPSHOT_CURSOR_VERSION: u32 = 1;
-
-/// Provider result consumed by the headless snapshot envelope.
-pub(crate) enum SessionSnapshotLoad {
-    Full {
-        reason: String,
-        messages: Vec<ClaudeMessage>,
-        cursor: Option<String>,
-    },
-    Unchanged {
-        cursor: String,
-    },
-    Replace {
-        replace_from: usize,
-        messages: Vec<ClaudeMessage>,
-        cursor: String,
-    },
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexParserState {
@@ -974,8 +958,9 @@ fn complete_snapshot_from_path(
     if !is_plain_rollout(canonical_path) {
         return Ok(SessionSnapshotLoad::Full {
             reason,
-            messages: parse_rollout_file(canonical_path)?,
+            messages: finalize_loaded_messages(parse_rollout_file(canonical_path)?),
             cursor: None,
+            cursor_replace_from: None,
         });
     }
 
@@ -990,19 +975,26 @@ fn complete_snapshot_from_path(
     let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
         .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
     let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
-    let cursor = if source_stayed_stable(&before, &after, mmap.len()) {
-        Some(cursor_for(
-            canonical_path,
-            &mmap[..outcome.accepted_len],
-            outcome.checkpoint.clone(),
-        )?)
-    } else {
-        None
-    };
+    let original_len = outcome.messages.len();
+    let messages = finalize_loaded_messages(outcome.messages);
+    let cursor =
+        if messages.len() == original_len && source_stayed_stable(&before, &after, mmap.len()) {
+            Some(cursor_for(
+                canonical_path,
+                &mmap[..outcome.accepted_len],
+                outcome.checkpoint.clone(),
+            )?)
+        } else {
+            None
+        };
 
     Ok(SessionSnapshotLoad::Full {
         reason,
-        messages: outcome.messages,
+        messages,
+        cursor_replace_from: cursor
+            .as_deref()
+            .map(snapshot_cursor_replace_from)
+            .transpose()?,
         cursor,
     })
 }
@@ -1112,6 +1104,12 @@ pub(crate) fn load_session_snapshot(
 
     hasher.update(&mmap[accepted_len..outcome.accepted_len]);
     let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize());
+    let cursor_replace_from = outcome.checkpoint.replace_from;
+    let original_len = outcome.messages.len();
+    let messages = finalize_loaded_messages(outcome.messages);
+    if messages.len() != original_len {
+        return complete_snapshot_from_path(&canonical_path, "post-normalization-count-changed");
+    }
     let next_cursor = encode_snapshot_cursor(&CodexSnapshotCursor {
         version: SNAPSHOT_CURSOR_VERSION,
         provider: "codex".to_string(),
@@ -1124,7 +1122,8 @@ pub(crate) fn load_session_snapshot(
 
     Ok(SessionSnapshotLoad::Replace {
         replace_from,
-        messages: outcome.messages,
+        messages,
+        cursor_replace_from,
         cursor: next_cursor,
     })
 }
@@ -2959,6 +2958,7 @@ mod tests {
                     reason,
                     messages,
                     cursor: Some(cursor),
+                    ..
                 } => {
                     assert_eq!(reason, "initial");
                     (messages, cursor)
@@ -3015,6 +3015,7 @@ mod tests {
                     replace_from,
                     messages,
                     cursor,
+                    ..
                 } => {
                     assert_eq!(replace_from, initial_len);
                     cached.truncate(replace_from);
@@ -3073,6 +3074,7 @@ mod tests {
                 replace_from,
                 messages,
                 cursor,
+                ..
             } => {
                 assert_eq!(replace_from, initial_len);
                 cached.truncate(replace_from);
@@ -3460,6 +3462,7 @@ mod tests {
                 reason,
                 messages,
                 cursor,
+                ..
             } => {
                 assert_eq!(reason, "unsupported-source");
                 assert!(cursor.is_none());

@@ -16,9 +16,11 @@
 //!
 //! The snapshot command is additive: providers without an incremental
 //! implementation return a complete normalized array inside a `full` envelope.
-//! Codex plain rollouts can instead prove the accepted byte prefix and return an
-//! exact replacement suffix from a completed-turn checkpoint. The ordinary
-//! `--dump-session` array contract remains unchanged.
+//! Codex plain rollouts and Claude session JSONL can instead prove the accepted
+//! byte prefix and return an exact replacement suffix from a provider-owned
+//! checkpoint. Codex checkpoints at completed turns; Claude replays from a
+//! verified authored-user boundary.
+//! The ordinary `--dump-session` array contract remains unchanged.
 //!
 //! Other companion commands share this file: `--list-sessions` (which also
 //! stamps each session with its decoded project directory, so callers can match
@@ -30,10 +32,10 @@
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
-    finalize_loaded_messages, load_provider_messages, load_provider_sessions, scan_all_projects,
+    load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::{ClaudeMessage, ClaudeSession};
-use crate::providers::codex;
+use crate::providers::{claude, codex, SessionSnapshotLoad};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -266,7 +268,7 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
 
     let result: Result<SessionSnapshotEnvelope, String> = block_on(async {
         let session_path = resolve_session_path(&provider, &id).await?;
-        if provider != "codex" {
+        if provider != "codex" && provider != "claude" {
             let messages = load_provider_messages(provider.clone(), session_path).await?;
             return Ok(SessionSnapshotEnvelope::Full {
                 reason: "unsupported-provider".to_string(),
@@ -276,53 +278,37 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
             });
         }
 
-        match codex::load_session_snapshot(&session_path, cursor.as_deref())? {
-            codex::SessionSnapshotLoad::Full {
+        let snapshot = if provider == "claude" {
+            claude::load_session_snapshot(&session_path, cursor.as_deref())?
+        } else {
+            codex::load_session_snapshot(&session_path, cursor.as_deref())?
+        };
+        match snapshot {
+            SessionSnapshotLoad::Full {
                 reason,
                 messages,
                 cursor,
-            } => {
-                let original_len = messages.len();
-                let messages = finalize_loaded_messages(messages);
-                let cursor = (messages.len() == original_len).then_some(cursor).flatten();
-                let cursor_replace_from = cursor
-                    .as_deref()
-                    .map(codex::snapshot_cursor_replace_from)
-                    .transpose()?;
-                Ok(SessionSnapshotEnvelope::Full {
-                    reason,
-                    messages,
-                    cursor,
-                    cursor_replace_from,
-                })
-            }
-            codex::SessionSnapshotLoad::Unchanged { cursor } => {
+                cursor_replace_from,
+            } => Ok(SessionSnapshotEnvelope::Full {
+                reason,
+                messages,
+                cursor,
+                cursor_replace_from,
+            }),
+            SessionSnapshotLoad::Unchanged { cursor } => {
                 Ok(SessionSnapshotEnvelope::Unchanged { cursor })
             }
-            codex::SessionSnapshotLoad::Replace {
+            SessionSnapshotLoad::Replace {
                 replace_from,
                 messages,
                 cursor,
-            } => {
-                let original_len = messages.len();
-                let messages = finalize_loaded_messages(messages);
-                if messages.len() != original_len {
-                    let messages = load_provider_messages(provider.clone(), session_path).await?;
-                    return Ok(SessionSnapshotEnvelope::Full {
-                        reason: "post-normalization-count-changed".to_string(),
-                        messages,
-                        cursor: None,
-                        cursor_replace_from: None,
-                    });
-                }
-                let cursor_replace_from = codex::snapshot_cursor_replace_from(&cursor)?;
-                Ok(SessionSnapshotEnvelope::Replace {
-                    replace_from,
-                    messages,
-                    cursor,
-                    cursor_replace_from,
-                })
-            }
+                cursor_replace_from,
+            } => Ok(SessionSnapshotEnvelope::Replace {
+                replace_from,
+                messages,
+                cursor,
+                cursor_replace_from,
+            }),
         }
     });
 
@@ -1483,11 +1469,66 @@ mod tests {
         ]);
         assert_eq!(run_dump_session_snapshot(&snapshot_argv), 0);
         let snapshot: Value =
-            serde_json::from_slice(&std::fs::read(snapshot_output).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&snapshot_output).unwrap()).unwrap();
         assert_eq!(snapshot["kind"], "full");
-        assert_eq!(snapshot["reason"], "unsupported-provider");
+        assert_eq!(snapshot["reason"], "initial");
         assert_eq!(snapshot["messages"].as_array().unwrap().len(), 2);
-        assert!(snapshot["cursor"].is_null());
+        assert!(snapshot["cursor"].is_string());
+        assert_eq!(snapshot["cursorReplaceFrom"], 0);
+        let cursor = snapshot["cursor"].as_str().unwrap().to_string();
+
+        use std::io::Write as _;
+        let mut input_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        writeln!(
+            input_file,
+            r#"{{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"s1","timestamp":"2026-01-01T00:02:00Z","message":{{"role":"user","content":"again"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            input_file,
+            r#"{{"type":"assistant","uuid":"a2","parentUuid":"u2","sessionId":"s1","timestamp":"2026-01-01T00:03:00Z","message":{{"role":"assistant","content":[{{"type":"text","text":"again"}}]}}}}"#
+        )
+        .unwrap();
+        input_file.sync_all().unwrap();
+
+        let refresh_argv = args(&[
+            "viewer",
+            "--dump-session-snapshot",
+            input.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--cursor",
+            &cursor,
+            "--output",
+            snapshot_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_snapshot(&refresh_argv), 0);
+        let refresh: Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_output).unwrap()).unwrap();
+        assert_eq!(refresh["kind"], "replace");
+        assert_eq!(refresh["replaceFrom"], 0);
+        assert_eq!(refresh["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(refresh["cursorReplaceFrom"], 2);
+        let next_cursor = refresh["cursor"].as_str().unwrap();
+
+        let unchanged_argv = args(&[
+            "viewer",
+            "--dump-session-snapshot",
+            input.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--cursor",
+            next_cursor,
+            "--output",
+            snapshot_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_snapshot(&unchanged_argv), 0);
+        let unchanged: Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_output).unwrap()).unwrap();
+        assert_eq!(unchanged["kind"], "unchanged");
     }
 
     #[test]

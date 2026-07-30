@@ -2128,15 +2128,31 @@ fn parse_line_simd(
     })
 }
 
-#[tauri::command]
+/// Parse one Claude JSONL record through the same visibility rules used by the
+/// complete mmap loader.
+pub(crate) fn parse_visible_message_line(
+    line_num: usize,
+    line: &mut [u8],
+) -> Option<ClaudeMessage> {
+    parse_line_simd(line_num, line, false).filter(|message| {
+        if is_system_message_type(&message.message_type) {
+            return false;
+        }
+        if message.message_type == "system" {
+            return !is_hidden_system_subtype(message.subtype.as_deref());
+        }
+        true
+    })
+}
+
 #[allow(unsafe_code)] // Required for mmap performance optimization
-pub async fn load_session_messages(session_path: String) -> Result<Vec<ClaudeMessage>, String> {
+pub(crate) fn load_session_messages_sync(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     #[cfg(debug_assertions)]
     let start_time = std::time::Instant::now();
 
     // Use memory-mapped file for faster I/O
     let file =
-        fs::File::open(&session_path).map_err(|e| format!("Failed to open session file: {e}"))?;
+        fs::File::open(session_path).map_err(|e| format!("Failed to open session file: {e}"))?;
 
     // SAFETY: We're only reading the file, and the file handle is kept open
     // for the duration of the mmap's lifetime. No concurrent modifications expected
@@ -2160,17 +2176,7 @@ pub async fn load_session_messages(session_path: String) -> Result<Vec<ClaudeMes
             // Create a mutable copy for simd-json (it requires mutable slice)
             let mut line_bytes = mmap[start..end].to_vec();
 
-            parse_line_simd(line_num, &mut line_bytes, false)
-                .filter(|msg| {
-                    if is_system_message_type(&msg.message_type) {
-                        return false;
-                    }
-                    if msg.message_type == "system" {
-                        return !is_hidden_system_subtype(msg.subtype.as_deref());
-                    }
-                    true
-                })
-                .map(|msg| (line_num, msg))
+            parse_visible_message_line(line_num, &mut line_bytes).map(|message| (line_num, message))
         })
         .collect();
 
@@ -2189,6 +2195,11 @@ pub async fn load_session_messages(session_path: String) -> Result<Vec<ClaudeMes
     }
 
     Ok(messages)
+}
+
+#[tauri::command]
+pub async fn load_session_messages(session_path: String) -> Result<Vec<ClaudeMessage>, String> {
+    load_session_messages_sync(&session_path)
 }
 
 // ============================================================================

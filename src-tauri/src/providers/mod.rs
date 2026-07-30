@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::models::ClaudeMessage;
+
 pub mod aider;
 pub mod amazon_q;
 pub mod antigravity;
@@ -33,6 +35,28 @@ pub mod trae;
 pub mod vibe;
 pub mod vscode;
 pub mod zed;
+
+/// Provider result consumed by the headless snapshot envelope.
+///
+/// Each provider owns its opaque cursor and the proof that `replace_from`
+/// addresses the same finalized message sequence returned by a complete load.
+pub(crate) enum SessionSnapshotLoad {
+    Full {
+        reason: String,
+        messages: Vec<ClaudeMessage>,
+        cursor: Option<String>,
+        cursor_replace_from: Option<usize>,
+    },
+    Unchanged {
+        cursor: String,
+    },
+    Replace {
+        replace_from: usize,
+        messages: Vec<ClaudeMessage>,
+        cursor: String,
+        cursor_replace_from: usize,
+    },
+}
 
 /// Provider identifier
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
