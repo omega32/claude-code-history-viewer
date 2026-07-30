@@ -19,7 +19,8 @@
 //! Codex plain rollouts and Claude session JSONL can instead prove the accepted
 //! byte prefix and return an exact replacement suffix from a provider-owned
 //! checkpoint. Codex checkpoints at completed turns; Claude replays from a
-//! verified authored-user boundary.
+//! verified authored-user boundary; Copilot replays its authoritative source
+//! and hashes the retained normalized prefix before emitting a suffix.
 //! The ordinary `--dump-session` array contract remains unchanged.
 //!
 //! Other companion commands share this file: `--list-sessions` (which also
@@ -35,7 +36,7 @@ use crate::commands::multi_provider::{
     load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::{ClaudeMessage, ClaudeSession};
-use crate::providers::{claude, codex, SessionSnapshotLoad};
+use crate::providers::{claude, codex, copilot, SessionSnapshotLoad};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -268,7 +269,7 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
 
     let result: Result<SessionSnapshotEnvelope, String> = block_on(async {
         let session_path = resolve_session_path(&provider, &id).await?;
-        if provider != "codex" && provider != "claude" {
+        if provider != "codex" && provider != "claude" && provider != "copilot" {
             let messages = load_provider_messages(provider.clone(), session_path).await?;
             return Ok(SessionSnapshotEnvelope::Full {
                 reason: "unsupported-provider".to_string(),
@@ -278,10 +279,11 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
             });
         }
 
-        let snapshot = if provider == "claude" {
-            claude::load_session_snapshot(&session_path, cursor.as_deref())?
-        } else {
-            codex::load_session_snapshot(&session_path, cursor.as_deref())?
+        let snapshot = match provider.as_str() {
+            "claude" => claude::load_session_snapshot(&session_path, cursor.as_deref())?,
+            "codex" => codex::load_session_snapshot(&session_path, cursor.as_deref())?,
+            "copilot" => copilot::load_session_snapshot(&session_path, cursor.as_deref())?,
+            _ => unreachable!("unsupported providers return above"),
         };
         match snapshot {
             SessionSnapshotLoad::Full {

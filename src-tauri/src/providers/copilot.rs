@@ -18,17 +18,22 @@
 //! costs us one extra scan on session-load, but avoids encoding multiple
 //! storage hashes into the project URL.
 
+use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
-use crate::providers::{copilot_cli, vscode, ProviderInfo};
+use crate::providers::{copilot_cli, vscode, ProviderInfo, SessionSnapshotLoad};
 use crate::utils::parse_rfc3339_utc;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 /// Public provider id stamped on every record.
 pub const PROVIDER_ID: &str = "copilot";
+const SNAPSHOT_CURSOR_VERSION: u32 = 1;
 
 /// Synthetic URL scheme for merged Copilot projects.
 const PROJECT_SCHEME: &str = "copilot://";
@@ -64,6 +69,135 @@ struct SourceRef {
 struct ProjectRef {
     actual: String,
     sources: Vec<SourceRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CopilotSnapshotCursor {
+    version: u32,
+    provider: String,
+    surface: String,
+    canonical_path: String,
+    replace_from: usize,
+    prefix_digest: String,
+    messages_digest: String,
+}
+
+fn digest_messages(messages: &[ClaudeMessage]) -> Result<String, String> {
+    let bytes = serde_json::to_vec(messages)
+        .map_err(|error| format!("Failed to serialize Copilot snapshot messages: {error}"))?;
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(bytes)))
+}
+
+fn encode_snapshot_cursor(cursor: &CopilotSnapshotCursor) -> Result<String, String> {
+    serde_json::to_vec(cursor)
+        .map(|bytes| BASE64_URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| format!("Failed to encode Copilot snapshot cursor: {error}"))
+}
+
+fn decode_snapshot_cursor(encoded: &str) -> Result<CopilotSnapshotCursor, String> {
+    const MAX_CURSOR_BYTES: usize = 64 * 1024;
+    if encoded.len() > MAX_CURSOR_BYTES {
+        return Err("Copilot snapshot cursor is too large".to_string());
+    }
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| format!("Invalid Copilot snapshot cursor encoding: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid Copilot snapshot cursor payload: {error}"))
+}
+
+fn replacement_checkpoint(messages: &[ClaudeMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message.message_type == "user" && message.subtype.is_none())
+        .unwrap_or(0)
+}
+
+fn cursor_for_messages(
+    surface: &str,
+    canonical_path: &str,
+    messages: &[ClaudeMessage],
+) -> Result<(String, usize, String), String> {
+    let replace_from = replacement_checkpoint(messages);
+    let messages_digest = digest_messages(messages)?;
+    let prefix_digest = digest_messages(&messages[..replace_from])?;
+    let cursor = encode_snapshot_cursor(&CopilotSnapshotCursor {
+        version: SNAPSHOT_CURSOR_VERSION,
+        provider: PROVIDER_ID.to_string(),
+        surface: surface.to_string(),
+        canonical_path: canonical_path.to_string(),
+        replace_from,
+        prefix_digest,
+        messages_digest: messages_digest.clone(),
+    })?;
+    Ok((cursor, replace_from, messages_digest))
+}
+
+fn full_snapshot(
+    reason: &str,
+    surface: &str,
+    canonical_path: &str,
+    messages: Vec<ClaudeMessage>,
+) -> Result<SessionSnapshotLoad, String> {
+    let (cursor, cursor_replace_from, _) = cursor_for_messages(surface, canonical_path, &messages)?;
+    Ok(SessionSnapshotLoad::Full {
+        reason: reason.to_string(),
+        messages,
+        cursor: Some(cursor),
+        cursor_replace_from: Some(cursor_replace_from),
+    })
+}
+
+fn snapshot_from_messages(
+    surface: &str,
+    canonical_path: &str,
+    messages: Vec<ClaudeMessage>,
+    previous_cursor: Option<&str>,
+) -> Result<SessionSnapshotLoad, String> {
+    let Some(encoded_cursor) = previous_cursor else {
+        return full_snapshot("initial", surface, canonical_path, messages);
+    };
+
+    let previous = match decode_snapshot_cursor(encoded_cursor) {
+        Ok(cursor)
+            if cursor.version == SNAPSHOT_CURSOR_VERSION
+                && cursor.provider == PROVIDER_ID
+                && cursor.surface == surface
+                && cursor.canonical_path == canonical_path
+                && cursor.replace_from <= messages.len() =>
+        {
+            cursor
+        }
+        _ => return full_snapshot("invalid-cursor", surface, canonical_path, messages),
+    };
+
+    let (cursor, cursor_replace_from, messages_digest) =
+        cursor_for_messages(surface, canonical_path, &messages)?;
+    if messages_digest == previous.messages_digest {
+        return Ok(SessionSnapshotLoad::Unchanged { cursor });
+    }
+
+    if cursor_replace_from < previous.replace_from {
+        return full_snapshot("checkpoint-regressed", surface, canonical_path, messages);
+    }
+
+    let current_prefix_digest = digest_messages(&messages[..previous.replace_from])?;
+    if current_prefix_digest != previous.prefix_digest {
+        return full_snapshot(
+            "normalized-prefix-mismatch",
+            surface,
+            canonical_path,
+            messages,
+        );
+    }
+
+    let suffix = messages[previous.replace_from..].to_vec();
+    Ok(SessionSnapshotLoad::Replace {
+        replace_from: previous.replace_from,
+        messages: suffix,
+        cursor,
+        cursor_replace_from,
+    })
 }
 
 fn encode_project_ref(r: &ProjectRef) -> String {
@@ -333,6 +467,32 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     }
 }
 
+/// Load a cursor-aware Copilot snapshot.
+///
+/// Copilot's two storage families have different mutation semantics: the CLI
+/// can append tool completions that update an earlier assistant record, while
+/// VS Code replays patches that may target any prior request. The first safe
+/// delta implementation therefore replays the provider source authoritatively,
+/// finalizes the complete normalized sequence, and emits a suffix only after
+/// the previous cursor's retained normalized prefix hashes byte-for-byte.
+/// Provider-native parser checkpoints can optimize that replay later without
+/// changing this envelope or its fallback guarantees.
+pub(crate) fn load_session_snapshot(
+    session_path: &str,
+    previous_cursor: Option<&str>,
+) -> Result<SessionSnapshotLoad, String> {
+    let surface = if is_vscode_session_path(session_path) {
+        "copilot-vscode"
+    } else {
+        "copilot-cli"
+    };
+    let messages = finalize_loaded_messages(load_messages(session_path)?);
+    let canonical = fs::canonicalize(session_path)
+        .map_err(|error| format!("Failed to resolve Copilot session path: {error}"))?;
+    let canonical_path = canonical.to_string_lossy();
+    snapshot_from_messages(surface, &canonical_path, messages, previous_cursor)
+}
+
 /// Search across all three sub-providers and merge results, capping at `limit`.
 pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     let mut out = Vec::new();
@@ -432,6 +592,14 @@ mod tests {
             microcompact_metadata: None,
             provider: Some(PROVIDER_ID.to_string()),
         }
+    }
+
+    fn authored_message(uuid: &str, message_type: &str, subtype: Option<&str>) -> ClaudeMessage {
+        let mut value = message(uuid, "2026-01-01T00:00:00Z");
+        value.message_type = message_type.to_string();
+        value.subtype = subtype.map(str::to_string);
+        value.content = Some(serde_json::json!(uuid));
+        value
     }
 
     #[test]
@@ -565,5 +733,202 @@ mod tests {
         assert!(!is_vscode_session_path(
             "/Users/me/.copilot/session-state/abc/events.jsonl"
         ));
+    }
+
+    #[test]
+    fn snapshot_replaces_from_the_previous_authored_user_checkpoint() {
+        let initial = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+            authored_message("u2", "user", None),
+            authored_message("a2", "assistant", None),
+        ];
+        let cursor = match snapshot_from_messages(
+            "copilot-vscode",
+            "C:/sessions/example.jsonl",
+            initial,
+            None,
+        )
+        .expect("initial snapshot")
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                cursor_replace_from: Some(2),
+                ..
+            } => cursor,
+            _ => panic!("initial snapshot should seed an authored-user checkpoint"),
+        };
+
+        let appended = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+            authored_message("u2", "user", None),
+            authored_message("a2-updated", "assistant", None),
+            authored_message("u3", "user", None),
+            authored_message("a3", "assistant", None),
+        ];
+        match snapshot_from_messages(
+            "copilot-vscode",
+            "C:/sessions/example.jsonl",
+            appended,
+            Some(&cursor),
+        )
+        .expect("delta snapshot")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor_replace_from,
+                ..
+            } => {
+                assert_eq!(replace_from, 2);
+                assert_eq!(cursor_replace_from, 4);
+                assert_eq!(
+                    messages
+                        .iter()
+                        .map(|message| message.uuid.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["u2", "a2-updated", "u3", "a3"]
+                );
+            }
+            _ => panic!("append should replace the prior open suffix"),
+        }
+    }
+
+    #[test]
+    fn snapshot_falls_back_when_a_patch_changes_the_retained_prefix() {
+        let initial = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+            authored_message("u2", "user", None),
+            authored_message("a2", "assistant", None),
+        ];
+        let cursor = match snapshot_from_messages(
+            "copilot-vscode",
+            "C:/sessions/example.jsonl",
+            initial,
+            None,
+        )
+        .expect("initial snapshot")
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("cursor expected"),
+        };
+
+        let patched = vec![
+            authored_message("u1-patched", "user", None),
+            authored_message("a1", "assistant", None),
+            authored_message("u2", "user", None),
+            authored_message("a2", "assistant", None),
+        ];
+        match snapshot_from_messages(
+            "copilot-vscode",
+            "C:/sessions/example.jsonl",
+            patched,
+            Some(&cursor),
+        )
+        .expect("fallback snapshot")
+        {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "normalized-prefix-mismatch");
+            }
+            _ => panic!("a retained-prefix mutation must fall back"),
+        }
+    }
+
+    #[test]
+    fn snapshot_reports_unchanged_for_an_identical_normalized_sequence() {
+        let messages = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+        ];
+        let cursor = match snapshot_from_messages(
+            "copilot-cli",
+            "/sessions/events.jsonl",
+            messages.clone(),
+            None,
+        )
+        .expect("initial snapshot")
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("cursor expected"),
+        };
+
+        assert!(matches!(
+            snapshot_from_messages(
+                "copilot-cli",
+                "/sessions/events.jsonl",
+                messages,
+                Some(&cursor),
+            )
+            .expect("unchanged snapshot"),
+            SessionSnapshotLoad::Unchanged { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_does_not_use_compaction_summaries_as_checkpoints() {
+        let messages = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+            authored_message("summary", "user", Some("compact_summary")),
+            authored_message("a2", "assistant", None),
+        ];
+        match snapshot_from_messages(
+            "copilot-vscode",
+            "C:/sessions/example.jsonl",
+            messages,
+            None,
+        )
+        .expect("initial snapshot")
+        {
+            SessionSnapshotLoad::Full {
+                cursor_replace_from: Some(0),
+                ..
+            } => {}
+            _ => panic!("only ordinary authored-user messages may own checkpoints"),
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_a_cursor_from_another_copilot_surface() {
+        let messages = vec![
+            authored_message("u1", "user", None),
+            authored_message("a1", "assistant", None),
+        ];
+        let cursor = match snapshot_from_messages(
+            "copilot-cli",
+            "/sessions/events.jsonl",
+            messages.clone(),
+            None,
+        )
+        .expect("initial snapshot")
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("cursor expected"),
+        };
+
+        match snapshot_from_messages(
+            "copilot-vscode",
+            "/sessions/events.jsonl",
+            messages,
+            Some(&cursor),
+        )
+        .expect("invalid cursor fallback")
+        {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "invalid-cursor");
+            }
+            _ => panic!("surface-mismatched cursors must fall back"),
+        }
     }
 }
