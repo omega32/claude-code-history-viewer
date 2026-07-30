@@ -1436,10 +1436,19 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let input = temp.path().join("session.jsonl");
         let output = temp.path().join("dump.json");
+        let snapshot_output = temp.path().join("snapshot.json");
         std::fs::write(
             &input,
             concat!(
                 r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+                r#"{"type":"custom-title","sessionId":"s1","customTitle":"Branch name"}"#,
+                "\n",
+                r#"{"type":"file-history-delta","messageId":"m1","snapshotMessageId":"snapshot-1","trackingPath":"/tmp/history","backup":{},"timestamp":"2026-01-01T00:00:30Z"}"#,
+                "\n",
+                r#"{"type":"permission-mode","sessionId":"s1","permissionMode":"acceptEdits"}"#,
+                "\n",
+                r#"{"type":"relocated","sessionId":"s1","relocatedCwd":"/tmp/project"}"#,
                 "\n",
                 r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
                 "\n"
@@ -1462,6 +1471,23 @@ mod tests {
         assert_eq!(messages[0]["type"], "user");
         assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["parentUuid"], "u1");
+
+        let snapshot_argv = args(&[
+            "viewer",
+            "--dump-session-snapshot",
+            input.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--output",
+            snapshot_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_snapshot(&snapshot_argv), 0);
+        let snapshot: Value =
+            serde_json::from_slice(&std::fs::read(snapshot_output).unwrap()).unwrap();
+        assert_eq!(snapshot["kind"], "full");
+        assert_eq!(snapshot["reason"], "unsupported-provider");
+        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 2);
+        assert!(snapshot["cursor"].is_null());
     }
 
     #[test]

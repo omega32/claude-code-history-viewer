@@ -720,13 +720,22 @@ fn extract_session_metadata_internal(
     })
 }
 
-/// Message types that should always be excluded from the viewer
-const EXCLUDED_MESSAGE_TYPES: [&str; 8] = [
+/// Non-conversational record types that should never become normalized messages.
+///
+/// The shared visibility checks also use this list for the GUI, pagination,
+/// counts, and offsets so every message surface describes the same sequence.
+const EXCLUDED_MESSAGE_TYPES: [&str; 12] = [
     "progress",
     "queue-operation",
     "file-history-snapshot",
+    // Incremental editor backup metadata. It has no conversational payload or
+    // stable message identity, so normalizing it would invent a UUID.
+    "file-history-delta",
     "last-prompt",
     "pr-link",
+    // `/branch` naming metadata is consumed by the session-list scanner. It has
+    // no stable message UUID/timestamp and must not enter normalized dumps.
+    "custom-title",
     // Emitted alongside "custom-title" by the `/branch` command; redundant with it
     // (same name), so it's excluded from the viewer rather than used as a rename source.
     "agent-name",
@@ -736,10 +745,13 @@ const EXCLUDED_MESSAGE_TYPES: [&str; 8] = [
     // `/mode`-change marker (`{type:"mode",mode:…,sessionId:…}`) — non-conversational
     // metadata, hidden from the viewer.
     "mode",
-    // Note: this list is the *viewer* denylist (via `is_system_message_type`). It no
-    // longer drives `message_count`, which is computed from a conversational allowlist
-    // in `extract_session_metadata_internal`, so new metadata types need no entry here
-    // to be kept out of the count (only to be hidden from the viewer).
+    // Permission selection and project-relocation state are session metadata,
+    // not authored conversation. Observed records have no UUID or timestamp.
+    "permission-mode",
+    "relocated",
+    // Note: session-list `message_count` is computed from a separate conversational
+    // allowlist in `extract_session_metadata_internal`, so this denylist does not
+    // affect cached metadata or require a cache-version bump.
 ];
 
 /// System subtypes that are internal metadata (excluded from the viewer).
@@ -1630,6 +1642,10 @@ fn parse_line_to_message(
         return None;
     }
 
+    if is_system_message_type(&log_entry.message_type) {
+        return None;
+    }
+
     if log_entry.message_type == "summary" {
         if !include_summary {
             return None;
@@ -1907,6 +1923,10 @@ fn parse_line_simd(
 
     // Skip meta messages
     if log_entry.is_meta.unwrap_or(false) {
+        return None;
+    }
+
+    if is_system_message_type(&log_entry.message_type) {
         return None;
     }
 
@@ -2674,6 +2694,64 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].message_type, "user");
         assert_eq!(messages[1].message_type, "assistant");
+    }
+
+    #[tokio::test]
+    async fn test_message_surfaces_exclude_metadata_only_records_deterministically() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            create_sample_user_message("uuid-1", "session-1", "Hello"),
+            r#"{"type":"custom-title","sessionId":"session-1","customTitle":"Branch name"}"#,
+            r#"{"type":"file-history-delta","messageId":"msg-1","snapshotMessageId":"snapshot-1","trackingPath":"/tmp/history","backup":{},"timestamp":"2025-06-26T10:00:30Z"}"#,
+            r#"{"type":"permission-mode","sessionId":"session-1","permissionMode":"acceptEdits"}"#,
+            r#"{"type":"relocated","sessionId":"session-1","relocatedCwd":"/tmp/project"}"#,
+            create_sample_assistant_message("uuid-2", "session-1", "Hi there!")
+        );
+        let file_path = create_test_jsonl_file(&temp_dir, "test.jsonl", &content);
+        let path = file_path.to_string_lossy().to_string();
+
+        let first = load_session_messages(path.clone()).await.unwrap();
+        let second = load_session_messages(path.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert_eq!(
+            first
+                .iter()
+                .map(|message| message.message_type.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant"]
+        );
+
+        let page = load_session_messages_paginated(path.clone(), 0, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total_count, 2);
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(
+            get_session_message_count(path.clone(), None).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            get_session_message_offset(path, "uuid-1".to_string(), None).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_metadata_only_records_never_normalize_into_messages() {
+        for line in [
+            r#"{"type":"custom-title","sessionId":"session-1","customTitle":"Branch name"}"#,
+            r#"{"type":"file-history-delta","messageId":"msg-1","snapshotMessageId":"snapshot-1","trackingPath":"/tmp/history","backup":{},"timestamp":"2025-06-26T10:00:30Z"}"#,
+            r#"{"type":"permission-mode","sessionId":"session-1","permissionMode":"acceptEdits"}"#,
+            r#"{"type":"relocated","sessionId":"session-1","relocatedCwd":"/tmp/project"}"#,
+        ] {
+            assert!(parse_line_to_message(0, line, false).is_none());
+            let mut bytes = line.as_bytes().to_vec();
+            assert!(parse_line_simd(0, &mut bytes, false).is_none());
+        }
     }
 
     #[tokio::test]
