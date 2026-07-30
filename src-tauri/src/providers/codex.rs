@@ -27,7 +27,7 @@ const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 1;
+const SNAPSHOT_CURSOR_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexParserState {
@@ -595,6 +595,7 @@ fn parse_rollout_slice(
     let mut active_turn_message_start = 0usize;
     let mut authored_user_messages_in_turn = 0usize;
     let mut pending_user_message_index: Option<usize> = None;
+    let mut pending_compacted_notification = false;
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
         if start < usize::try_from(checkpoint.byte_offset).map_err(|_| ())? {
@@ -618,6 +619,27 @@ fn parse_rollout_slice(
             .to_string();
 
         let line_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let event_type = if line_type == "event_msg" {
+            val.get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        } else {
+            ""
+        };
+
+        // Current Codex rollouts persist one logical compaction twice: the
+        // authoritative `compacted` record carries replacement history, then
+        // `context_compacted` announces that same event after bookkeeping.
+        // Retain a standalone notification, but suppress the companion while
+        // the exact provider sequence remains intact.
+        if pending_compacted_notification
+            && !matches!(line_type, "world_state" | "turn_context" | "compacted")
+            && !(line_type == "event_msg"
+                && matches!(event_type, "token_count" | "context_compacted"))
+        {
+            pending_compacted_notification = false;
+        }
 
         match line_type {
             // First session_meta only — later ones are history replayed by
@@ -687,7 +709,10 @@ fn parse_rollout_slice(
             }
             "event_msg" => {
                 if let Some(payload) = val.get("payload") {
-                    let event_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if event_type == "context_compacted" && pending_compacted_notification {
+                        pending_compacted_notification = false;
+                        continue;
+                    }
 
                     // Skip events that duplicate response_item messages.
                     // Codex logs user/assistant text in both response_item (type=message)
@@ -866,6 +891,7 @@ fn parse_rollout_slice(
                         &mut state.msg_counter,
                     );
                     messages.push(msg);
+                    pending_compacted_notification = true;
                 }
             }
             _ => {}
@@ -3256,6 +3282,26 @@ mod tests {
                     "payload": { "replacement_history": [{ "type": "message" }] }
                 }),
                 json!({
+                    "timestamp": "2026-07-29T10:01:01.005Z",
+                    "type": "world_state",
+                    "payload": {}
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:01.010Z",
+                    "type": "turn_context",
+                    "payload": {}
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:01.015Z",
+                    "type": "event_msg",
+                    "payload": { "type": "token_count" }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:01.020Z",
+                    "type": "event_msg",
+                    "payload": { "type": "context_compacted" }
+                }),
+                json!({
                     "timestamp": "2026-07-29T10:01:02Z",
                     "type": "event_msg",
                     "payload": { "type": "task_started", "turn_id": "turn-2" }
@@ -3314,12 +3360,105 @@ mod tests {
                 .all(|message| message.session_id == "snapshot-structural"),
             "replayed fork metadata must not replace the destination session id"
         );
-        assert!(cached
+        assert_eq!(
+            cached
+                .iter()
+                .filter(|message| message.subtype.as_deref() == Some("compact_boundary"))
+                .count(),
+            1
+        );
+        assert!(!cached
             .iter()
-            .any(|message| message.subtype.as_deref() == Some("compact_boundary")));
+            .any(|message| message.subtype.as_deref() == Some("microcompact_boundary")));
         assert!(cached
             .iter()
             .any(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE)));
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_correlates_a_compaction_split_across_refreshes() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-split-compaction");
+        let path_text = path.to_string_lossy();
+
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-07-29T10:01:00Z",
+                    "type": "compacted",
+                    "payload": { "replacement_history": [{ "type": "message" }] }
+                }),
+                json!({
+                    "timestamp": "2026-07-29T10:01:00.005Z",
+                    "type": "world_state",
+                    "payload": {}
+                }),
+            ],
+        );
+
+        let cursor = match load_session_snapshot(&path_text, Some(&cursor))
+            .expect("authoritative compaction delta")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+                cursor
+            }
+            _ => panic!("an appended compaction should produce a replacement"),
+        };
+
+        append_rollout_lines(
+            &path,
+            &[json!({
+                "timestamp": "2026-07-29T10:01:00.020Z",
+                "type": "event_msg",
+                "payload": { "type": "context_compacted" }
+            })],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("companion delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("the appended companion should produce a replacement"),
+        }
+        assert_snapshot_matches_fresh(&cached, &path);
+        assert_eq!(
+            cached
+                .iter()
+                .filter(|message| message.subtype.as_deref() == Some("compact_boundary"))
+                .count(),
+            1
+        );
+        assert!(!cached
+            .iter()
+            .any(|message| message.subtype.as_deref() == Some("microcompact_boundary")));
     }
 
     #[test]
@@ -4463,17 +4602,17 @@ mod tests {
                 }
             }),
             json!({
-                "timestamp": "2026-02-19T12:00:08Z",
-                "type": "event_msg",
-                "payload": {
-                    "type": "context_compacted"
-                }
-            }),
-            json!({
-                "timestamp": "2026-02-19T12:00:09Z",
+                "timestamp": "2026-02-19T12:00:08.000Z",
                 "type": "compacted",
                 "payload": {
                     "replacement_history": [{ "type": "message" }, { "type": "summary" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:08.020Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "context_compacted"
                 }
             }),
         ];
@@ -4492,13 +4631,12 @@ mod tests {
         )
         .expect("rollout should be parsed");
 
-        assert_eq!(messages.len(), 6);
+        assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].message_type, "assistant");
         assert_eq!(messages[1].message_type, "assistant");
         assert_eq!(messages[2].message_type, "progress");
         assert_eq!(messages[3].message_type, "progress");
         assert_eq!(messages[4].message_type, "system");
-        assert_eq!(messages[5].message_type, "system");
 
         let first_blocks = messages[0]
             .content
@@ -4555,13 +4693,9 @@ mod tests {
                 .and_then(Value::as_str),
             Some("completed")
         );
+        assert_eq!(messages[4].subtype.as_deref(), Some("compact_boundary"));
         assert_eq!(
-            messages[4].subtype.as_deref(),
-            Some("microcompact_boundary")
-        );
-        assert_eq!(messages[5].subtype.as_deref(), Some("compact_boundary"));
-        assert_eq!(
-            messages[5]
+            messages[4]
                 .compact_metadata
                 .as_ref()
                 .and_then(|v| v.get("replacementHistoryCount"))
