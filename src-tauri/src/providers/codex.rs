@@ -360,8 +360,8 @@ pub(crate) struct SessionInfo {
     pub(crate) session_id: String,
     pub(crate) cwd: Option<String>,
     /// Provider-qualified source from the rollout's first `session_meta`.
-    /// Known user-facing surfaces are `codex-cli` / `codex-vscode`; other
-    /// Codex sources are preserved without being presented as a UI surface.
+    /// User-facing surfaces are `codex-cli` / `codex-vscode`; structured
+    /// subagent provenance is normalized separately as `codex-subagent`.
     pub(crate) entrypoint: Option<String>,
     /// Authoritative parent id from the rollout's first `session_meta`.
     pub(crate) forked_from_id: Option<String>,
@@ -376,19 +376,35 @@ pub(crate) struct SessionInfo {
     pub(crate) summary: Option<String>,
 }
 
-/// Map Codex's unqualified rollout `source` to the shared provider entrypoint
-/// namespace. Unknown future values remain inspectable metadata, but only
-/// the known CLI / VS Code sources are treated as user-facing surfaces.
-fn codex_entrypoint(source: Option<&str>) -> Option<String> {
-    let source = source?.trim();
-    if source.is_empty() {
-        return None;
+/// Map Codex's rollout `source` to the shared provider entrypoint namespace.
+/// User-facing clients use strings; spawned agents use a structured
+/// `{ "subagent": { "thread_spawn": ... } }` source. Unknown structured
+/// variants remain unset rather than inventing a classification.
+fn codex_entrypoint(source: Option<&Value>) -> Option<String> {
+    match source? {
+        Value::String(source) => {
+            let source = source.trim();
+            if source.is_empty() {
+                None
+            } else {
+                Some(match source {
+                    "cli" => "codex-cli".to_string(),
+                    "vscode" => "codex-vscode".to_string(),
+                    other => format!("codex-{other}"),
+                })
+            }
+        }
+        Value::Object(source)
+            if source
+                .get("subagent")
+                .and_then(Value::as_object)
+                .and_then(|subagent| subagent.get("thread_spawn"))
+                .is_some_and(Value::is_object) =>
+        {
+            Some("codex-subagent".to_string())
+        }
+        _ => None,
     }
-    Some(match source {
-        "cli" => "codex-cli".to_string(),
-        "vscode" => "codex-vscode".to_string(),
-        other => format!("codex-{other}"),
-    })
 }
 
 /// Lightweight metadata used by project-level scans.
@@ -1685,10 +1701,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                         .get("cwd")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    source = payload
-                        .get("source")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    source = payload.get("source").cloned();
                     forked_from_id = payload
                         .get("forked_from_id")
                         .and_then(|v| v.as_str())
@@ -1785,7 +1798,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     Ok(SessionInfo {
         session_id,
         cwd,
-        entrypoint: codex_entrypoint(source.as_deref()),
+        entrypoint: codex_entrypoint(source.as_ref()),
         forked_from_id,
         model,
         message_count,
@@ -5875,12 +5888,43 @@ mod tests {
         })]);
         assert_eq!(info.entrypoint.as_deref(), Some("codex-vscode"));
 
-        assert_eq!(codex_entrypoint(Some("cli")).as_deref(), Some("codex-cli"));
         assert_eq!(
-            codex_entrypoint(Some("future-surface")).as_deref(),
+            codex_entrypoint(Some(&json!("cli"))).as_deref(),
+            Some("codex-cli")
+        );
+        assert_eq!(
+            codex_entrypoint(Some(&json!("future-surface"))).as_deref(),
             Some("codex-future-surface")
         );
-        assert_eq!(codex_entrypoint(Some(" ")), None);
+        assert_eq!(codex_entrypoint(Some(&json!(" "))), None);
+    }
+
+    #[test]
+    fn extract_session_info_stamps_structured_subagent_source() {
+        let info = run_extract_session_info_on_lines(vec![json!({
+            "timestamp": "2026-05-13T08:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "sess-subagent",
+                "cwd": "/tmp/proj",
+                "forked_from_id": "sess-parent",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "sess-parent",
+                            "depth": 1,
+                            "agent_path": "/root/research",
+                            "agent_nickname": "Parfit"
+                        }
+                    }
+                }
+            }
+        })]);
+
+        assert_eq!(info.entrypoint.as_deref(), Some("codex-subagent"));
+        assert_eq!(info.forked_from_id.as_deref(), Some("sess-parent"));
+        assert_eq!(codex_entrypoint(Some(&json!({ "subagent": {} }))), None);
+        assert_eq!(codex_entrypoint(Some(&json!({ "future": {} }))), None);
     }
 
     #[test]
