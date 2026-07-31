@@ -242,6 +242,7 @@ fn load_sessions_conn(conn: &Connection, target_ws: &str) -> Result<Vec<ClaudeSe
                 provider: Some(PROVIDER.to_string()),
                 storage_type: Some("sqlite".to_string()),
                 entrypoint: None,
+                forked_from_id: None,
             }
         })
         .collect();

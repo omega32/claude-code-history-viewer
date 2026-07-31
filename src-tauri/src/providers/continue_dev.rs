@@ -284,6 +284,7 @@ pub(crate) fn load_sessions_for(
             provider: Some(f.provider_id.to_string()),
             storage_type: Some("json".to_string()),
             entrypoint: None,
+            forked_from_id: None,
         });
     }
 

@@ -4995,6 +4995,7 @@ mod tests {
             provider: Some("antigravity".to_string()),
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         };
 
         let (billing_stats, _) =

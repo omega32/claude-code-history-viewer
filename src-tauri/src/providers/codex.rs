@@ -363,6 +363,8 @@ pub(crate) struct SessionInfo {
     /// Known user-facing surfaces are `codex-cli` / `codex-vscode`; other
     /// Codex sources are preserved without being presented as a UI surface.
     pub(crate) entrypoint: Option<String>,
+    /// Authoritative parent id from the rollout's first `session_meta`.
+    pub(crate) forked_from_id: Option<String>,
     #[allow(dead_code)]
     pub(crate) model: Option<String>,
     pub(crate) message_count: usize,
@@ -543,6 +545,7 @@ pub fn load_sessions(
                     provider: Some("codex".to_string()),
                     storage_type: None,
                     entrypoint: info.entrypoint,
+                    forked_from_id: info.forked_from_id,
                 });
             }
         }
@@ -1645,6 +1648,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     let mut meta_seen = false;
     let mut cwd = None;
     let mut source = None;
+    let mut forked_from_id = None;
     let mut turn_context_cwd = None;
     let mut model = None;
     let mut message_count = 0usize;
@@ -1684,6 +1688,12 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                     source = payload
                         .get("source")
                         .and_then(|v| v.as_str())
+                        .map(String::from);
+                    forked_from_id = payload
+                        .get("forked_from_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
                         .map(String::from);
                 }
             }
@@ -1776,6 +1786,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
         session_id,
         cwd,
         entrypoint: codex_entrypoint(source.as_deref()),
+        forked_from_id,
         model,
         message_count,
         first_message_time: first_time,
@@ -5898,6 +5909,23 @@ mod tests {
         })
     }
 
+    fn forked_session_meta_line_with(
+        timestamp: &str,
+        id: &str,
+        cwd: &str,
+        forked_from_id: Value,
+    ) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "cwd": cwd,
+                "forked_from_id": forked_from_id
+            }
+        })
+    }
+
     #[test]
     /// `codex fork` creates the new rollout with its own `session_meta` first,
     /// then replays the source rollout verbatim — including the source's
@@ -5907,13 +5935,47 @@ mod tests {
     /// while project scanning used the first).
     fn extract_session_info_keeps_first_session_meta_on_forked_rollout() {
         let info = run_extract_session_info_on_lines(vec![
-            session_meta_line_with("2026-05-13T08:00:00Z", "sess-fork-new", "/tmp/proj-b"),
-            session_meta_line_with("2026-05-12T08:00:00Z", "sess-orig", "/tmp/proj-a"),
+            forked_session_meta_line_with(
+                "2026-05-13T08:00:00Z",
+                "sess-fork-new",
+                "/tmp/proj-b",
+                json!("sess-orig"),
+            ),
+            forked_session_meta_line_with(
+                "2026-05-12T08:00:00Z",
+                "sess-orig",
+                "/tmp/proj-a",
+                json!("older-origin"),
+            ),
             user_message_line("2026-05-13T08:00:01Z", "continue from the forked session"),
         ]);
 
         assert_eq!(info.session_id, "sess-fork-new");
         assert_eq!(info.cwd.as_deref(), Some("/tmp/proj-b"));
+        assert_eq!(info.forked_from_id.as_deref(), Some("sess-orig"));
+    }
+
+    #[test]
+    fn extract_session_info_ignores_invalid_fork_provenance() {
+        for forked_from_id in [Value::Null, json!(""), json!("  "), json!(42), json!({})] {
+            let info = run_extract_session_info_on_lines(vec![
+                forked_session_meta_line_with(
+                    "2026-05-13T08:00:00Z",
+                    "sess-native",
+                    "/tmp/proj",
+                    forked_from_id,
+                ),
+                forked_session_meta_line_with(
+                    "2026-05-12T08:00:00Z",
+                    "replayed-session",
+                    "/tmp/older-proj",
+                    json!("replayed-parent"),
+                ),
+                user_message_line("2026-05-13T08:00:01Z", "native session"),
+            ]);
+
+            assert_eq!(info.forked_from_id, None);
+        }
     }
 
     #[test]

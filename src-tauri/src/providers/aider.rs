@@ -149,6 +149,7 @@ pub fn load_sessions(
             provider: Some("aider".to_string()),
             storage_type: Some("markdown".to_string()),
             entrypoint: None,
+            forked_from_id: None,
         });
     }
 

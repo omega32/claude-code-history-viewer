@@ -88,6 +88,8 @@ export interface ClaudeSession {
    * Undefined for providers that don't stamp the field, or older sessions.
    */
   entrypoint?: string;
+  /** Parent session id for a provider-reported fork (currently Codex). */
+  forked_from_id?: string;
 }
 
 export interface SessionPage {

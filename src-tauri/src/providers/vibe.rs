@@ -170,6 +170,7 @@ pub fn load_sessions_from_base_path(
             provider: Some(PROVIDER_ID.to_string()),
             storage_type: Some("jsonl".to_string()),
             entrypoint: None,
+            forked_from_id: None,
         });
     }
 

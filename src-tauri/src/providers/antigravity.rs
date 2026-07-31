@@ -422,6 +422,7 @@ pub fn load_sessions(path: &str, _exclude_sidechain: bool) -> Result<Vec<ClaudeS
             provider: Some("antigravity".to_string()),
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         });
     }
 

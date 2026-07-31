@@ -1409,6 +1409,7 @@ pub async fn get_expiring_sessions(
                     provider: None,
                     storage_type: None,
                     entrypoint: None,
+                    forked_from_id: None,
                 };
 
                 let subagent_count = find_subagent_files(&path).len() as u32;

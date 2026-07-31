@@ -161,6 +161,7 @@ pub fn load_sessions(
                 provider: Some("cline".to_string()),
                 storage_type: Some("json".to_string()),
                 entrypoint: None,
+                forked_from_id: None,
             })
         })
         .collect();

@@ -572,6 +572,7 @@ fn load_sessions_from_chat_dir(
             provider: Some(PROVIDER_ID.to_string()),
             storage_type: None,
             entrypoint: Some(ENTRYPOINT.to_string()),
+            forked_from_id: None,
         });
     }
 

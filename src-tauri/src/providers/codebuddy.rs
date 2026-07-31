@@ -803,6 +803,7 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
         provider: Some(PROVIDER_ID.to_string()),
         storage_type: None,
         entrypoint: Some("cli".to_string()),
+        forked_from_id: None,
     })
 }
 

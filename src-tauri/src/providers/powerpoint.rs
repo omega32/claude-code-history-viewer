@@ -135,6 +135,7 @@ pub fn load_sessions(
                 provider: Some(PROVIDER.to_string()),
                 storage_type: Some("indexeddb".to_string()),
                 entrypoint: Some(ENTRYPOINT.to_string()),
+                forked_from_id: None,
             }
         })
         .collect())

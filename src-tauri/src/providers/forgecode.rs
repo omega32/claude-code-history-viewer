@@ -451,6 +451,7 @@ fn load_sessions_from_db(base_path: &str, workspace_id: &str) -> Option<Vec<Clau
                 provider: Some(PROVIDER_ID.to_string()),
                 storage_type: Some(STORAGE_TYPE.to_string()),
                 entrypoint: None,
+                forked_from_id: None,
             }
         })
         .collect();

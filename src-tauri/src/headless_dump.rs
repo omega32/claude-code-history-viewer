@@ -1134,6 +1134,7 @@ fn synthesize_teleport_session(
             provider: None,
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         },
         project_path,
         is_hidden,
@@ -1371,6 +1372,7 @@ mod tests {
             provider: None,
             storage_type: None,
             entrypoint: entrypoint.map(str::to_string),
+            forked_from_id: None,
         }
     }
 
@@ -1851,8 +1853,10 @@ mod tests {
     #[test]
     fn flattened_listing_serializes_decoded_project_path_and_flags() {
         let temp = TempDir::new().unwrap();
+        let mut forked_session = session(&temp.path().join("s.jsonl"), "s1", None);
+        forked_session.forked_from_id = Some("parent-session".to_string());
         let wrapped = SessionWithProjectPath {
-            session: session(&temp.path().join("s.jsonl"), "s1", None),
+            session: forked_session,
             project_path: Some(r"C:\work\decoded-project".to_string()),
             is_hidden: true,
             is_orphan: false,
@@ -1868,6 +1872,7 @@ mod tests {
         assert_eq!(value["project_path"], r"C:\work\decoded-project");
         assert_eq!(value["is_hidden"], true);
         assert_eq!(value["is_pinned"], false);
+        assert_eq!(value["forked_from_id"], "parent-session");
         assert!(
             value.get("session").is_none(),
             "ClaudeSession must stay flattened"

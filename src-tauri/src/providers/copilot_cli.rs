@@ -517,6 +517,7 @@ pub fn load_sessions(
             provider: Some(client.provider_id().to_string()),
             storage_type: None,
             entrypoint: Some(info.client_kind.entrypoint().to_string()),
+            forked_from_id: None,
         })
         .collect();
 

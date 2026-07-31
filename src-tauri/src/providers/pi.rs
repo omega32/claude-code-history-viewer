@@ -186,6 +186,7 @@ pub(crate) fn load_sessions_of(
             provider: Some(store.id.to_string()),
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         });
     }
 

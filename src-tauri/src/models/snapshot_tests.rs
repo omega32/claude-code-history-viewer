@@ -402,6 +402,7 @@ mod session_snapshots {
             provider: None,
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         };
 
         assert_json_snapshot!("claude_session", session);
@@ -425,6 +426,7 @@ mod session_snapshots {
             provider: Some("forgecode".to_string()),
             storage_type: Some("sqlite".to_string()),
             entrypoint: None,
+            forked_from_id: None,
         };
 
         assert_json_snapshot!("forgecode_session", session);
@@ -450,6 +452,7 @@ mod session_snapshots {
             provider: Some("pi".to_string()),
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         };
 
         assert_json_snapshot!("pi_session", session);

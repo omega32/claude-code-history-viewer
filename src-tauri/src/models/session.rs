@@ -73,6 +73,12 @@ pub struct ClaudeSession {
     /// `None` for non-Claude providers or sessions predating the entrypoint field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// Parent session id for an explicitly forked session.
+    ///
+    /// Codex supplies this as `session_meta.payload.forked_from_id`. Other
+    /// providers and native sessions leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,14 +112,37 @@ mod tests {
             provider: None,
             storage_type: None,
             entrypoint: None,
+            forked_from_id: None,
         };
 
         let serialized = serde_json::to_string(&session).unwrap();
+        assert!(!serialized.contains("forked_from_id"));
         let deserialized: ClaudeSession = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.project_name, "my-project");
         assert_eq!(deserialized.message_count, 42);
         assert!(deserialized.has_tool_use);
         assert!(!deserialized.has_errors);
+    }
+
+    #[test]
+    fn test_legacy_claude_session_deserialization_defaults_fork_provenance() {
+        let json = r#"{
+            "session_id":"/path/to/file.jsonl",
+            "actual_session_id":"actual-session-id",
+            "file_path":"/path/to/file.jsonl",
+            "project_name":"my-project",
+            "message_count":1,
+            "first_message_time":"2025-06-01T10:00:00Z",
+            "last_message_time":"2025-06-01T10:00:00Z",
+            "last_modified":"2025-06-01T10:00:00Z",
+            "has_tool_use":false,
+            "has_errors":false,
+            "summary":null,
+            "is_renamed":false
+        }"#;
+
+        let session: ClaudeSession = serde_json::from_str(json).unwrap();
+        assert_eq!(session.forked_from_id, None);
     }
 }

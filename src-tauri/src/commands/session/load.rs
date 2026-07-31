@@ -708,6 +708,7 @@ fn extract_session_metadata_internal(
             provider: None,
             storage_type: None,
             entrypoint,
+            forked_from_id: None,
         },
         sidechain_count,
         final_byte_offset: file_size,

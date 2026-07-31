@@ -436,6 +436,7 @@ pub fn load_sessions(
                 provider: Some("opencode".to_string()),
                 storage_type: Some("json".to_string()),
                 entrypoint: None,
+                forked_from_id: None,
             });
         }
     }
@@ -953,6 +954,7 @@ fn load_sessions_from_db(
                     provider: Some("opencode".to_string()),
                     storage_type: Some("sqlite".to_string()),
                     entrypoint: None,
+                    forked_from_id: None,
                 },
             ))
         })
