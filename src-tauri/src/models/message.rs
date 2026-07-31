@@ -33,6 +33,18 @@ impl InferenceUsage {
     }
 }
 
+/// Provider-neutral monetary or consumption estimate associated with one
+/// normalized invocation. `kind` records whether the provider reported the
+/// value or the normalizer derived it from a versioned rate card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceCost {
+    pub value: f64,
+    pub unit: String,
+    pub kind: String,
+    pub rate_card_version: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceMetadata {
@@ -58,6 +70,8 @@ pub struct InferenceMetadata {
     pub personality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<InferenceUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<InferenceCost>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     #[serde(rename = "costUSD", skip_serializing_if = "Option::is_none")]
@@ -356,6 +370,27 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.output_tokens, None);
         assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn inference_cost_serializes_with_explicit_provenance() {
+        let cost = InferenceCost {
+            value: 1.25,
+            unit: "credits".to_string(),
+            kind: "estimated".to_string(),
+            rate_card_version: "2026-07-31".to_string(),
+        };
+
+        let serialized = serde_json::to_value(&cost).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "value": 1.25,
+                "unit": "credits",
+                "kind": "estimated",
+                "rateCardVersion": "2026-07-31"
+            })
+        );
     }
 
     #[test]

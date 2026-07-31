@@ -1,7 +1,8 @@
 use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{
-    ClaudeMessage, ClaudeProject, ClaudeSession, InferenceMetadata, InferenceUsage, TokenUsage,
+    ClaudeMessage, ClaudeProject, ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage,
+    TokenUsage,
 };
 use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
@@ -28,6 +29,8 @@ const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const STEER_SUBTYPE: &str = "steer";
 const SNAPSHOT_CURSOR_VERSION: u32 = 2;
+/// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
+const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexParserState {
@@ -853,6 +856,12 @@ fn parse_rollout_slice(
                             cache_write_input_tokens: delta.cache_write,
                             reasoning_output_tokens: delta.reasoning,
                         });
+                        let plan_type = payload
+                            .get("rate_limits")
+                            .and_then(|limits| limits.get("plan_type"))
+                            .and_then(Value::as_str);
+                        let cost = codex_credit_estimate(inference, delta, plan_type);
+                        inference.cost = cost;
                     } else if let Some(mut msg) = convert_codex_event(
                         payload,
                         &state.session_id,
@@ -2482,6 +2491,71 @@ struct CodexTokenUsage {
     reasoning: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CodexCreditRates {
+    input: f64,
+    cached_input: f64,
+    output: f64,
+    fast_multiplier: f64,
+}
+
+fn codex_credit_rates(model: &str) -> Option<CodexCreditRates> {
+    let rates = match model {
+        "gpt-5.6-sol" | "gpt-5.5" => (125.0, 12.5, 750.0, 2.5),
+        "gpt-5.6-terra" => (50.0, 5.0, 300.0, 2.5),
+        "gpt-5.6-luna" => (5.0, 0.5, 30.0, 2.5),
+        "gpt-5.4" => (62.5, 6.25, 375.0, 2.0),
+        "gpt-5.4-mini" => (18.75, 1.875, 113.0, 2.0),
+        _ => return None,
+    };
+    Some(CodexCreditRates {
+        input: rates.0,
+        cached_input: rates.1,
+        output: rates.2,
+        fast_multiplier: rates.3,
+    })
+}
+
+/// Estimate `ChatGPT` credits for one Codex inference only when the rollout
+/// records every billing discriminator required by the published rate card.
+/// API-key/custom providers and unknown models or tiers deliberately remain
+/// unset instead of receiving a guessed value.
+fn codex_credit_estimate(
+    inference: &InferenceMetadata,
+    usage: CodexTokenUsage,
+    plan_type: Option<&str>,
+) -> Option<InferenceCost> {
+    plan_type.filter(|plan| !plan.trim().is_empty())?;
+    if inference.model_provider.as_deref() != Some("openai") {
+        return None;
+    }
+    let rates = codex_credit_rates(inference.model.as_deref()?)?;
+    let multiplier = match inference.service_tier.as_deref()? {
+        "default" | "standard" => 1.0,
+        // Codex configuration's `fast` tier is recorded on requests as
+        // `priority`; accept both representations at the normalization edge.
+        "fast" | "priority" => rates.fast_multiplier,
+        _ => return None,
+    };
+
+    // OpenAI input_tokens includes cached_input_tokens as a subset. Reasoning
+    // tokens likewise remain a detail of output_tokens and must not be charged
+    // a second time.
+    let cached = usage.cached.unwrap_or(0).min(usage.input);
+    let non_cached = usage.input.saturating_sub(cached);
+    let value = (f64::from(non_cached) * rates.input
+        + f64::from(cached) * rates.cached_input
+        + f64::from(usage.output) * rates.output)
+        * multiplier
+        / 1_000_000.0;
+    Some(InferenceCost {
+        value,
+        unit: "credits".to_string(),
+        kind: "estimated".to_string(),
+        rate_card_version: CODEX_CREDIT_RATE_CARD_VERSION.to_string(),
+    })
+}
+
 fn codex_token_usage(value: &Value) -> Option<CodexTokenUsage> {
     let number = |name: &str| {
         value
@@ -3734,23 +3808,107 @@ mod tests {
     }
 
     #[test]
+    fn estimates_chatgpt_credits_from_supported_codex_usage() {
+        let inference = InferenceMetadata {
+            model: Some("gpt-5.6-sol".to_string()),
+            model_provider: Some("openai".to_string()),
+            service_tier: Some("default".to_string()),
+            ..InferenceMetadata::default()
+        };
+        let usage = CodexTokenUsage {
+            input: 1_000,
+            cached: Some(800),
+            output: 100,
+            ..CodexTokenUsage::default()
+        };
+
+        let standard = codex_credit_estimate(&inference, usage, Some("prolite"))
+            .expect("supported ChatGPT estimate");
+        assert_eq!(standard.unit, "credits");
+        assert_eq!(standard.kind, "estimated");
+        assert_eq!(standard.rate_card_version, CODEX_CREDIT_RATE_CARD_VERSION);
+        assert!((standard.value - 0.11).abs() < 1e-12);
+
+        let priority = codex_credit_estimate(
+            &InferenceMetadata {
+                service_tier: Some("priority".to_string()),
+                ..inference
+            },
+            usage,
+            Some("prolite"),
+        )
+        .expect("supported Fast estimate");
+        assert!((priority.value - 0.275).abs() < 1e-12);
+    }
+
+    #[test]
+    fn omits_codex_credit_estimates_without_complete_billing_evidence() {
+        let inference = InferenceMetadata {
+            model: Some("gpt-5.6-sol".to_string()),
+            model_provider: Some("openai".to_string()),
+            service_tier: Some("default".to_string()),
+            ..InferenceMetadata::default()
+        };
+        let usage = CodexTokenUsage {
+            input: 1_000,
+            output: 100,
+            ..CodexTokenUsage::default()
+        };
+
+        assert_eq!(codex_credit_estimate(&inference, usage, None), None);
+        assert_eq!(
+            codex_credit_estimate(
+                &InferenceMetadata {
+                    model: Some("future-model".to_string()),
+                    ..inference.clone()
+                },
+                usage,
+                Some("prolite"),
+            ),
+            None
+        );
+        assert_eq!(
+            codex_credit_estimate(
+                &InferenceMetadata {
+                    model_provider: Some("custom".to_string()),
+                    ..inference.clone()
+                },
+                usage,
+                Some("prolite"),
+            ),
+            None
+        );
+        assert_eq!(
+            codex_credit_estimate(
+                &InferenceMetadata {
+                    service_tier: Some("future-tier".to_string()),
+                    ..inference
+                },
+                usage,
+                Some("prolite"),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn normalizes_authoritative_turn_inference_metadata() {
         let tmp = TempDir::new().expect("temp dir");
         let rollout_path = tmp.path().join("rollout-2026-07-22-test-session.jsonl");
         let lines = [
             json!({"timestamp":"2026-07-22T10:00:00Z","type":"session_meta","payload":{"id":"test-session"}}),
             json!({"timestamp":"2026-07-22T10:00:01Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{
-                "model":"gpt-test","model_provider_id":"openai","service_tier":"default",
+                "model":"gpt-5.6-sol","model_provider_id":"openai","service_tier":"default",
                 "reasoning_effort":"high","reasoning_summary":"none","personality":"pragmatic",
                 "collaboration_mode":{"mode":"default"}
             }}}),
             json!({"timestamp":"2026-07-22T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":258400,"collaboration_mode_kind":"default"}}),
-            json!({"timestamp":"2026-07-22T10:00:03Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-test","effort":"high","summary":"auto"}}),
+            json!({"timestamp":"2026-07-22T10:00:03Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol","effort":"high","summary":"auto"}}),
             json!({"timestamp":"2026-07-22T10:00:04Z","type":"response_item","payload":{"id":"a1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}),
             json!({"timestamp":"2026-07-22T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{
                 "input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":3,
                 "output_tokens":20,"reasoning_output_tokens":7
-            }}}}),
+            }},"rate_limits":{"plan_type":"prolite"}}}),
             json!({"timestamp":"2026-07-22T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":1500,"time_to_first_token_ms":250}}),
         ];
         let body = lines
@@ -3766,7 +3924,7 @@ mod tests {
             .find(|message| message.message_type == "assistant")
             .expect("assistant");
         let inference = assistant.inference.as_ref().expect("inference metadata");
-        assert_eq!(inference.model.as_deref(), Some("gpt-test"));
+        assert_eq!(inference.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(inference.model_provider.as_deref(), Some("openai"));
         assert_eq!(inference.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(inference.reasoning_summary.as_deref(), Some("none"));
@@ -3790,6 +3948,11 @@ mod tests {
                 .and_then(|usage| usage.reasoning_output_tokens),
             Some(7)
         );
+        let cost = inference.cost.as_ref().expect("credit estimate");
+        assert_eq!(cost.unit, "credits");
+        assert_eq!(cost.kind, "estimated");
+        assert_eq!(cost.rate_card_version, CODEX_CREDIT_RATE_CARD_VERSION);
+        assert!((cost.value - 0.023).abs() < 1e-12);
     }
 
     #[test]
