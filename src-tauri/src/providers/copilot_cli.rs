@@ -525,6 +525,41 @@ pub fn load_sessions(
     Ok(sessions)
 }
 
+/// Derive one immutable CLI/Desktop carrier's listing metadata without scanning
+/// the current Copilot home or retaining provider cache state.
+pub(crate) fn load_offline_session_metadata(
+    events_path: &Path,
+) -> Result<(ClaudeSession, Option<String>), String> {
+    let info = extract_session_info(events_path)?;
+    let project_path = info.cwd.clone();
+    let project_name = project_path
+        .as_deref()
+        .and_then(|cwd| Path::new(cwd).file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok((
+        ClaudeSession {
+            session_id: info.file_path.clone(),
+            actual_session_id: info.session_id,
+            file_path: info.file_path,
+            project_name,
+            message_count: info.message_count,
+            first_message_time: info.first_message_time,
+            last_message_time: info.last_message_time,
+            last_modified: info.last_modified,
+            has_tool_use: info.has_tool_use,
+            has_errors: false,
+            summary: info.summary,
+            is_renamed: info.is_renamed,
+            provider: Some("copilot".to_string()),
+            storage_type: None,
+            entrypoint: Some(info.client_kind.entrypoint().to_string()),
+            forked_from_id: None,
+        },
+        project_path,
+    ))
+}
+
 /// Stream messages out of `events.jsonl`.
 #[allow(unsafe_code)] // Required for mmap performance optimization
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
@@ -535,9 +570,24 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let canonical = validate_session_path(path, session_path)
         .or_else(|_| validate_wsl_session_path(path, session_path))?;
 
-    let client = classify_client(&read_workspace_metadata(&canonical));
+    load_messages_from_path(&canonical)
+}
 
-    let file = File::open(&canonical).map_err(|e| e.to_string())?;
+/// Parse an immutable events.jsonl after the headless offline boundary has
+/// confined it to the selected backup payload.
+#[allow(unsafe_code)] // Required for mmap performance optimization
+pub(crate) fn load_offline_messages(events_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    if !is_events_jsonl(events_path) || !events_path.is_file() {
+        return Err("Offline Copilot CLI session is not an events.jsonl file".to_string());
+    }
+    load_messages_from_path(events_path)
+}
+
+#[allow(unsafe_code)] // Required for mmap performance optimization
+fn load_messages_from_path(canonical: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    let client = classify_client(&read_workspace_metadata(canonical));
+
+    let file = File::open(canonical).map_err(|e| e.to_string())?;
     // SAFETY: file is opened read-only and we only read the mapping.
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
     let ranges = find_line_ranges(&mmap);

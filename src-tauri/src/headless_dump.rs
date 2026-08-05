@@ -33,16 +33,17 @@
 
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::{
-    load_provider_messages, load_provider_sessions, scan_all_projects,
+    finalize_loaded_messages, load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::{ClaudeMessage, ClaudeSession};
-use crate::providers::{claude, codex, copilot, SessionSnapshotLoad};
+use crate::providers::{claude, codex, copilot, copilot_cli, vscode, SessionSnapshotLoad};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use walkdir::WalkDir;
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
@@ -117,7 +118,9 @@ pub fn run_capabilities(args: &[String]) -> i32 {
         commands: vec![
             "dump-session",
             "dump-session-snapshot",
+            "dump-backup-session",
             "list-sessions",
+            "list-backup-sessions",
             "hide-session",
             "archive-session",
             "unarchive-session",
@@ -140,6 +143,14 @@ Return a normalized session envelope. A provider-owned cursor may produce an\n\
 unchanged result or an exact normalized replacement suffix; unsupported or\n\
 unverifiable transitions return the complete message array. The established\n\
 --dump-session array contract remains unchanged.";
+
+const BACKUP_DUMP_USAGE: &str = "Usage: --dump-backup-session <relative-path> --backup-root <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
+Normalize one immutable session carrier confined beneath an explicit verified\n\
+backup payload. This command never discovers or consults current provider roots.";
+
+const BACKUP_LIST_USAGE: &str = "Usage: --list-backup-sessions <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
+List sessions only from one explicit verified backup payload. The payload uses\n\
+ccmsg's provider-neutral logical layout; no live provider root or index is read.";
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -316,6 +327,269 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
 
     match result {
         Ok(snapshot) => emit_json(args, &snapshot),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+fn canonical_backup_root(raw: &str) -> Result<PathBuf, String> {
+    let root = PathBuf::from(raw);
+    if !root.is_absolute() {
+        return Err("Backup payload root must be absolute".to_string());
+    }
+    let metadata = std::fs::symlink_metadata(&root)
+        .map_err(|error| format!("Cannot inspect backup payload root: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Backup payload root must be a regular non-symlink directory".to_string());
+    }
+    root.canonicalize()
+        .map_err(|error| format!("Cannot resolve backup payload root: {error}"))
+}
+
+fn safe_backup_relative_path(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("Backup session path must be a safe relative path".to_string());
+    }
+    Ok(path)
+}
+
+/// Resolve one payload-relative carrier and independently reject every symlink
+/// component. ccmsg verifies the manifest first; this second boundary prevents
+/// a malformed direct invocation from turning the offline command into an
+/// arbitrary host-file reader.
+fn confined_backup_file(root: &Path, raw_relative: &str) -> Result<PathBuf, String> {
+    let relative = safe_backup_relative_path(raw_relative)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err("Backup session path must be a safe relative path".to_string());
+        };
+        current.push(part);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("Cannot inspect backup session path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Backup session path contains a symlink".to_string());
+        }
+    }
+    let canonical = current
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve backup session path: {error}"))?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err("Backup session path is outside the payload or is not a file".to_string());
+    }
+    Ok(canonical)
+}
+
+fn offline_session(
+    session: ClaudeSession,
+    project_path: Option<String>,
+    is_archived: bool,
+) -> SessionWithProjectPath {
+    SessionWithProjectPath {
+        session,
+        project_path,
+        is_hidden: false,
+        is_orphan: false,
+        is_archived,
+        is_pinned: false,
+        is_teleported: false,
+        is_imported: false,
+        imported_from: None,
+        remote_session_id: None,
+    }
+}
+
+fn logical_backup_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn is_json_or_jsonl(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| extension == "json" || extension == "jsonl")
+}
+
+// Provider-owned carrier names are deliberately case-sensitive: accepting a
+// differently cased suffix would admit files the provider never writes.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn list_backup_sessions(
+    provider: &str,
+    root: &Path,
+) -> Result<Vec<SessionWithProjectPath>, String> {
+    if !matches!(provider, "claude" | "codex" | "copilot") {
+        return Err(format!("Unsupported backup provider: {provider}"));
+    }
+    let mut sessions = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| format!("Cannot walk backup payload: {error}"))?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Backup payload contains a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(logical) = logical_backup_path(root, entry.path()) else {
+            continue;
+        };
+        let parts = logical.split('/').collect::<Vec<_>>();
+        match provider {
+            "claude"
+                if entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl") =>
+            {
+                if let Some((session, project_path)) =
+                    crate::commands::session::load_offline_session_metadata(entry.path())
+                {
+                    sessions.push(offline_session(session, project_path, false));
+                }
+            }
+            "codex"
+                if (logical.starts_with("active/") || logical.starts_with("archived/"))
+                    && (logical.ends_with(".jsonl") || logical.ends_with(".jsonl.zst")) =>
+            {
+                if let Ok((session, project_path)) =
+                    codex::load_offline_session_metadata(entry.path())
+                {
+                    sessions.push(offline_session(
+                        session,
+                        project_path,
+                        logical.starts_with("archived/"),
+                    ));
+                }
+            }
+            "copilot"
+                if parts.len() == 4
+                    && parts[0] == "cli"
+                    && parts[1] == "session-state"
+                    && parts[3] == "events.jsonl" =>
+            {
+                if let Ok((session, project_path)) =
+                    copilot_cli::load_offline_session_metadata(entry.path())
+                {
+                    sessions.push(offline_session(session, project_path, false));
+                }
+            }
+            "copilot"
+                if parts.len() >= 6 && parts[0] == "vscode" && is_json_or_jsonl(entry.path()) =>
+            {
+                let flavor = parts[1];
+                let (project_name, project_path) = if parts[2] == "workspaces"
+                    && parts.len() == 6
+                    && parts[4] == "chatSessions"
+                {
+                    let workspace = root
+                        .join("vscode")
+                        .join(flavor)
+                        .join("workspaces")
+                        .join(parts[3]);
+                    let actual =
+                        vscode::read_offline_workspace_folder(&workspace.join("workspace.json"));
+                    let name = actual
+                        .as_deref()
+                        .and_then(|value| Path::new(value).file_name())
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("{} workspace {}", flavor, parts[3]));
+                    (
+                        name,
+                        actual.or_else(|| {
+                            Some(format!("backup://copilot/{flavor}/workspace/{}", parts[3]))
+                        }),
+                    )
+                } else if parts[2] == "global"
+                    && parts.len() == 5
+                    && (parts[3] == "emptyWindowChatSessions" || parts[3] == "legacy-no-workspace")
+                {
+                    (
+                        format!("{flavor} empty window"),
+                        Some(format!("backup://copilot/{flavor}/empty-window")),
+                    )
+                } else {
+                    continue;
+                };
+                if let Some(session) =
+                    vscode::load_offline_session_metadata(entry.path(), &project_name)
+                {
+                    sessions.push(offline_session(session, project_path, false));
+                }
+            }
+            "claude" | "codex" | "copilot" => {}
+            _ => unreachable!("provider validated before walking the payload"),
+        }
+    }
+    sessions.sort_by(|left, right| {
+        right
+            .session
+            .last_message_time
+            .cmp(&left.session.last_message_time)
+    });
+    Ok(sessions)
+}
+
+/// List only carriers beneath one explicit ccmsg backup payload. No provider
+/// discovery, live index, native title database, or metadata cache participates.
+pub fn run_list_backup_sessions(args: &[String]) -> i32 {
+    let Some(raw_root) = extract_flag_value(args, "--list-backup-sessions") else {
+        eprintln!("{BACKUP_LIST_USAGE}");
+        return 2;
+    };
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    let result =
+        canonical_backup_root(&raw_root).and_then(|root| list_backup_sessions(&provider, &root));
+    match result {
+        Ok(sessions) => emit_json(args, &sessions),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+/// Dump one payload-relative carrier through the same normalization functions
+/// as live mode, after an independent confinement check.
+pub fn run_dump_backup_session(args: &[String]) -> i32 {
+    let Some(relative) = extract_flag_value(args, "--dump-backup-session") else {
+        eprintln!("{BACKUP_DUMP_USAGE}");
+        return 2;
+    };
+    let Some(raw_root) = extract_flag_value(args, "--backup-root") else {
+        eprintln!("{BACKUP_DUMP_USAGE}");
+        return 2;
+    };
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    let result = canonical_backup_root(&raw_root).and_then(|root| {
+        let path = confined_backup_file(&root, &relative)?;
+        let messages = match provider.as_str() {
+            "claude" => {
+                crate::commands::session::load_session_messages_sync(&path.to_string_lossy())
+            }
+            "codex" => codex::load_offline_messages(&path),
+            "copilot"
+                if relative
+                    .replace('\\', "/")
+                    .starts_with("cli/session-state/") =>
+            {
+                copilot_cli::load_offline_messages(&path)
+            }
+            "copilot" => vscode::load_offline_messages(&path),
+            _ => Err(format!("Unsupported backup provider: {provider}")),
+        }?;
+        Ok(finalize_loaded_messages(messages))
+    });
+    match result {
+        Ok(messages) => emit_json(args, &messages),
         Err(error) => {
             eprintln!("{error}");
             1
@@ -1418,6 +1692,167 @@ mod tests {
                 "unarchive-session",
                 "capabilities"
             ])
+        );
+    }
+
+    #[test]
+    fn offline_backup_commands_list_and_dump_only_the_supplied_payload() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("verified-payload");
+        let outside = temp.path().join("live-provider-store");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let write_session = |path: &Path, id: &str, prompt: &str| {
+            std::fs::write(
+                path,
+                format!(
+                    concat!(
+                        r#"{{"type":"user","uuid":"u1","sessionId":"{}","timestamp":"2026-08-01T00:00:00Z","cwd":"/backup/project","message":{{"role":"user","content":"{}"}}}}"#,
+                        "\n",
+                        r#"{{"type":"assistant","uuid":"a1","sessionId":"{}","timestamp":"2026-08-01T00:01:00Z","message":{{"role":"assistant","content":[{{"type":"text","text":"backup answer"}}]}}}}"#,
+                        "\n"
+                    ),
+                    id, prompt, id
+                ),
+            )
+            .unwrap();
+        };
+        write_session(
+            &payload.join("backup-session.jsonl"),
+            "backup-session",
+            "backup prompt",
+        );
+        write_session(
+            &outside.join("live-session.jsonl"),
+            "live-session",
+            "live prompt",
+        );
+        let list_output = temp.path().join("listed.json");
+        let list_args = args(&[
+            "viewer",
+            "--list-backup-sessions",
+            payload.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--output",
+            list_output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_backup_sessions(&list_args), 0);
+        let listed: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&list_output).unwrap()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["actual_session_id"], "backup-session");
+        assert!(!std::fs::read_to_string(&list_output)
+            .unwrap()
+            .contains("live-session"));
+
+        let dump_output = temp.path().join("dumped.json");
+        let dump_args = args(&[
+            "viewer",
+            "--dump-backup-session",
+            "backup-session.jsonl",
+            "--backup-root",
+            payload.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--output",
+            dump_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_backup_session(&dump_args), 0);
+        let dumped: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(dump_output).unwrap()).unwrap();
+        assert_eq!(dumped.len(), 2);
+        assert_eq!(dumped[0]["sessionId"], "backup-session");
+    }
+
+    #[test]
+    fn offline_backup_path_confinement_rejects_escape_and_unknown_providers() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("payload");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(temp.path().join("outside.jsonl"), "{}\n").unwrap();
+
+        assert!(
+            confined_backup_file(&payload.canonicalize().unwrap(), "../outside.jsonl")
+                .unwrap_err()
+                .contains("safe relative path")
+        );
+        let error = match list_backup_sessions("unknown", &payload) {
+            Ok(_) => panic!("unknown provider unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported backup provider"));
+    }
+
+    #[test]
+    fn offline_backup_lists_codex_and_compound_copilot_surfaces() {
+        let temp = TempDir::new().unwrap();
+        let codex_root = temp.path().join("codex");
+        let codex_file = codex_root.join("active/2026/08/05/rollout-backup.jsonl");
+        std::fs::create_dir_all(codex_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &codex_file,
+            [
+                json!({"type":"session_meta","payload":{"id":"codex-backup","cwd":"/backup/codex"}}),
+                json!({"timestamp":"2026-08-05T01:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex prompt"}]}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let codex = list_backup_sessions("codex", &codex_root).unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].session.actual_session_id, "codex-backup");
+        assert!(!codex[0].is_archived);
+        assert_eq!(codex::load_offline_messages(&codex_file).unwrap().len(), 1);
+
+        let copilot_root = temp.path().join("copilot");
+        let cli_file = copilot_root.join("cli/session-state/copilot-cli/events.jsonl");
+        std::fs::create_dir_all(cli_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cli_file,
+            [
+                json!({"type":"session.start","timestamp":"2026-08-05T01:00:00Z","data":{"sessionId":"copilot-cli","context":{"cwd":"/backup/copilot-cli"}}}),
+                json!({"type":"user.message","id":"cli-user","timestamp":"2026-08-05T01:00:01Z","data":{"content":"copilot cli prompt"}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let workspace = copilot_root.join("vscode/code/workspaces/workspace-a");
+        let vscode_file = workspace.join("chatSessions/copilot-vscode.jsonl");
+        std::fs::create_dir_all(vscode_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///backup/copilot-vscode"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &vscode_file,
+            json!({"kind":0,"v":{"sessionId":"copilot-vscode","creationDate":1779490058917u64,"requests":[{"message":{"text":"copilot vscode prompt"},"response":[]}]}}).to_string(),
+        )
+        .unwrap();
+
+        let copilot = list_backup_sessions("copilot", &copilot_root).unwrap();
+        assert_eq!(copilot.len(), 2);
+        assert!(copilot
+            .iter()
+            .any(|session| session.session.actual_session_id == "copilot-cli"));
+        assert!(copilot
+            .iter()
+            .any(|session| session.session.actual_session_id == "copilot-vscode"));
+        assert_eq!(
+            copilot_cli::load_offline_messages(&cli_file).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            vscode::load_offline_messages(&vscode_file).unwrap().len(),
+            1
         );
     }
 

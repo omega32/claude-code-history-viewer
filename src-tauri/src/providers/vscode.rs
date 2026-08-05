@@ -580,10 +580,59 @@ fn load_sessions_from_chat_dir(
     Ok(sessions)
 }
 
+/// Derive one immutable VS Code carrier's listing metadata without consulting
+/// current user-data roots or reading/writing the on-disk metadata cache.
+pub(crate) fn load_offline_session_metadata(
+    session_path: &Path,
+    project_name: &str,
+) -> Option<ClaudeSession> {
+    let info = probe_session_metadata(session_path)?;
+    if info.message_count == 0 {
+        return None;
+    }
+    Some(ClaudeSession {
+        session_id: session_path.to_string_lossy().to_string(),
+        actual_session_id: info.session_id,
+        file_path: session_path.to_string_lossy().to_string(),
+        project_name: project_name.to_string(),
+        message_count: info.message_count,
+        first_message_time: ms_to_iso(info.first_message_ms),
+        last_message_time: ms_to_iso(info.last_modified_ms),
+        last_modified: ms_to_iso(info.last_modified_ms),
+        has_tool_use: info.has_tool_use,
+        has_errors: false,
+        is_renamed: info.custom_title.is_some(),
+        summary: info.custom_title.or(info.summary),
+        provider: Some(PROVIDER_ID.to_string()),
+        storage_type: None,
+        entrypoint: Some(ENTRYPOINT.to_string()),
+        forked_from_id: None,
+    })
+}
+
+/// Read the workspace identity captured beside an offline carrier.
+pub(crate) fn read_offline_workspace_folder(workspace_json_path: &Path) -> Option<String> {
+    read_workspace_folder(workspace_json_path)
+}
+
 /// Replay the patch log, then convert each request into messages.
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let path = validate_session_path(session_path)?;
     load_messages_from_path(&path)
+}
+
+/// Parse an immutable JSON/JSONL carrier after the headless offline boundary
+/// has confined it to the selected backup payload.
+pub(crate) fn load_offline_messages(path: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    let supported = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| extension == "json" || extension == "jsonl");
+    if !supported || !path.is_file() {
+        return Err("Offline Copilot VS Code session is not a JSON/JSONL carrier".to_string());
+    }
+    load_messages_from_path(path)
 }
 
 fn load_messages_from_path(path: &Path) -> Result<Vec<ClaudeMessage>, String> {

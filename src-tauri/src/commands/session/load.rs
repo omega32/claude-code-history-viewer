@@ -248,6 +248,9 @@ struct QuickLineClassifier {
 /// Fast session metadata extraction result
 struct SessionExtractionResult {
     session: ClaudeSession,
+    /// Embedded working directory from the carrier. Offline backup listing uses
+    /// this instead of decoding or probing the current live project path.
+    project_path: Option<String>,
     sidechain_count: usize,
     /// Final byte offset after parsing (for incremental updates)
     final_byte_offset: u64,
@@ -710,6 +713,7 @@ fn extract_session_metadata_internal(
             entrypoint,
             forked_from_id: None,
         },
+        project_path: session_cwd,
         sidechain_count,
         final_byte_offset: file_size,
         has_tool_use,
@@ -719,6 +723,19 @@ fn extract_session_metadata_internal(
         first_assistant_text,
         rename_name,
     })
+}
+
+/// Read one immutable Claude carrier's listing metadata without consulting or
+/// updating the project metadata cache. The embedded cwd is returned separately
+/// so an offline caller never needs to probe a current live project directory.
+pub(crate) fn load_offline_session_metadata(
+    file_path: &Path,
+) -> Option<(ClaudeSession, Option<String>)> {
+    let result = extract_session_metadata_from_file(&file_path.to_path_buf())?;
+    let project_path = result.project_path;
+    let mut session = session_with_sidechain_filter(result.session, result.sidechain_count, true)?;
+    session.provider = Some("claude".to_string());
+    Some((session, project_path))
 }
 
 /// Non-conversational record types that should never become normalized messages.

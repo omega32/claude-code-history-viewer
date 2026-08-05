@@ -574,6 +574,50 @@ pub fn load_sessions(
     Ok(sessions)
 }
 
+/// Derive listing metadata from one already-confined immutable rollout without
+/// consulting `CODEX_HOME`, the native title index, or any current live state.
+pub(crate) fn load_offline_session_metadata(
+    rollout_path: &Path,
+) -> Result<(ClaudeSession, Option<String>), String> {
+    let info = extract_session_info(rollout_path)?;
+    let project_path = info.cwd.clone();
+    let project_name = project_path
+        .as_deref()
+        .and_then(|cwd| Path::new(cwd).file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok((
+        ClaudeSession {
+            session_id: info.file_path.clone(),
+            actual_session_id: info.session_id,
+            file_path: info.file_path,
+            project_name,
+            message_count: info.message_count,
+            first_message_time: info.first_message_time,
+            last_message_time: info.last_message_time,
+            last_modified: info.last_modified,
+            has_tool_use: info.has_tool_use,
+            has_errors: false,
+            summary: info.summary,
+            is_renamed: false,
+            provider: Some("codex".to_string()),
+            storage_type: None,
+            entrypoint: info.entrypoint,
+            forked_from_id: info.forked_from_id,
+        },
+        project_path,
+    ))
+}
+
+/// Parse an immutable rollout after the headless offline boundary has confined
+/// it to the selected backup payload.
+pub(crate) fn load_offline_messages(rollout_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    if !is_discoverable_rollout(rollout_path) {
+        return Err("Offline Codex session is not a supported rollout carrier".to_string());
+    }
+    parse_rollout_file(rollout_path)
+}
+
 /// Load all messages from a Codex rollout file
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let path = Path::new(session_path);

@@ -102,6 +102,14 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_dump_session(&args));
         }
+        // Immutable ccmsg backup carrier dump. Its explicit root confinement
+        // keeps provider discovery and current indexes out of the read path.
+        if args
+            .iter()
+            .any(|a| a == "--dump-backup-session" || a.starts_with("--dump-backup-session="))
+        {
+            std::process::exit(headless_dump::run_dump_backup_session(&args));
+        }
         // Cursor-aware normalized refresh. This is a separate command so the
         // established `--dump-session` array contract remains unchanged.
         if args
@@ -117,6 +125,14 @@ pub fn run() {
             .any(|a| a == "--list-sessions" || a.starts_with("--list-sessions="))
         {
             std::process::exit(headless_dump::run_list_sessions(&args));
+        }
+        // Immutable ccmsg backup listing. Unlike --list-sessions, this never
+        // scans provider-owned current roots.
+        if args
+            .iter()
+            .any(|a| a == "--list-backup-sessions" || a.starts_with("--list-backup-sessions="))
+        {
+            std::process::exit(headless_dump::run_list_backup_sessions(&args));
         }
         // Claude VS Code's reversible session deletion (`hiddenSessionIds`).
         if args
