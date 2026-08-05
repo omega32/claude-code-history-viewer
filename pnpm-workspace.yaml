@@ -1,5 +1,10 @@
 packages:
   - '.'
 
+overrides:
+  vite: ^7.1.12
+  prismjs: ^1.30.0
+  mdast-util-gfm-autolink-literal: 2.0.0
+
 ignoredBuiltDependencies:
   - '@tailwindcss/oxide'
