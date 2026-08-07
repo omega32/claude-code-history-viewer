@@ -27,8 +27,11 @@ use crate::commands::session::NativeRenameResult;
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
+const AUTHORED_USER_SUBTYPE: &str = "authored_user";
+const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
+const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 2;
+const SNAPSHOT_CURSOR_VERSION: u32 = 3;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -120,13 +123,86 @@ struct ExternalAgentImportRecord {
     imported_thread_id: String,
 }
 
-fn mark_pending_steer(
+#[derive(Debug)]
+struct PendingCodexUserMessage {
+    message_index: usize,
+    response_text: Option<String>,
+    authored_turn_id: Option<String>,
+    precedes_input_boundary: bool,
+}
+
+fn codex_user_response_text(payload: &Value) -> Option<String> {
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            )
+            .then(|| item.get("text").and_then(Value::as_str))
+            .flatten()
+        })
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+fn codex_authored_turn_id(payload: &Value) -> Option<String> {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|metadata| metadata.get("turn_id"))
+        .and_then(Value::as_str)
+        .filter(|turn_id| !turn_id.is_empty())
+        .map(str::to_string)
+}
+
+fn classify_pending_user_event(
     messages: &mut [ClaudeMessage],
-    pending_user_message_index: &mut Option<usize>,
+    pending: &mut Vec<PendingCodexUserMessage>,
+    event_payload: &Value,
+    authored_user_messages_in_turn: usize,
+    active_turn_id: Option<&str>,
 ) {
-    if let Some(index) = pending_user_message_index.take() {
-        messages[index].subtype = Some(STEER_SUBTYPE.to_string());
+    let Some(event_text) = event_payload.get("message").and_then(Value::as_str) else {
+        pending.clear();
+        return;
+    };
+    let Some(matched) = pending.last() else {
+        return;
+    };
+    if matched.response_text.as_deref() != Some(event_text) {
+        // A missing, reordered, or non-text pairing is ambiguous. Preserve every
+        // candidate as authorship_unknown instead of guessing from its content.
+        pending.clear();
+        return;
     }
+
+    let matched_index = matched.message_index;
+    let matched_turn_id = matched.authored_turn_id.clone();
+    let matched_turn_is_consistent = matched_turn_id
+        .as_deref()
+        .is_some_and(|turn_id| active_turn_id.is_none() || active_turn_id == Some(turn_id));
+    let unmatched_len = pending.len().saturating_sub(1);
+    for unmatched in pending.drain(..unmatched_len) {
+        let unmatched_turn_is_consistent =
+            unmatched.authored_turn_id.is_none() || unmatched.authored_turn_id == matched_turn_id;
+        if matched_turn_is_consistent
+            && unmatched_turn_is_consistent
+            && unmatched.precedes_input_boundary
+        {
+            messages[unmatched.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
+        }
+    }
+    messages[matched_index].subtype = Some(
+        if active_turn_id.is_some() && authored_user_messages_in_turn > 0 {
+            STEER_SUBTYPE
+        } else {
+            AUTHORED_USER_SUBTYPE
+        }
+        .to_string(),
+    );
+    pending.clear();
 }
 
 /// Detect Codex CLI installation
@@ -660,7 +736,7 @@ fn parse_rollout_slice(
     let mut active_turn_id: Option<String> = None;
     let mut active_turn_message_start = 0usize;
     let mut authored_user_messages_in_turn = 0usize;
-    let mut pending_user_message_index: Option<usize> = None;
+    let mut pending_user_messages = Vec::<PendingCodexUserMessage>::new();
     let mut pending_compacted_notification = false;
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
@@ -721,6 +797,9 @@ fn parse_rollout_slice(
                 }
             }
             "turn_context" => {
+                for candidate in &mut pending_user_messages {
+                    candidate.precedes_input_boundary = true;
+                }
                 if let Some(payload) = val.get("payload") {
                     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
                         state.current_inference.model = Some(m.to_string());
@@ -763,14 +842,26 @@ fn parse_rollout_slice(
                             return Err(());
                         }
                         messages.push(msg);
-                        if is_user_message && active_turn_id.is_some() {
-                            // The matching `event_msg.user_message` immediately follows the
-                            // persisted response item. Remember its normalized row so that the
-                            // event stream can classify authored input without mistaking
-                            // injected user-role context for a steer.
-                            pending_user_message_index = Some(messages.len() - 1);
+                        if is_user_message {
+                            let message_index = messages.len() - 1;
+                            // Preserve unresolved rows while exposing their ambiguity. A later
+                            // matching authored event retroactively resolves this replaceable
+                            // suffix as authored input or provider-injected context.
+                            messages[message_index].subtype =
+                                Some(AUTHORSHIP_UNKNOWN_SUBTYPE.to_string());
+                            pending_user_messages.push(PendingCodexUserMessage {
+                                message_index,
+                                response_text: codex_user_response_text(payload),
+                                authored_turn_id: codex_authored_turn_id(payload),
+                                precedes_input_boundary: false,
+                            });
                         }
                     }
+                }
+            }
+            "world_state" => {
+                for candidate in &mut pending_user_messages {
+                    candidate.precedes_input_boundary = true;
                 }
             }
             "event_msg" => {
@@ -787,12 +878,22 @@ fn parse_rollout_slice(
                     // distinguish same-turn steering from injected user-role context.
                     if event_type == "user_message" {
                         if active_turn_id.is_some() {
-                            if authored_user_messages_in_turn > 0 {
-                                mark_pending_steer(&mut messages, &mut pending_user_message_index);
-                            } else {
-                                pending_user_message_index = None;
-                            }
+                            classify_pending_user_event(
+                                &mut messages,
+                                &mut pending_user_messages,
+                                payload,
+                                authored_user_messages_in_turn,
+                                active_turn_id.as_deref(),
+                            );
                             authored_user_messages_in_turn += 1;
+                        } else {
+                            classify_pending_user_event(
+                                &mut messages,
+                                &mut pending_user_messages,
+                                payload,
+                                authored_user_messages_in_turn,
+                                None,
+                            );
                         }
                         continue;
                     }
@@ -823,7 +924,7 @@ fn parse_rollout_slice(
                             state.current_inference.interaction_mode = Some(mode.to_string());
                         }
                         authored_user_messages_in_turn = 0;
-                        pending_user_message_index = None;
+                        pending_user_messages.clear();
                     }
 
                     if event_type == "token_count" {
@@ -942,7 +1043,7 @@ fn parse_rollout_slice(
                         }
                         active_turn_id = None;
                         authored_user_messages_in_turn = 0;
-                        pending_user_message_index = None;
+                        pending_user_messages.clear();
                         let next_offset = ranges
                             .get(range_index + 1)
                             .map_or(bytes.len(), |&(next_start, _)| next_start);
@@ -1724,7 +1825,8 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     let mut first_time = String::new();
     let mut last_time = String::new();
     let mut has_tool_use = false;
-    let mut summary = None;
+    let mut authored_summary = None;
+    let mut fallback_summary = None;
 
     for &(start, end) in &ranges {
         let line = &mmap[start..end];
@@ -1778,6 +1880,22 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                     }
                 }
             }
+            "event_msg" => {
+                if authored_summary.is_none() {
+                    let payload = val.get("payload");
+                    if payload
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("user_message")
+                    {
+                        authored_summary = payload
+                            .and_then(|item| item.get("message"))
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                            .map(truncate_preview_text);
+                    }
+                }
+            }
             "response_item" => {
                 if let Some(payload) = val.get("payload") {
                     let item_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1798,17 +1916,14 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                             last_time.clone_from(&ts);
                         }
 
-                        // Extract first user message as summary, skipping
-                        // auto-injected wrapper blocks (e.g. <environment_context>)
-                        // that codex CLI / Codex Desktop prepend to every session —
-                        // they are system context, not a real user prompt.
-                        if summary.is_none() {
+                        // Event-less legacy or incomplete rollouts cannot prove
+                        // authorship. Keep their first user-role item as a fail-open
+                        // fallback; a structurally authored event wins when present.
+                        if fallback_summary.is_none() {
                             if let Some(role) = payload.get("role").and_then(|r| r.as_str()) {
                                 if role == "user" {
                                     if let Some(text) = extract_text_from_content(payload) {
-                                        if !is_codex_auto_injected_user_text(&text) {
-                                            summary = Some(text);
-                                        }
+                                        fallback_summary = Some(text);
                                     }
                                 }
                             }
@@ -1860,8 +1975,15 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
         last_modified,
         file_path: rollout_path.to_string_lossy().to_string(),
         has_tool_use,
-        summary,
+        summary: authored_summary.or(fallback_summary),
     })
+}
+
+fn truncate_preview_text(text: &str) -> String {
+    match text.char_indices().nth(200) {
+        Some((idx, _)) => format!("{}...", &text[..idx]),
+        None => text.to_string(),
+    }
 }
 
 fn extract_text_from_content(item: &Value) -> Option<String> {
@@ -1870,25 +1992,11 @@ fn extract_text_from_content(item: &Value) -> Option<String> {
         let ctype = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if ctype == "input_text" || ctype == "output_text" || ctype == "text" {
             if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
-                let truncated = match text.char_indices().nth(200) {
-                    Some((idx, _)) => format!("{}...", &text[..idx]),
-                    None => text.to_string(),
-                };
-                return Some(truncated);
+                return Some(truncate_preview_text(text));
             }
         }
     }
     None
-}
-
-/// Returns true when `text` is an auto-injected wrapper block prepended by
-/// codex CLI / Codex Desktop to every session (currently
-/// `<environment_context>...</environment_context>`). These look like user
-/// messages structurally but contain no real prompt, so they should be
-/// skipped when picking a session summary preview.
-fn is_codex_auto_injected_user_text(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("<environment_context>")
 }
 
 fn absolute_prompt_path_basename(raw_path: &str) -> Option<String> {
@@ -3629,7 +3737,7 @@ mod tests {
             _ => panic!("initial snapshot should carry a cursor"),
         };
         let mut cursor = decode_snapshot_cursor(&encoded).expect("cursor should decode");
-        cursor.version += 1;
+        cursor.version = SNAPSHOT_CURSOR_VERSION - 1;
         let incompatible = encode_snapshot_cursor(&cursor).expect("cursor should encode");
         match load_session_snapshot(&path_text, Some(&incompatible)).expect("incompatible fallback")
         {
@@ -5208,22 +5316,29 @@ mod tests {
                 "payload": { "type": "task_started", "turn_id": "turn-1" }
             }),
             // User-role context is model input, not an authored prompt, because it has
-            // no matching user_message event. It must never consume the turn's first
-            // authored-message slot or receive steer provenance.
+            // no matching user_message event. Its content intentionally uses an unknown
+            // future wrapper so provenance cannot depend on a tag-name allowlist.
             json!({
                 "timestamp": "2026-07-14T10:00:02Z",
                 "type": "response_item",
                 "payload": {
                     "id": "context-1", "type": "message", "role": "user",
-                    "content": [{ "type": "input_text", "text": "<environment_context>...</environment_context>" }]
+                    "content": [{ "type": "input_text", "text": "<future_host_context>opaque</future_host_context>" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
                 }
+            }),
+            json!({
+                "timestamp": "2026-07-14T10:00:02.5Z",
+                "type": "world_state",
+                "payload": {}
             }),
             json!({
                 "timestamp": "2026-07-14T10:00:03Z",
                 "type": "response_item",
                 "payload": {
                     "id": "u1", "type": "message", "role": "user",
-                    "content": [{ "type": "input_text", "text": "start the work" }]
+                    "content": [{ "type": "input_text", "text": "start the work" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
                 }
             }),
             json!({
@@ -5244,7 +5359,8 @@ mod tests {
                 "type": "response_item",
                 "payload": {
                     "id": "u2", "type": "message", "role": "user",
-                    "content": [{ "type": "input_text", "text": "focus on tests first" }]
+                    "content": [{ "type": "input_text", "text": "focus on tests first" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
                 }
             }),
             json!({
@@ -5267,7 +5383,8 @@ mod tests {
                 "type": "response_item",
                 "payload": {
                     "id": "u3", "type": "message", "role": "user",
-                    "content": [{ "type": "input_text", "text": "ordinary follow-up" }]
+                    "content": [{ "type": "input_text", "text": "ordinary follow-up" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-2" }
                 }
             }),
             json!({
@@ -5302,13 +5419,217 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(users.len(), 4);
-        assert_eq!(users[0].subtype, None, "injected context is not a steer");
-        assert_eq!(users[1].subtype, None, "the turn's first prompt is normal");
+        assert_eq!(
+            users[0].subtype.as_deref(),
+            Some("injected_context"),
+            "unmatched user-role context receives provider provenance"
+        );
+        assert_eq!(
+            users[1].subtype.as_deref(),
+            Some(AUTHORED_USER_SUBTYPE),
+            "the turn's first prompt is positively authored"
+        );
         assert_eq!(users[2].subtype.as_deref(), Some(STEER_SUBTYPE));
         assert_eq!(
-            users[3].subtype, None,
-            "the next task's first prompt resets steer detection"
+            users[3].subtype.as_deref(),
+            Some(AUTHORED_USER_SUBTYPE),
+            "the next task's first prompt resets steer detection and remains authored"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_preserves_authored_injection_lookalike() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-authored-lookalike.jsonl");
+        let authored =
+            "# AGENTS.md instructions\n<INSTRUCTIONS>\nKeep this authored text.\n</INSTRUCTIONS>";
+        let lines = [
+            json!({
+                "timestamp": "2026-08-07T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "authored-lookalike" }
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:01.5Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "authored event was lost" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "other-turn" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:01.75Z",
+                "type": "world_state",
+                "payload": {}
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": authored }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": authored }
+            }),
+            json!({
+                "timestamp": "2026-08-07T10:00:04Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-1" }
+            }),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n"))
+            .expect("rollout fixture should be written");
+
+        let messages = load_messages(rollout_path.to_str().unwrap()).expect("rollout should parse");
+        let users = messages
+            .iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            users[0].subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a cross-turn row with a missing event must fail open"
+        );
+        assert_eq!(users[1].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            users[1]
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str),
+            Some(authored)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_reclassifies_unresolved_context_after_authored_event_arrives() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-injected-context");
+        let path_text = path.to_string_lossy();
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-08-07T10:01:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-2" }
+                }),
+                json!({
+                    "timestamp": "2026-08-07T10:01:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "<future_context>pending</future_context>" }],
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-2" }
+                    }
+                }),
+            ],
+        );
+
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+        let unresolved = cached
+            .iter()
+            .find(|message| {
+                message.message_type == "user"
+                    && message
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| content.to_string().contains("future_context"))
+            })
+            .expect("unresolved context should remain visible");
+        assert_eq!(
+            unresolved.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "EOF without an authored pairing must fail open explicitly"
+        );
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-08-07T10:01:01.5Z",
+                    "type": "world_state",
+                    "payload": {}
+                }),
+                json!({
+                    "timestamp": "2026-08-07T10:01:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "authored prompt" }],
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-2" }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-07T10:01:03Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "authored prompt" }
+                }),
+                json!({
+                    "timestamp": "2026-08-07T10:01:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-2" }
+                }),
+            ],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("resolved replacement") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("the active suffix should be replaced after append"),
+        }
+        assert_snapshot_matches_fresh(&cached, &path);
+        assert!(cached.iter().any(|message| {
+            message.subtype.as_deref() == Some("injected_context")
+                && message
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| content.to_string().contains("future_context"))
+        }));
     }
 
     #[test]
@@ -5941,7 +6262,7 @@ mod tests {
 
     /// Helper: write `lines` as one JSON-per-line into a fresh rollout file
     /// and run `extract_session_info` against it. Returns the resulting
-    /// `SessionInfo`. Used by the env-context-skip tests below.
+    /// `SessionInfo`. Used by the summary-provenance tests below.
     fn run_extract_session_info_on_lines(lines: Vec<Value>) -> SessionInfo {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("rollout-2026-05-13.jsonl");
@@ -6049,10 +6370,9 @@ mod tests {
     }
 
     #[test]
-    /// First user message is an auto-injected `<environment_context>` block;
-    /// second user message is a real prompt — the summary should be the
-    /// real prompt, not the env-context block.
-    fn extract_session_info_skips_environment_context_wrapper() {
+    /// Without authored events, even a known-looking wrapper is ambiguous and
+    /// must remain visible as the legacy summary fallback.
+    fn extract_session_info_fails_open_for_eventless_context_lookalike() {
         let info = run_extract_session_info_on_lines(vec![
             session_meta_line(),
             user_message_line("2026-05-13T08:00:01Z", ENV_CONTEXT_BLOCK),
@@ -6062,14 +6382,33 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(
-            info.summary.as_deref(),
-            Some("Please review my PR for the Antigravity provider.")
-        );
-        // message_count counts *every* response_item type=message,
-        // including the skipped wrapper, so the count surfaces real
-        // activity volume.
+        assert_eq!(info.summary.as_deref(), Some(ENV_CONTEXT_BLOCK));
+        // message_count still counts every response_item type=message.
         assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    fn extract_session_info_prefers_structurally_authored_summary() {
+        let authored = "# AGENTS.md instructions\n<INSTRUCTIONS>authored</INSTRUCTIONS>";
+        let info = run_extract_session_info_on_lines(vec![
+            session_meta_line(),
+            user_message_line(
+                "2026-08-07T08:00:01Z",
+                "<future_context>injected</future_context>",
+            ),
+            user_message_line("2026-08-07T08:00:02Z", authored),
+            json!({
+                "timestamp": "2026-08-07T08:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": authored }
+            }),
+        ]);
+
+        assert_eq!(info.summary.as_deref(), Some(authored));
+        assert_eq!(
+            info.message_count, 2,
+            "authorship classification must not change activity counts"
+        );
     }
 
     #[test]
@@ -6135,20 +6474,15 @@ mod tests {
     }
 
     #[test]
-    /// Session contains only auto-injected wrapper messages and no real
-    /// prompt — summary stays None, matching legacy empty-session behaviour.
-    fn extract_session_info_env_context_only_yields_no_summary() {
+    /// An event-less wrapper-only session is ambiguous, so its content remains
+    /// the fail-open summary instead of being hidden by a tag-name heuristic.
+    fn extract_session_info_env_context_only_fails_open() {
         let info = run_extract_session_info_on_lines(vec![
             session_meta_line(),
             user_message_line("2026-05-13T08:00:01Z", ENV_CONTEXT_BLOCK),
         ]);
 
-        assert!(
-            info.summary.is_none(),
-            "env-context-only sessions should not produce a misleading summary; got {:?}",
-            info.summary
-        );
-        // The wrapper still counts as a message — only the summary is gated.
+        assert_eq!(info.summary.as_deref(), Some(ENV_CONTEXT_BLOCK));
         assert_eq!(info.message_count, 1);
     }
 
