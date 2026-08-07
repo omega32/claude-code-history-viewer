@@ -247,11 +247,18 @@ pub fn detect() -> Option<ProviderInfo> {
 /// `file:///path` URIs while the CLI uses bare filesystem paths; we drop
 /// the `file://` prefix so they group together.
 fn group_key(actual_path: &str) -> String {
-    actual_path
-        .strip_prefix("file://")
-        .unwrap_or(actual_path)
-        .trim_end_matches('/')
-        .to_string()
+    let path = actual_path.strip_prefix("file://").unwrap_or(actual_path);
+    let all_separators = !path.is_empty() && path.chars().all(|value| matches!(value, '/' | '\\'));
+    let drive_root = path.len() >= 3
+        && path.as_bytes()[1] == b':'
+        && path.as_bytes()[2..]
+            .iter()
+            .all(|value| matches!(value, b'/' | b'\\'));
+    if all_separators || drive_root {
+        path.to_string()
+    } else {
+        path.trim_end_matches(['/', '\\']).to_string()
+    }
 }
 
 /// Tag each project with its sub-source kind, then group by canonical folder.
@@ -263,8 +270,8 @@ fn merge_projects(parts: Vec<(SourceKind, ClaudeProject)>) -> Vec<ClaudeProject>
     }
 
     let mut merged: Vec<ClaudeProject> = grouped
-        .into_values()
-        .map(|mut group| {
+        .into_iter()
+        .map(|(group_key, mut group)| {
             // Use the most-recently-modified project as the display template.
             group.sort_by(|a, b| b.1.last_modified.cmp(&a.1.last_modified));
             let template = group
@@ -279,14 +286,9 @@ fn merge_projects(parts: Vec<(SourceKind, ClaudeProject)>) -> Vec<ClaudeProject>
                 .max()
                 .unwrap_or("")
                 .to_string();
-            // Prefer a non-`file://` actual_path for display so the UI shows
-            // a plain filesystem path.
-            let actual_path = group
-                .iter()
-                .map(|(_, p)| p.actual_path.as_str())
-                .find(|p| !p.starts_with("file://"))
-                .unwrap_or(&template.actual_path)
-                .to_string();
+            // Use the grouping identity itself so the merged path is stable
+            // regardless of which storage surface was modified most recently.
+            let actual_path = group_key;
             let name = if actual_path.starts_with(VSCODE_EMPTY_WINDOW_PROJECT_SCHEME) {
                 template.name.clone()
             } else {
@@ -325,6 +327,37 @@ fn merge_projects(parts: Vec<(SourceKind, ClaudeProject)>) -> Vec<ClaudeProject>
 
     merged.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     merged
+}
+
+pub(crate) struct CopilotSessionListing {
+    pub(crate) session: ClaudeSession,
+    pub(crate) project_path: String,
+}
+
+/// Load one exact live Copilot carrier without reading sibling carrier contents.
+/// Concrete providers may enumerate parent directory names to prove spelling.
+pub(crate) fn load_session_metadata_by_path(
+    raw: &str,
+) -> Result<Option<CopilotSessionListing>, String> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err("Copilot session path must be absolute".to_string());
+    }
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let loaded = if matches!(parent, Some("chatSessions" | "emptyWindowChatSessions")) {
+        vscode::load_session_metadata_by_path(raw)?
+    } else if path.file_name().is_some_and(|name| name == "events.jsonl") {
+        copilot_cli::load_session_metadata_by_path(raw)?
+    } else {
+        return Err("Copilot session path is not a recognized live carrier".to_string());
+    };
+    Ok(loaded.map(|(session, project_path)| CopilotSessionListing {
+        session,
+        project_path: group_key(&project_path),
+    }))
 }
 
 fn tag<I: IntoIterator<Item = ClaudeProject>>(
@@ -607,6 +640,10 @@ mod tests {
         assert_eq!(group_key("/Users/me/repo"), "/Users/me/repo");
         assert_eq!(group_key("file:///Users/me/repo"), "/Users/me/repo");
         assert_eq!(group_key("file:///Users/me/repo/"), "/Users/me/repo");
+        assert_eq!(group_key(r"C:\Users\me\repo\"), r"C:\Users\me\repo");
+        assert_eq!(group_key("/"), "/");
+        assert_eq!(group_key(r"C:\"), r"C:\");
+        assert_eq!(group_key("C:/"), "C:/");
     }
 
     #[test]

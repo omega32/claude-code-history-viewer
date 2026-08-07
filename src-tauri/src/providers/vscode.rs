@@ -25,9 +25,10 @@ use crate::utils::{
     build_provider_message, is_symlink, ms_to_iso, prompt_attachment_name, prompt_attachments_data,
     search_json_value_case_insensitive,
 };
+use fs2::FileExt;
 use serde_json::Value;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, OpenOptions};
+use std::path::{Component, Path, PathBuf};
 
 /// Public provider id stamped on every project/session/message — unified
 /// with the Copilot CLI/Desktop providers under "copilot". Per-session
@@ -74,6 +75,13 @@ pub fn get_base_paths() -> Vec<PathBuf> {
 }
 
 fn get_user_data_roots() -> Vec<UserDataRoot> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("CCHV_TEST_VSCODE_USER_DATA_ROOT") {
+        return vec![UserDataRoot {
+            path: PathBuf::from(path),
+            label: "VS Code",
+        }];
+    }
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -165,19 +173,22 @@ fn empty_window_project_name(
 ) -> String {
     let flavor = custom_directory_label
         .map(ToString::to_string)
-        .or_else(|| {
-            user_data_path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .map(|name| match name {
-                    "Code - Insiders" => "VS Code Insiders".to_string(),
-                    "VSCodium" => "VSCodium".to_string(),
-                    _ => "VS Code".to_string(),
-                })
-        })
+        .or_else(|| conventional_user_data_label(user_data_path).map(ToString::to_string))
         .unwrap_or_else(|| "VS Code".to_string());
     format!("{flavor} — Empty Window")
+}
+
+fn conventional_user_data_label(user_data_path: &Path) -> Option<&'static str> {
+    match user_data_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        Some("Code - Insiders") => Some("VS Code Insiders"),
+        Some("VSCodium") => Some("VSCodium"),
+        Some("Code") => Some("VS Code"),
+        _ => None,
+    }
 }
 
 fn user_data_roots_from_workspace_roots(workspace_storage_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -513,9 +524,10 @@ fn load_sessions_in(
         if !managed {
             return Err("VS Code empty-window path is outside managed user data".to_string());
         }
+        let label = conventional_user_data_label(&raw);
         return load_sessions_from_chat_dir(
             &empty_window_chat_dir(&canonical),
-            &empty_window_project_name(&canonical, None),
+            &empty_window_project_name(&canonical, label),
         );
     }
 
@@ -554,27 +566,7 @@ fn load_sessions_from_chat_dir(
             continue;
         }
 
-        sessions.push(ClaudeSession {
-            session_id: session_path.to_string_lossy().to_string(),
-            actual_session_id: info.session_id,
-            file_path: session_path.to_string_lossy().to_string(),
-            project_name: project_name.to_string(),
-            message_count: info.message_count,
-            first_message_time: ms_to_iso(info.first_message_ms),
-            last_message_time: ms_to_iso(info.last_modified_ms),
-            last_modified: ms_to_iso(info.last_modified_ms),
-            has_tool_use: info.has_tool_use,
-            has_errors: false,
-            // A user rename wins over the first-request preview (same precedence
-            // as the Claude/codex scanners give their native titles).
-            is_renamed: info.custom_title.is_some(),
-            summary: info.custom_title.or(info.summary),
-            provider: Some(PROVIDER_ID.to_string()),
-            storage_type: None,
-            entrypoint: Some(ENTRYPOINT.to_string()),
-            forked_from_id: None,
-            subagent_provenance: None,
-        });
+        sessions.push(session_from_metadata(&session_path, info, project_name));
     }
 
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
@@ -591,7 +583,15 @@ pub(crate) fn load_offline_session_metadata(
     if info.message_count == 0 {
         return None;
     }
-    Some(ClaudeSession {
+    Some(session_from_metadata(session_path, info, project_name))
+}
+
+fn session_from_metadata(
+    session_path: &Path,
+    info: SessionMetadata,
+    project_name: &str,
+) -> ClaudeSession {
+    ClaudeSession {
         session_id: session_path.to_string_lossy().to_string(),
         actual_session_id: info.session_id,
         file_path: session_path.to_string_lossy().to_string(),
@@ -609,7 +609,256 @@ pub(crate) fn load_offline_session_metadata(
         entrypoint: Some(ENTRYPOINT.to_string()),
         forked_from_id: None,
         subagent_provenance: None,
-    })
+    }
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn validate_direct_carrier(
+    root: &Path,
+    relative: &[(&std::ffi::OsStr, bool)],
+) -> Result<bool, String> {
+    let mut current = root.to_path_buf();
+    let root_metadata = match fs::symlink_metadata(&current) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Failed to inspect VS Code storage root: {error}")),
+    };
+    if !root_metadata.file_type().is_dir() || is_symlink_or_reparse(&root_metadata) {
+        return Err("VS Code storage root is not a direct directory".to_string());
+    }
+    for (index, (component, require_exact_spelling)) in relative.iter().enumerate() {
+        if *require_exact_spelling {
+            let exact_entry_exists = fs::read_dir(&current)
+                .map_err(|error| format!("Failed to read VS Code session directory: {error}"))?
+                .flatten()
+                .any(|entry| entry.file_name().as_os_str() == *component);
+            if !exact_entry_exists {
+                if current.join(component).exists() {
+                    return Err(
+                        "VS Code session path must use its exact listed spelling".to_string()
+                    );
+                }
+                return Ok(false);
+            }
+        }
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("Failed to inspect VS Code session path: {error}")),
+        };
+        if is_symlink_or_reparse(&metadata) {
+            return Err("VS Code session path contains a symlink or reparse point".to_string());
+        }
+        let final_component = index + 1 == relative.len();
+        if (final_component && !metadata.file_type().is_file())
+            || (!final_component && !metadata.file_type().is_dir())
+        {
+            return Ok(false);
+        }
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve VS Code storage root: {error}"))?;
+    let canonical_path = current
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve VS Code session path: {error}"))?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err("VS Code session path is outside managed chat storage".to_string());
+    }
+    Ok(true)
+}
+
+fn load_targeted_session_metadata(path: &Path) -> Option<SessionMetadata> {
+    let chat_dir = path.parent()?;
+    let key = path.file_name()?.to_string_lossy().into_owned();
+    let before = file_freshness(path)?;
+    let old = load_metadata_cache(chat_dir);
+    if let Some(hit) = old.entries.get(&key) {
+        if (hit.modified_time, hit.modified_time_nanos, hit.file_size) == before
+            && file_freshness(path) == Some(before)
+        {
+            return Some(hit.metadata.clone());
+        }
+    }
+
+    let metadata = probe_session_metadata(path)?;
+    let after = file_freshness(path)?;
+    if before == after {
+        let _ = with_metadata_cache_lock(chat_dir, || {
+            if file_freshness(path) != Some(after) {
+                return;
+            }
+            let mut latest = load_metadata_cache(chat_dir);
+            latest.version = METADATA_CACHE_VERSION;
+            latest.entries.insert(
+                key,
+                CachedSessionMetadata {
+                    modified_time: after.0,
+                    modified_time_nanos: after.1,
+                    file_size: after.2,
+                    metadata: metadata.clone(),
+                },
+            );
+            write_metadata_cache(chat_dir, &latest);
+        });
+    }
+    Some(metadata)
+}
+
+pub(crate) fn load_session_metadata_by_path(
+    raw: &str,
+) -> Result<Option<(ClaudeSession, String)>, String> {
+    let user_roots = get_user_data_roots();
+    let workspace_roots = user_roots
+        .iter()
+        .map(|root| root.path.join("workspaceStorage"))
+        .collect::<Vec<_>>();
+    let labeled_roots = user_roots
+        .iter()
+        .map(|root| (root.path.clone(), root.label))
+        .collect::<Vec<_>>();
+    load_session_metadata_by_path_in(raw, &workspace_roots, &labeled_roots)
+}
+
+fn load_session_metadata_by_path_in(
+    raw: &str,
+    workspace_storage_roots: &[PathBuf],
+    user_data_roots: &[(PathBuf, &str)],
+) -> Result<Option<(ClaudeSession, String)>, String> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err("VS Code session path must be absolute".to_string());
+    }
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+    {
+        return Err("VS Code session path must be a JSONL file".to_string());
+    }
+
+    for (user_data_root, label) in user_data_roots {
+        let listing_user_data_root = match user_data_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Failed to resolve VS Code user-data root: {error}"));
+            }
+        };
+        let configured_workspace_root = user_data_root.join("workspaceStorage");
+        let workspace_root = configured_workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| listing_user_data_root.join("workspaceStorage"));
+        if workspace_storage_roots
+            .iter()
+            .any(|allowed| allowed.as_os_str() == configured_workspace_root.as_os_str())
+        {
+            if let Ok(relative) = path.strip_prefix(&workspace_root) {
+                let components = relative.components().collect::<Vec<_>>();
+                if let [Component::Normal(workspace), Component::Normal(chat), Component::Normal(file)] =
+                    components.as_slice()
+                {
+                    if *chat != "chatSessions" {
+                        return Err(
+                            "VS Code workspace session path has the wrong depth".to_string()
+                        );
+                    }
+                    let exact = workspace_root.join(workspace).join(chat).join(file);
+                    if exact.as_os_str() != path.as_os_str() {
+                        return Err(
+                            "VS Code session path must use its exact listed spelling".to_string()
+                        );
+                    }
+                    if !validate_direct_carrier(
+                        &listing_user_data_root,
+                        &[
+                            (std::ffi::OsStr::new("workspaceStorage"), false),
+                            (*workspace, true),
+                            (*chat, false),
+                            (*file, true),
+                        ],
+                    )? {
+                        return Ok(None);
+                    }
+                    let workspace_path = workspace_root.join(workspace);
+                    let Some(project_path) =
+                        read_workspace_folder(&workspace_path.join("workspace.json"))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(metadata) = load_targeted_session_metadata(&exact) else {
+                        return Ok(None);
+                    };
+                    if metadata.message_count == 0 {
+                        return Ok(None);
+                    }
+                    let project_name = Path::new(&project_path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| project_path.clone());
+                    return Ok(Some((
+                        session_from_metadata(&exact, metadata, &project_name),
+                        project_path,
+                    )));
+                }
+                return Err("VS Code workspace session path has the wrong depth".to_string());
+            }
+        }
+
+        let empty_root = empty_window_chat_dir(&listing_user_data_root);
+        if let Ok(relative) = path.strip_prefix(&empty_root) {
+            let components = relative.components().collect::<Vec<_>>();
+            let [Component::Normal(file)] = components.as_slice() else {
+                return Err("VS Code empty-window session path has the wrong depth".to_string());
+            };
+            let exact = empty_root.join(file);
+            if exact.as_os_str() != path.as_os_str() {
+                return Err("VS Code session path must use its exact listed spelling".to_string());
+            }
+            if !validate_direct_carrier(
+                &listing_user_data_root,
+                &[
+                    (std::ffi::OsStr::new("globalStorage"), false),
+                    (std::ffi::OsStr::new(EMPTY_WINDOW_DIR), false),
+                    (*file, true),
+                ],
+            )? {
+                return Ok(None);
+            }
+            let Some(metadata) = load_targeted_session_metadata(&exact) else {
+                return Ok(None);
+            };
+            if metadata.message_count == 0 {
+                return Ok(None);
+            }
+            return Ok(Some((
+                session_from_metadata(
+                    &exact,
+                    metadata,
+                    &empty_window_project_name(user_data_root, Some(*label)),
+                ),
+                empty_window_project_identity(Some(*label)),
+            )));
+        }
+    }
+
+    Err("VS Code session path is outside managed chat storage".to_string())
 }
 
 /// Read the workspace identity captured beside an offline carrier.
@@ -1379,6 +1628,8 @@ struct SessionMetadata {
 struct CachedSessionMetadata {
     /// File modification time (Unix seconds).
     modified_time: u64,
+    /// Nanosecond remainder of the file modification time.
+    modified_time_nanos: u32,
     /// File size in bytes (catches sub-second appends a seconds-mtime misses).
     file_size: u64,
     metadata: SessionMetadata,
@@ -1394,7 +1645,7 @@ struct SessionMetadataCache {
     entries: std::collections::HashMap<String, CachedSessionMetadata>,
 }
 
-const METADATA_CACHE_VERSION: u32 = 1;
+const METADATA_CACHE_VERSION: u32 = 2;
 
 /// The cache file lives alongside the sessions it describes (mirroring Claude's
 /// `.session_cache.json`); VS Code only reads `*.jsonl` here, so the dotfile is
@@ -1403,17 +1654,20 @@ fn metadata_cache_path(chat_dir: &Path) -> PathBuf {
     chat_dir.join(".session_cache.json")
 }
 
+fn metadata_cache_lock_path(chat_dir: &Path) -> PathBuf {
+    chat_dir.join(".session_cache.lock")
+}
+
 /// A file's freshness key: (modified-time seconds, size bytes). `None` if it
 /// can't be stat'd (the caller then probes without caching).
-fn file_freshness(path: &Path) -> Option<(u64, u64)> {
+fn file_freshness(path: &Path) -> Option<(u64, u32, u64)> {
     let meta = path.metadata().ok()?;
     let mtime = meta
         .modified()
         .ok()?
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some((mtime, meta.len()))
+        .ok()?;
+    Some((mtime.as_secs(), mtime.subsec_nanos(), meta.len()))
 }
 
 /// Load a `chatSessions/` cache from disk (empty on any error or a version bump).
@@ -1428,12 +1682,23 @@ fn load_metadata_cache(chat_dir: &Path) -> SessionMetadataCache {
     SessionMetadataCache::default()
 }
 
-/// Save a `chatSessions/` cache atomically (best effort; errors ignored — the
-/// cache is only an accelerator). Skips the write when there is nothing to cache.
-fn save_metadata_cache(chat_dir: &Path, cache: &SessionMetadataCache) {
-    if cache.entries.is_empty() {
-        return;
-    }
+fn with_metadata_cache_lock<T>(chat_dir: &Path, operation: impl FnOnce() -> T) -> Option<T> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(metadata_cache_lock_path(chat_dir))
+        .ok()?;
+    FileExt::lock_exclusive(&lock).ok()?;
+    let result = operation();
+    let _ = FileExt::unlock(&lock);
+    Some(result)
+}
+
+/// Publish a cache from inside the directory lock. Replacement is best effort;
+/// a failed or interrupted write only loses acceleration, never session data.
+fn write_metadata_cache(chat_dir: &Path, cache: &SessionMetadataCache) {
     let path = metadata_cache_path(chat_dir);
     let Ok(content) = serde_json::to_string(cache) else {
         return;
@@ -1452,6 +1717,11 @@ fn save_metadata_cache(chat_dir: &Path, cache: &SessionMetadataCache) {
     }
 }
 
+#[cfg(test)]
+fn save_metadata_cache(chat_dir: &Path, cache: &SessionMetadataCache) {
+    let _ = with_metadata_cache_lock(chat_dir, || write_metadata_cache(chat_dir, cache));
+}
+
 /// Probe one session's metadata, reusing the cache when the file is unchanged.
 /// On a hit the entry is carried into `next`; on a miss the file is replayed and
 /// the fresh result stored. A file that can't be stat'd or replayed is probed
@@ -1464,11 +1734,14 @@ fn probe_cached(
     let Some(key) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return probe_session_metadata(path);
     };
-    let Some((modified_time, file_size)) = file_freshness(path) else {
+    let Some((modified_time, modified_time_nanos, file_size)) = file_freshness(path) else {
         return probe_session_metadata(path);
     };
     if let Some(hit) = old.entries.get(&key) {
-        if hit.modified_time == modified_time && hit.file_size == file_size {
+        if hit.modified_time == modified_time
+            && hit.modified_time_nanos == modified_time_nanos
+            && hit.file_size == file_size
+        {
             next.entries.insert(key, hit.clone());
             return Some(hit.metadata.clone());
         }
@@ -1478,6 +1751,7 @@ fn probe_cached(
         key,
         CachedSessionMetadata {
             modified_time,
+            modified_time_nanos,
             file_size,
             metadata: metadata.clone(),
         },
@@ -1491,32 +1765,53 @@ fn probe_cached(
 /// Callers filter empties (`message_count == 0`) — those stay cached, so the
 /// common empty chat panels aren't re-replayed either.
 fn list_session_metadata(chat_dir: &Path) -> Result<Vec<(PathBuf, SessionMetadata)>, String> {
-    let old = load_metadata_cache(chat_dir);
-    let mut next = SessionMetadataCache {
-        version: METADATA_CACHE_VERSION,
-        entries: std::collections::HashMap::new(),
-    };
-    let mut out = Vec::new();
-    for entry in fs::read_dir(chat_dir).map_err(|e| e.to_string())?.flatten() {
-        let path = entry.path();
-        if is_symlink(&path) || !path.is_file() {
-            continue;
+    with_metadata_cache_lock(chat_dir, || {
+        let old = load_metadata_cache(chat_dir);
+        let mut next = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION,
+            entries: std::collections::HashMap::new(),
+        };
+        let mut out = Vec::new();
+        for entry in fs::read_dir(chat_dir).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            if is_symlink(&path) || !path.is_file() {
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some("jsonl")
+            {
+                continue;
+            }
+            if let Some(meta) = probe_cached(&path, &old, &mut next) {
+                out.push((path, meta));
+            }
         }
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some("jsonl")
-        {
-            continue;
+        write_metadata_cache(chat_dir, &next);
+        Ok(out)
+    })
+    .unwrap_or_else(|| {
+        // A cache lock failure must not make listing unavailable.
+        let mut out = Vec::new();
+        for entry in fs::read_dir(chat_dir).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            if !is_symlink(&path)
+                && path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+            {
+                if let Some(metadata) = probe_session_metadata(&path) {
+                    out.push((path, metadata));
+                }
+            }
         }
-        if let Some(meta) = probe_cached(&path, &old, &mut next) {
-            out.push((path, meta));
-        }
-    }
-    save_metadata_cache(chat_dir, &next);
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Text of a VS Code message field that is either a markdown object
@@ -1854,6 +2149,16 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
 
     fn build_log(initial: Value, patches: &[Value]) -> String {
         let mut lines = vec![json!({"kind": 0, "v": initial}).to_string()];
@@ -2686,7 +2991,7 @@ mod tests {
         let (chat, file, path) = seed_session(&tmp, "aaaa");
         // Seed a cache entry whose metadata differs from a real probe, stamped
         // with the file's actual (mtime, size) so it's considered fresh.
-        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let (modified_time, modified_time_nanos, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
             entries: std::collections::HashMap::default(),
@@ -2695,6 +3000,7 @@ mod tests {
             file,
             CachedSessionMetadata {
                 modified_time,
+                modified_time_nanos,
                 file_size,
                 metadata: sentinel_meta(),
             },
@@ -2712,7 +3018,7 @@ mod tests {
     fn metadata_cache_misses_on_size_change_and_reprobes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (chat, file, path) = seed_session(&tmp, "bbbb");
-        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let (modified_time, modified_time_nanos, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
             entries: std::collections::HashMap::default(),
@@ -2722,6 +3028,7 @@ mod tests {
             file,
             CachedSessionMetadata {
                 modified_time,
+                modified_time_nanos,
                 file_size: file_size + 1,
                 metadata: sentinel_meta(),
             },
@@ -2736,7 +3043,7 @@ mod tests {
     fn metadata_cache_ignores_a_stale_version() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (chat, file, path) = seed_session(&tmp, "cccc");
-        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let (modified_time, modified_time_nanos, file_size) = file_freshness(&path).unwrap();
         // Right freshness but wrong version → the whole cache is dropped.
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION + 1,
@@ -2746,6 +3053,7 @@ mod tests {
             file,
             CachedSessionMetadata {
                 modified_time,
+                modified_time_nanos,
                 file_size,
                 metadata: sentinel_meta(),
             },
@@ -2762,7 +3070,7 @@ mod tests {
     fn metadata_cache_evicts_vanished_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (chat, file, path) = seed_session(&tmp, "dddd");
-        let (modified_time, file_size) = file_freshness(&path).unwrap();
+        let (modified_time, modified_time_nanos, file_size) = file_freshness(&path).unwrap();
         let mut cache = SessionMetadataCache {
             version: METADATA_CACHE_VERSION,
             entries: std::collections::HashMap::default(),
@@ -2771,6 +3079,7 @@ mod tests {
             file.clone(),
             CachedSessionMetadata {
                 modified_time,
+                modified_time_nanos,
                 file_size,
                 metadata: sentinel_meta(),
             },
@@ -2779,6 +3088,7 @@ mod tests {
             "ghost.jsonl".into(),
             CachedSessionMetadata {
                 modified_time,
+                modified_time_nanos,
                 file_size,
                 metadata: sentinel_meta(),
             },
@@ -2789,6 +3099,20 @@ mod tests {
         let after = load_metadata_cache(&chat);
         assert!(after.entries.contains_key(&file)); // present file kept
         assert!(!after.entries.contains_key("ghost.jsonl")); // vanished file evicted
+    }
+
+    #[test]
+    fn metadata_cache_publishes_empty_state_after_the_last_session_is_deleted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "last-session");
+        assert_eq!(list_session_metadata(&chat).unwrap().len(), 1);
+        assert!(load_metadata_cache(&chat).entries.contains_key(&file));
+
+        fs::remove_file(path).unwrap();
+        assert!(list_session_metadata(&chat).unwrap().is_empty());
+        let after = load_metadata_cache(&chat);
+        assert_eq!(after.version, METADATA_CACHE_VERSION);
+        assert!(after.entries.is_empty());
     }
 
     #[test]
@@ -2805,6 +3129,75 @@ mod tests {
             cached.entries.get(&file).unwrap().metadata.session_id,
             "real"
         );
+    }
+
+    #[test]
+    fn targeted_metadata_cache_merges_one_entry_and_reuses_it_until_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, file, path) = seed_session(&tmp, "targeted-cache");
+        let freshness = file_freshness(&path).unwrap();
+        let mut cache = SessionMetadataCache {
+            version: METADATA_CACHE_VERSION,
+            entries: std::collections::HashMap::default(),
+        };
+        cache.entries.insert(
+            "sibling.jsonl".into(),
+            CachedSessionMetadata {
+                modified_time: freshness.0,
+                modified_time_nanos: freshness.1,
+                file_size: freshness.2,
+                metadata: sentinel_meta(),
+            },
+        );
+        save_metadata_cache(&chat, &cache);
+
+        let cold = load_targeted_session_metadata(&path).unwrap();
+        assert_eq!(cold.session_id, "real");
+        let merged = load_metadata_cache(&chat);
+        assert!(merged.entries.contains_key("sibling.jsonl"));
+        assert!(merged.entries.contains_key(&file));
+
+        let mut warm_cache = merged;
+        warm_cache.entries.get_mut(&file).unwrap().metadata = sentinel_meta();
+        save_metadata_cache(&chat, &warm_cache);
+        assert_eq!(
+            load_targeted_session_metadata(&path).unwrap().session_id,
+            "CACHED",
+            "an unchanged exact carrier should not be replayed"
+        );
+
+        fs::write(
+            &path,
+            json!({"kind": 0, "v": {
+                "sessionId": "changed",
+                "creationDate": 1000u64,
+                "requests": [{"message": {"text": "a longer changed prompt"}}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_targeted_session_metadata(&path).unwrap().session_id,
+            "changed"
+        );
+    }
+
+    #[test]
+    fn concurrent_targeted_cache_misses_preserve_both_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chat, first, first_path) = seed_session(&tmp, "target-one");
+        let (_, second, second_path) = seed_session(&tmp, "target-two");
+
+        let first_worker =
+            std::thread::spawn(move || load_targeted_session_metadata(&first_path).unwrap());
+        let second_worker =
+            std::thread::spawn(move || load_targeted_session_metadata(&second_path).unwrap());
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
+
+        let cache = load_metadata_cache(&chat);
+        assert!(cache.entries.contains_key(&first));
+        assert!(cache.entries.contains_key(&second));
     }
 
     #[test]
@@ -2866,6 +3259,369 @@ mod tests {
             !ids.iter().any(|id| id.starts_with("empty-")),
             "empty chat panel must be skipped: {ids:?}",
         );
+    }
+
+    #[test]
+    fn targeted_metadata_matches_workspace_listing_and_project_identity() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = user_data.path().join("workspaceStorage");
+        let workspace = workspace_root.join("hash-targeted");
+        let chat_dir = workspace.join("chatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///Users/me/targeted-repo"}"#,
+        )
+        .unwrap();
+        let session_path = chat_dir.join("targeted-1111-1111-1111-111111111111.jsonl");
+        fs::write(
+            &session_path,
+            json!({"kind": 0, "v": {
+                "sessionId": "targeted-1111-1111-1111-111111111111",
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "hello"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let roots = vec![workspace_root];
+
+        let project = scan_workspace(&workspace, None).unwrap().unwrap();
+        let listed = load_sessions_in(&project.path, &roots).unwrap().remove(0);
+        let listed_path = listed.file_path.clone();
+        let targeted = load_session_metadata_by_path_in(
+            &listed_path,
+            &roots,
+            &[(user_data.path().to_path_buf(), "VS Code")],
+        )
+        .expect("targeted metadata should load")
+        .expect("used session should remain listed");
+        assert_eq!(targeted.1, project.actual_path);
+        assert_eq!(
+            serde_json::to_value(targeted.0).unwrap(),
+            serde_json::to_value(listed).unwrap()
+        );
+        if listed_path != session_path.to_string_lossy() {
+            assert!(load_session_metadata_by_path_in(
+                session_path.to_str().unwrap(),
+                &roots,
+                &[(user_data.path().to_path_buf(), "VS Code")],
+            )
+            .is_err());
+        }
+
+        fs::remove_file(workspace.join("workspace.json")).unwrap();
+        assert!(load_session_metadata_by_path_in(
+            &listed_path,
+            &roots,
+            &[(user_data.path().to_path_buf(), "VS Code")],
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn targeted_metadata_accepts_a_configured_root_alias_used_by_listing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let physical_user_data = temp.path().join("physical-user-data");
+        let workspace = physical_user_data
+            .join("workspaceStorage")
+            .join("root-alias-workspace");
+        let chat_dir = workspace.join("chatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///Users/me/root-alias-repo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            chat_dir.join("root-alias.jsonl"),
+            json!({"kind": 0, "v": {
+                "sessionId": "root-alias",
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "hello"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let configured_root = temp.path().join("configured-user-data");
+        if try_symlink_dir(&physical_user_data, &configured_root).is_err() {
+            return;
+        }
+        let roots = vec![configured_root.join("workspaceStorage")];
+        let project = scan_projects_from_user_data_path(&configured_root, None)
+            .unwrap()
+            .remove(0);
+        let listed = load_sessions_in(&project.path, &roots).unwrap().remove(0);
+        let targeted = load_session_metadata_by_path_in(
+            &listed.file_path,
+            &roots,
+            &[(configured_root, "VS Code")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(targeted.1, project.actual_path);
+        assert_eq!(
+            serde_json::to_value(targeted.0).unwrap(),
+            serde_json::to_value(listed).unwrap()
+        );
+    }
+
+    #[test]
+    fn targeted_empty_window_metadata_matches_relocated_flavor_roots() {
+        for (directory, label, scan_label, identity, project_name) in [
+            (
+                "Code",
+                "VS Code",
+                None,
+                "vscode-empty-window://code",
+                "VS Code — Empty Window",
+            ),
+            (
+                "Code - Insiders",
+                "VS Code Insiders",
+                Some("VS Code Insiders"),
+                "vscode-empty-window://code-insiders",
+                "VS Code Insiders — Empty Window",
+            ),
+            (
+                "VSCodium",
+                "VSCodium",
+                Some("VSCodium"),
+                "vscode-empty-window://vscodium",
+                "VSCodium — Empty Window",
+            ),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let physical = temp.path().join("relocated-user-data");
+            let chat_dir = empty_window_chat_dir(&physical);
+            fs::create_dir_all(&chat_dir).unwrap();
+            fs::write(
+                chat_dir.join("relocated-empty.jsonl"),
+                json!({"kind": 0, "v": {
+                    "sessionId": "relocated-empty",
+                    "creationDate": 1779490058917u64,
+                    "requests": [{"message": {"text": "hello"}, "response": []}]
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let configured_parent = temp.path().join(directory);
+            fs::create_dir_all(&configured_parent).unwrap();
+            let configured = configured_parent.join("User");
+            if try_symlink_dir(&physical, &configured).is_err() {
+                return;
+            }
+            let roots = vec![configured.join("workspaceStorage")];
+            let project = scan_empty_window_project(&configured, scan_label)
+                .unwrap()
+                .unwrap();
+            let listed = load_sessions_in(&project.path, &roots).unwrap().remove(0);
+            let targeted =
+                load_session_metadata_by_path_in(&listed.file_path, &roots, &[(configured, label)])
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(targeted.1, identity);
+            assert_eq!(targeted.0.project_name, project_name);
+            assert_eq!(
+                serde_json::to_value(targeted.0).unwrap(),
+                serde_json::to_value(listed).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn targeted_metadata_accepts_fixed_directory_casing_emitted_by_listing() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let physical_workspace = user_data
+            .path()
+            .join("WorkspaceStorage")
+            .join("case-workspace");
+        let physical_workspace_chats = physical_workspace.join("ChatSessions");
+        fs::create_dir_all(&physical_workspace_chats).unwrap();
+        fs::write(
+            physical_workspace.join("workspace.json"),
+            r#"{"folder":"file:///Users/me/workspace-case-parity"}"#,
+        )
+        .unwrap();
+        fs::write(
+            physical_workspace_chats.join("workspace-case-parity.jsonl"),
+            json!({"kind": 0, "v": {
+                "sessionId": "workspace-case-parity",
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "hello"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let physical_chat_dir = user_data
+            .path()
+            .join("GlobalStorage")
+            .join("EmptyWindowChatSessions");
+        fs::create_dir_all(&physical_chat_dir).unwrap();
+        fs::write(
+            physical_chat_dir.join("case-parity.jsonl"),
+            json!({"kind": 0, "v": {
+                "sessionId": "case-parity",
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "hello"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let roots = vec![user_data.path().join("workspaceStorage")];
+        let workspace_project = scan_workspace(&roots[0].join("case-workspace"), None)
+            .unwrap()
+            .unwrap();
+        let workspace_listed = load_sessions_in(&workspace_project.path, &roots)
+            .unwrap()
+            .remove(0);
+        let workspace_targeted = load_session_metadata_by_path_in(
+            &workspace_listed.file_path,
+            &roots,
+            &[(user_data.path().to_path_buf(), "VS Code")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(workspace_targeted.0).unwrap(),
+            serde_json::to_value(workspace_listed).unwrap()
+        );
+        let project = scan_empty_window_project(user_data.path(), None)
+            .unwrap()
+            .unwrap();
+        let listed = load_sessions_in(&project.path, &roots).unwrap().remove(0);
+        let targeted = load_session_metadata_by_path_in(
+            &listed.file_path,
+            &roots,
+            &[(user_data.path().to_path_buf(), "VS Code")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(targeted.0).unwrap(),
+            serde_json::to_value(listed).unwrap()
+        );
+    }
+
+    #[test]
+    fn targeted_metadata_matches_empty_window_identity_and_rejects_aliases() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = user_data.path().join("workspaceStorage");
+        let chat_dir = user_data
+            .path()
+            .join("globalStorage")
+            .join("emptyWindowChatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+        let session_path = chat_dir.join("targeted-empty.jsonl");
+        fs::write(
+            &session_path,
+            json!({"kind": 0, "v": {
+                "sessionId": "targeted-empty",
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "hello"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let roots = vec![workspace_root];
+        let user_roots = vec![(user_data.path().to_path_buf(), "VS Code")];
+        let listed_session_path = user_data
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("globalStorage")
+            .join("emptyWindowChatSessions")
+            .join("targeted-empty.jsonl");
+
+        let targeted = load_session_metadata_by_path_in(
+            listed_session_path.to_str().unwrap(),
+            &roots,
+            &user_roots,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(targeted.1, "vscode-empty-window://code");
+        assert_eq!(targeted.0.project_name, "VS Code — Empty Window");
+        #[cfg(windows)]
+        {
+            let case_alias = listed_session_path.with_file_name("TARGETED-EMPTY.JSONL");
+            assert!(load_session_metadata_by_path_in(
+                case_alias.to_str().unwrap(),
+                &roots,
+                &user_roots,
+            )
+            .is_err());
+        }
+        for (label, identity, name) in [
+            (
+                "VS Code Insiders",
+                "vscode-empty-window://code-insiders",
+                "VS Code Insiders — Empty Window",
+            ),
+            (
+                "VSCodium",
+                "vscode-empty-window://vscodium",
+                "VSCodium — Empty Window",
+            ),
+        ] {
+            let flavor = load_session_metadata_by_path_in(
+                listed_session_path.to_str().unwrap(),
+                &roots,
+                &[(user_data.path().to_path_buf(), label)],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(flavor.1, identity);
+            assert_eq!(flavor.0.project_name, name);
+        }
+
+        let separator = std::path::MAIN_SEPARATOR;
+        let dot_alias = format!(
+            "{}{separator}.{separator}targeted-empty.jsonl",
+            listed_session_path.parent().unwrap().display()
+        );
+        assert!(load_session_metadata_by_path_in(&dot_alias, &roots, &user_roots).is_err());
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_chat = outside.path().join("chatSessions");
+        fs::create_dir_all(&outside_chat).unwrap();
+        let outside_path = outside_chat.join("outside.jsonl");
+        fs::write(&outside_path, "{}").unwrap();
+        assert!(load_session_metadata_by_path_in(
+            outside_path.to_str().unwrap(),
+            &roots,
+            &user_roots
+        )
+        .is_err());
+
+        fs::create_dir_all(user_data.path().join("workspaceStorage")).unwrap();
+        let linked_workspace = user_data.path().join("workspaceStorage").join("linked");
+        if try_symlink_dir(outside.path(), &linked_workspace).is_ok() {
+            let linked_path = user_data
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("workspaceStorage")
+                .join("linked")
+                .join("chatSessions")
+                .join("outside.jsonl");
+            assert!(load_session_metadata_by_path_in(
+                linked_path.to_str().unwrap(),
+                &roots,
+                &user_roots
+            )
+            .is_err());
+        }
+
+        fs::remove_file(&session_path).unwrap();
+        assert!(load_session_metadata_by_path_in(
+            listed_session_path.to_str().unwrap(),
+            &roots,
+            &user_roots
+        )
+        .expect("a deleted exact carrier should be a clean miss")
+        .is_none());
     }
 
     #[test]

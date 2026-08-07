@@ -34,8 +34,8 @@ use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 use walkdir::WalkDir;
@@ -498,28 +498,7 @@ pub fn load_sessions(
         .filter_map(|path| extract_session_info_cached(path).ok())
         .filter(|info| info.message_count > 0 && info.client_kind == client)
         .filter(|info| info.cwd.as_deref().unwrap_or("unknown") == target_cwd)
-        .map(|info| ClaudeSession {
-            session_id: info.file_path.clone(),
-            actual_session_id: info.session_id,
-            file_path: info.file_path,
-            project_name: Path::new(&target_cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            message_count: info.message_count,
-            first_message_time: info.first_message_time,
-            last_message_time: info.last_message_time,
-            last_modified: info.last_modified,
-            has_tool_use: info.has_tool_use,
-            has_errors: false,
-            summary: info.summary,
-            is_renamed: info.is_renamed,
-            provider: Some(client.provider_id().to_string()),
-            storage_type: None,
-            entrypoint: Some(info.client_kind.entrypoint().to_string()),
-            forked_from_id: None,
-            subagent_provenance: None,
-        })
+        .map(|info| session_from_info(info, &target_cwd))
         .collect();
 
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
@@ -533,33 +512,150 @@ pub(crate) fn load_offline_session_metadata(
 ) -> Result<(ClaudeSession, Option<String>), String> {
     let info = extract_session_info(events_path)?;
     let project_path = info.cwd.clone();
-    let project_name = project_path
-        .as_deref()
-        .and_then(|cwd| Path::new(cwd).file_name())
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    Ok((
-        ClaudeSession {
-            session_id: info.file_path.clone(),
-            actual_session_id: info.session_id,
-            file_path: info.file_path,
-            project_name,
-            message_count: info.message_count,
-            first_message_time: info.first_message_time,
-            last_message_time: info.last_message_time,
-            last_modified: info.last_modified,
-            has_tool_use: info.has_tool_use,
-            has_errors: false,
-            summary: info.summary,
-            is_renamed: info.is_renamed,
-            provider: Some("copilot".to_string()),
-            storage_type: None,
-            entrypoint: Some(info.client_kind.entrypoint().to_string()),
-            forked_from_id: None,
-            subagent_provenance: None,
-        },
-        project_path,
-    ))
+    let project_name = project_path.as_deref().unwrap_or("unknown");
+    Ok((session_from_info(info, project_name), project_path))
+}
+
+fn session_from_info(info: SessionInfo, project_path: &str) -> ClaudeSession {
+    ClaudeSession {
+        session_id: info.file_path.clone(),
+        actual_session_id: info.session_id,
+        file_path: info.file_path,
+        project_name: Path::new(project_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        message_count: info.message_count,
+        first_message_time: info.first_message_time,
+        last_message_time: info.last_message_time,
+        last_modified: info.last_modified,
+        has_tool_use: info.has_tool_use,
+        has_errors: false,
+        summary: info.summary,
+        is_renamed: info.is_renamed,
+        provider: Some(PROVIDER_ID.to_string()),
+        storage_type: None,
+        entrypoint: Some(info.client_kind.entrypoint().to_string()),
+        forked_from_id: None,
+        subagent_provenance: None,
+    }
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn validate_direct_session_carrier(
+    root: &Path,
+    relative: &[&std::ffi::OsStr],
+) -> Result<bool, String> {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect Copilot CLI session root: {error}"
+            ))
+        }
+    };
+    if !root_metadata.file_type().is_dir() || is_symlink_or_reparse(&root_metadata) {
+        return Err("Copilot CLI session root is not a direct directory".to_string());
+    }
+
+    let mut current = root.to_path_buf();
+    for (index, component) in relative.iter().enumerate() {
+        let exact_entry_exists = fs::read_dir(&current)
+            .map_err(|error| format!("Failed to read Copilot CLI session directory: {error}"))?
+            .flatten()
+            .any(|entry| entry.file_name().as_os_str() == *component);
+        if !exact_entry_exists {
+            if current.join(component).exists() {
+                return Err(
+                    "Copilot CLI session path must use its exact listed spelling".to_string(),
+                );
+            }
+            return Ok(false);
+        }
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("Failed to inspect Copilot CLI session path: {error}"))?;
+        if is_symlink_or_reparse(&metadata) {
+            return Err("Copilot CLI session path contains a symlink or reparse point".to_string());
+        }
+        let final_component = index + 1 == relative.len();
+        if (final_component && !metadata.file_type().is_file())
+            || (!final_component && !metadata.file_type().is_dir())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Load one live CLI/Desktop carrier without statting or parsing sibling carriers.
+/// Parent directory names are enumerated to prove exact on-disk spelling.
+pub(crate) fn load_session_metadata_by_path(
+    raw: &str,
+) -> Result<Option<(ClaudeSession, String)>, String> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err("Copilot CLI session path must be absolute".to_string());
+    }
+    let root = get_session_root()?;
+    if !root.is_absolute() {
+        return Err("Copilot CLI session root must be absolute".to_string());
+    }
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| format!("Session path is outside Copilot CLI session directory: {raw}"))?;
+    let parts: Vec<_> = relative.components().collect();
+    let [Component::Normal(session_dir), Component::Normal(file_name)] = parts.as_slice() else {
+        return Err(
+            "Copilot CLI session path must be exactly session-state/<session>/events.jsonl"
+                .to_string(),
+        );
+    };
+    if *file_name != "events.jsonl" {
+        return Err("Copilot CLI session path must end with events.jsonl".to_string());
+    }
+    let exact = root.join(session_dir).join(file_name);
+    if exact.as_os_str() != path.as_os_str() {
+        return Err("Copilot CLI session path must use its exact listed spelling".to_string());
+    }
+
+    if !validate_direct_session_carrier(&root, &[*session_dir, *file_name])? {
+        return Ok(None);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve Copilot CLI session root: {error}"))?;
+    let canonical_path = exact
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve Copilot CLI session path: {error}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "Session path is outside Copilot CLI session directory: {raw}"
+        ));
+    }
+
+    let info = match extract_session_info_cached(&exact) {
+        Ok(info) if info.message_count > 0 => info,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+    Ok(Some((session_from_info(info, &project_path), project_path)))
 }
 
 /// Stream messages out of `events.jsonl`.
@@ -1258,6 +1354,16 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -1481,6 +1587,167 @@ mod tests {
             sessions.is_empty(),
             "empty sessions must not surface in load_sessions: {sessions:?}",
         );
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_metadata_matches_cli_and_desktop_project_listings() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let cli_path = write_session(
+            tmp.path(),
+            "66666666-6666-6666-6666-666666666666",
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": "66666666-6666-6666-6666-666666666666",
+                        "context": {"cwd": "/repo/cli"}
+                    },
+                    "timestamp": "2026-01-06T00:00:00.000Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "cli prompt"},
+                    "timestamp": "2026-01-06T00:00:01.000Z"
+                }),
+            ],
+        );
+        let desktop_path = write_session(
+            tmp.path(),
+            "77777777-7777-7777-7777-777777777777",
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": "77777777-7777-7777-7777-777777777777",
+                        "context": {"cwd": "/repo/desktop"}
+                    },
+                    "timestamp": "2026-01-07T00:00:00.000Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "desktop prompt"},
+                    "timestamp": "2026-01-07T00:00:01.000Z"
+                }),
+            ],
+        );
+        fs::write(
+            desktop_path.parent().unwrap().join("workspace.yaml"),
+            "client_name: github/autopilot\n",
+        )
+        .unwrap();
+
+        for (path, project_path, expected_entrypoint) in [
+            (&cli_path, "/repo/cli", "copilot-cli"),
+            (&desktop_path, "/repo/desktop", "copilot-desktop"),
+        ] {
+            let targeted = load_session_metadata_by_path(path.to_str().unwrap())
+                .expect("targeted metadata should load")
+                .expect("used session should remain listed");
+            assert_eq!(targeted.1, project_path);
+            assert_eq!(targeted.0.entrypoint.as_deref(), Some(expected_entrypoint));
+            let project = if expected_entrypoint == "copilot-cli" {
+                scan_projects().unwrap()
+            } else {
+                scan_desktop_projects().unwrap()
+            }
+            .into_iter()
+            .find(|project| project.actual_path == project_path)
+            .unwrap();
+            let listed = load_sessions(&project.path, false)
+                .unwrap()
+                .into_iter()
+                .find(|session| session.file_path == path.to_string_lossy())
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(targeted.0).unwrap(),
+                serde_json::to_value(listed).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_metadata_rejects_aliases_and_outside_paths_and_maps_deletion_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let path = write_session(
+            tmp.path(),
+            "88888888-8888-8888-8888-888888888888",
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {"sessionId": "88888888-8888-8888-8888-888888888888", "context": {"cwd": "/repo"}},
+                    "timestamp": "2026-01-08T00:00:00.000Z"
+                }),
+                json!({"type": "user.message", "data": {"content": "hello"}, "timestamp": "2026-01-08T00:00:01.000Z"}),
+            ],
+        );
+        let session_root = tmp.path().join("session-state");
+        let dot_alias = session_root
+            .join(".")
+            .join(path.parent().unwrap().file_name().unwrap())
+            .join("events.jsonl");
+        assert!(load_session_metadata_by_path(dot_alias.to_str().unwrap()).is_err());
+
+        let outside = TempDir::new().unwrap();
+        let outside_path = write_events(outside.path(), &[json!({"type":"session.start"})]);
+        assert!(load_session_metadata_by_path(outside_path.to_str().unwrap()).is_err());
+
+        let wrong_depth = session_root
+            .join("nested")
+            .join("child")
+            .join("events.jsonl");
+        assert!(load_session_metadata_by_path(wrong_depth.to_str().unwrap()).is_err());
+
+        #[cfg(windows)]
+        {
+            let exact_case_dir = session_root.join("CaseCarrier");
+            fs::create_dir_all(&exact_case_dir).unwrap();
+            fs::write(exact_case_dir.join("events.jsonl"), "{}").unwrap();
+            let case_alias = session_root.join("casecarrier").join("events.jsonl");
+            assert!(load_session_metadata_by_path(case_alias.to_str().unwrap()).is_err());
+        }
+
+        let linked = session_root.join("linked-session");
+        if try_symlink_dir(path.parent().unwrap(), &linked).is_ok() {
+            assert!(
+                load_session_metadata_by_path(linked.join("events.jsonl").to_str().unwrap())
+                    .is_err()
+            );
+        }
+
+        fs::write(
+            path.parent().unwrap().join("workspace.yaml"),
+            "client_name: github/autopilot\nname: Live desktop title\nuser_named: true\n",
+        )
+        .unwrap();
+        let reclassified = load_session_metadata_by_path(path.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(reclassified.entrypoint.as_deref(), Some("copilot-desktop"));
+        assert_eq!(reclassified.summary.as_deref(), Some("Live desktop title"));
+        assert!(reclassified.is_renamed);
+
+        let empty_path = write_session(
+            tmp.path(),
+            "88888888-8888-8888-8888-000000000000",
+            &[json!({
+                "type": "session.start",
+                "data": {"sessionId": "88888888-8888-8888-8888-000000000000", "context": {"cwd": "/repo"}},
+                "timestamp": "2026-01-08T00:00:00.000Z"
+            })],
+        );
+        assert!(load_session_metadata_by_path(empty_path.to_str().unwrap())
+            .unwrap()
+            .is_none());
+
+        fs::remove_file(&path).unwrap();
+        assert!(load_session_metadata_by_path(path.to_str().unwrap())
+            .expect("a deleted exact carrier should be a clean miss")
+            .is_none());
     }
 
     #[test]

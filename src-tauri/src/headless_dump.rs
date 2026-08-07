@@ -608,8 +608,8 @@ project directory) when known. --provider defaults to 'claude'.";
 
 const METADATA_USAGE: &str = "Usage: --session-metadata <session-id|session-path> [--provider <name>] [--format json] [--output <file>]\n\n\
 Return one authoritative session-listing row, or null when the session is no\n\
-longer listed. An absolute Codex rollout path is loaded directly without a\n\
-provider-wide scan. --provider defaults to 'claude'.";
+longer listed. An absolute Codex rollout or Copilot carrier path is loaded\n\
+directly without a provider-wide scan. --provider defaults to 'claude'.";
 
 /// The Claude Code VS Code extension "deletes" a session by adding its id to a
 /// `hiddenSessionIds` array in the editor's global-state DB — a soft hide that
@@ -1340,6 +1340,36 @@ fn wrap_codex_listing(
     }
 }
 
+fn wrap_session_listing(
+    provider: &str,
+    session: ClaudeSession,
+    project_path: Option<String>,
+    hidden: &HashSet<String>,
+    copilot: &CopilotClassifier,
+    codex_imports: &HashMap<String, Option<String>>,
+) -> SessionWithProjectPath {
+    let (is_orphan, copilot_archived, is_pinned) = copilot.classify(&session);
+    let is_archived = copilot_archived
+        || (provider == "codex" && codex::is_archived_session_path(Path::new(&session.file_path)));
+    let is_imported = codex_imports.contains_key(&session.actual_session_id);
+    let imported_from = codex_imports
+        .get(&session.actual_session_id)
+        .cloned()
+        .flatten();
+    SessionWithProjectPath {
+        is_hidden: hidden.contains(&session.actual_session_id),
+        is_orphan,
+        is_archived,
+        is_pinned,
+        is_teleported: false,
+        is_imported,
+        imported_from,
+        remote_session_id: None,
+        session,
+        project_path,
+    }
+}
+
 /// A teleport redirect stub: a Claude session whose local `.jsonl` was emptied to
 /// a single `teleported-from` record when its conversation was relocated to a
 /// cloud (web) session. The base's normal metadata scan drops such a file (it has
@@ -1498,7 +1528,6 @@ async fn list_sessions(
     } else {
         HashSet::new()
     };
-    let is_hidden = |session: &ClaudeSession| hidden.contains(&session.actual_session_id);
     // Copilot VS Code orphan/archive/pin classification (inert for other providers),
     // caching each workspace's state.vscdb read across its sessions. Codex's
     // archived state is cheaper and authoritative: it is the scan-root provenance.
@@ -1511,27 +1540,14 @@ async fn list_sessions(
         HashMap::new()
     };
     let wrap = |session: ClaudeSession, project_path: Option<String>| {
-        let (is_orphan, copilot_archived, is_pinned) = copilot.classify(&session);
-        let is_archived = copilot_archived
-            || (provider == "codex"
-                && codex::is_archived_session_path(Path::new(&session.file_path)));
-        let is_imported = codex_imports.contains_key(&session.actual_session_id);
-        let imported_from = codex_imports
-            .get(&session.actual_session_id)
-            .cloned()
-            .flatten();
-        SessionWithProjectPath {
-            is_hidden: is_hidden(&session),
-            is_orphan,
-            is_archived,
-            is_pinned,
-            is_teleported: false,
-            is_imported,
-            imported_from,
-            remote_session_id: None,
+        wrap_session_listing(
+            provider,
             session,
             project_path,
-        }
+            &hidden,
+            &copilot,
+            &codex_imports,
+        )
     };
 
     if let Some(path) = project {
@@ -1686,6 +1702,21 @@ async fn session_metadata(
         let imports = codex::external_agent_imports();
         return codex::load_session_metadata_by_path(selector)
             .map(|listed| listed.map(|row| wrap_codex_listing(row, &imports)));
+    }
+    if provider == "copilot" && looks_like_session_path(selector) {
+        let classifier = CopilotClassifier::new(provider);
+        return copilot::load_session_metadata_by_path(selector).map(|listed| {
+            listed.map(|row| {
+                wrap_session_listing(
+                    provider,
+                    row.session,
+                    Some(row.project_path),
+                    &HashSet::new(),
+                    &classifier,
+                    &HashMap::new(),
+                )
+            })
+        });
     }
     select_session_metadata(list_sessions(provider, None).await?, provider, selector)
 }
@@ -2622,6 +2653,250 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn session_metadata_matches_copilot_cli_and_desktop_listing_rows() {
+        let temp = TempDir::new().unwrap();
+        let copilot_home = temp.path().join("copilot-home");
+        let session_dir = copilot_home
+            .join("session-state")
+            .join("99999999-9999-9999-9999-999999999999");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let _guard = EnvVarGuard::set("COPILOT_CLI_HOME", &copilot_home);
+        let carrier = session_dir.join("events.jsonl");
+        let records = [
+            json!({
+                "type": "session.start",
+                "data": {
+                    "sessionId": "99999999-9999-9999-9999-999999999999",
+                    "context": {"cwd": "/redacted/copilot-targeted"}
+                },
+                "timestamp": "2026-08-07T00:00:00Z"
+            }),
+            json!({
+                "type": "user.message",
+                "data": {"content": "hello from Copilot"},
+                "timestamp": "2026-08-07T00:00:01Z"
+            }),
+        ];
+        std::fs::write(
+            &carrier,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let desktop_id = "aaaaaaaa-9999-9999-9999-999999999999";
+        let desktop_dir = copilot_home.join("session-state").join(desktop_id);
+        std::fs::create_dir_all(&desktop_dir).unwrap();
+        let desktop_carrier = desktop_dir.join("events.jsonl");
+        let desktop_records = [
+            json!({
+                "type": "session.start",
+                "data": {
+                    "sessionId": desktop_id,
+                    "context": {"cwd": "/redacted/copilot-desktop-targeted"}
+                },
+                "timestamp": "2026-08-07T00:02:00Z"
+            }),
+            json!({
+                "type": "user.message",
+                "data": {"content": "hello from Copilot Desktop"},
+                "timestamp": "2026-08-07T00:02:01Z"
+            }),
+        ];
+        std::fs::write(
+            &desktop_carrier,
+            desktop_records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            desktop_dir.join("workspace.yaml"),
+            "client_name: github/autopilot\nname: Desktop target\nuser_named: true\n",
+        )
+        .unwrap();
+
+        let list_output = temp.path().join("copilot-sessions.json");
+        assert_eq!(
+            run_list_sessions(&args(&[
+                "viewer",
+                "--list-sessions",
+                "--provider",
+                "copilot",
+                "--output",
+                list_output.to_str().unwrap(),
+            ])),
+            0
+        );
+        let listed: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&list_output).unwrap()).unwrap();
+
+        let metadata_output = temp.path().join("copilot-metadata.json");
+        for (id, path, entrypoint) in [
+            (
+                "99999999-9999-9999-9999-999999999999",
+                &carrier,
+                "copilot-cli",
+            ),
+            (desktop_id, &desktop_carrier, "copilot-desktop"),
+        ] {
+            let listed_row = listed
+                .iter()
+                .find(|row| row["actual_session_id"] == id)
+                .expect("the fixture should be present in unified listing");
+            assert_eq!(listed_row["entrypoint"], entrypoint);
+            let metadata_args = args(&[
+                "viewer",
+                "--session-metadata",
+                path.to_str().unwrap(),
+                "--provider",
+                "copilot",
+                "--output",
+                metadata_output.to_str().unwrap(),
+            ]);
+            assert_eq!(run_session_metadata(&metadata_args), 0);
+            let targeted: Value =
+                serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+            assert_eq!(&targeted, listed_row);
+        }
+
+        std::fs::remove_file(&carrier).unwrap();
+        let metadata_args = args(&[
+            "viewer",
+            "--session-metadata",
+            carrier.to_str().unwrap(),
+            "--provider",
+            "copilot",
+            "--output",
+            metadata_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_session_metadata(&metadata_args), 0);
+        let missing: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+        assert!(missing.is_null());
+    }
+
+    #[test]
+    #[serial]
+    fn session_metadata_matches_copilot_vscode_listing_rows_with_live_flags() {
+        let temp = TempDir::new().unwrap();
+        let copilot_home = temp.path().join("empty-copilot-home");
+        std::fs::create_dir_all(&copilot_home).unwrap();
+        let user_data = temp.path().join("vscode-user-data");
+        let workspace = user_data
+            .join("workspaceStorage")
+            .join("targeted-workspace");
+        let workspace_chats = workspace.join("chatSessions");
+        let empty_chats = user_data
+            .join("globalStorage")
+            .join("emptyWindowChatSessions");
+        std::fs::create_dir_all(&workspace_chats).unwrap();
+        std::fs::create_dir_all(&empty_chats).unwrap();
+        std::fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///redacted/vscode-targeted"}"#,
+        )
+        .unwrap();
+        let workspace_id = "vscode-workspace-target";
+        let empty_id = "vscode-empty-target";
+        for (path, id, prompt) in [
+            (
+                workspace_chats.join(format!("{workspace_id}.jsonl")),
+                workspace_id,
+                "workspace prompt",
+            ),
+            (
+                empty_chats.join(format!("{empty_id}.jsonl")),
+                empty_id,
+                "empty-window prompt",
+            ),
+        ] {
+            std::fs::write(
+                path,
+                json!({"kind": 0, "v": {
+                    "sessionId": id,
+                    "creationDate": 1779490058917u64,
+                    "requests": [{"message": {"text": prompt}, "response": []}]
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        for (db, id) in [
+            (workspace.join("state.vscdb"), workspace_id),
+            (
+                user_data.join("globalStorage").join("state.vscdb"),
+                empty_id,
+            ),
+        ] {
+            create_item_table(
+                &db,
+                &[
+                    (COPILOT_CHAT_INDEX_KEY, json!({"entries":{}})),
+                    (
+                        COPILOT_AGENT_STATE_KEY,
+                        json!([{
+                            "resource": local_chat_resource(id),
+                            "archived": true,
+                            "pinned": true
+                        }]),
+                    ),
+                ],
+            );
+        }
+        let _copilot_guard = EnvVarGuard::set("COPILOT_CLI_HOME", &copilot_home);
+        let _vscode_guard = EnvVarGuard::set("CCHV_TEST_VSCODE_USER_DATA_ROOT", &user_data);
+
+        let list_output = temp.path().join("vscode-list.json");
+        assert_eq!(
+            run_list_sessions(&args(&[
+                "viewer",
+                "--list-sessions",
+                "--provider",
+                "copilot",
+                "--output",
+                list_output.to_str().unwrap(),
+            ])),
+            0
+        );
+        let listed: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&list_output).unwrap()).unwrap();
+        let metadata_output = temp.path().join("vscode-metadata.json");
+        for id in [workspace_id, empty_id] {
+            let listed_row = listed
+                .iter()
+                .find(|row| row["actual_session_id"] == id)
+                .expect("the VS Code fixture should be listed");
+            assert_eq!(listed_row["is_orphan"], false);
+            assert_eq!(listed_row["is_archived"], true);
+            assert_eq!(listed_row["is_pinned"], true);
+            let path = listed_row["file_path"].as_str().unwrap();
+            assert_eq!(
+                run_session_metadata(&args(&[
+                    "viewer",
+                    "--session-metadata",
+                    path,
+                    "--provider",
+                    "copilot",
+                    "--output",
+                    metadata_output.to_str().unwrap(),
+                ])),
+                0
+            );
+            let targeted: Value =
+                serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+            assert_eq!(&targeted, listed_row);
+        }
+    }
+
+    #[test]
     fn session_metadata_selector_preserves_id_precedence_and_path_exactness() {
         let temp = TempDir::new().unwrap();
         let wrap = |path: &Path, id: &str| SessionWithProjectPath {
@@ -2873,6 +3148,66 @@ mod tests {
             )),
             (false, false, false)
         );
+    }
+
+    #[test]
+    fn copilot_target_wrapper_reloads_lifecycle_state_for_each_command() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspaceStorage").join("targeted");
+        let chats = workspace.join("chatSessions");
+        std::fs::create_dir_all(&chats).unwrap();
+        let db = workspace.join("state.vscdb");
+        create_item_table(
+            &db,
+            &[
+                (COPILOT_CHAT_INDEX_KEY, json!({"entries":{"target":{}}})),
+                (COPILOT_AGENT_STATE_KEY, json!([])),
+            ],
+        );
+        let target = session(
+            &chats.join("target.jsonl"),
+            "target",
+            Some(COPILOT_VSCODE_ENTRYPOINT),
+        );
+        let first = wrap_session_listing(
+            "copilot",
+            target.clone(),
+            Some("/project".to_string()),
+            &HashSet::new(),
+            &CopilotClassifier::new("copilot"),
+            &HashMap::new(),
+        );
+        assert!(!first.is_orphan);
+        assert!(!first.is_archived);
+        assert!(!first.is_pinned);
+
+        let resource = local_chat_resource("target");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE ItemTable SET value = ?1 WHERE key = ?2",
+            (json!({"entries":{}}).to_string(), COPILOT_CHAT_INDEX_KEY),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ItemTable SET value = ?1 WHERE key = ?2",
+            (
+                json!([{"resource":resource,"archived":true,"pinned":true}]).to_string(),
+                COPILOT_AGENT_STATE_KEY,
+            ),
+        )
+        .unwrap();
+
+        let refreshed = wrap_session_listing(
+            "copilot",
+            target,
+            Some("/project".to_string()),
+            &HashSet::new(),
+            &CopilotClassifier::new("copilot"),
+            &HashMap::new(),
+        );
+        assert!(!refreshed.is_orphan, "archive must suppress orphan state");
+        assert!(refreshed.is_archived);
+        assert!(refreshed.is_pinned);
     }
 
     #[test]
