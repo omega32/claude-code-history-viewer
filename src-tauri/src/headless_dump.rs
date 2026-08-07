@@ -1532,6 +1532,17 @@ async fn list_sessions(
         return Ok(wrapped);
     }
 
+    if provider == "codex" {
+        return Ok(codex::load_all_sessions()?
+            .into_iter()
+            .map(|listed| {
+                let mut wrapped = wrap(listed.session, Some(listed.project_path));
+                wrapped.is_archived = listed.is_archived;
+                wrapped
+            })
+            .collect());
+    }
+
     let projects =
         scan_all_projects(None, Some(vec![provider.to_string()]), None, None, None).await?;
     let mut all: Vec<SessionWithProjectPath> = Vec::new();
@@ -2207,6 +2218,7 @@ mod tests {
         ]);
 
         assert_eq!(run_list_sessions(&argv), 0);
+        assert_eq!(run_list_sessions(&argv), 0);
         let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         let active = rows
             .iter()
@@ -2278,6 +2290,7 @@ mod tests {
         ]);
 
         assert_eq!(run_list_sessions(&argv), 0);
+        assert_eq!(run_list_sessions(&argv), 0);
         let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["forked_from_id"], "parent-thread");
@@ -2343,7 +2356,7 @@ mod tests {
         ]);
 
         assert_eq!(run_list_sessions(&argv), 0);
-        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         let imported = rows
             .iter()
             .find(|row| row["actual_session_id"] == "imported-thread")
@@ -2356,6 +2369,36 @@ mod tests {
         assert_eq!(imported["imported_from"], "claude");
         assert_eq!(native["is_imported"], false);
         assert!(native.get("imported_from").is_none());
+
+        std::fs::write(
+            codex_home.join("external_agent_session_imports.json"),
+            serde_json::to_vec(&json!({
+                "records": [{
+                    "source_path": "/home/test/.copilot/session-state/source-session",
+                    "content_sha256": "def",
+                    "imported_thread_id": "native-thread",
+                    "imported_at": 2,
+                    "source_modified_at": 2
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(run_list_sessions(&argv), 0);
+        let refreshed: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        let former_import = refreshed
+            .iter()
+            .find(|row| row["actual_session_id"] == "imported-thread")
+            .unwrap();
+        let new_import = refreshed
+            .iter()
+            .find(|row| row["actual_session_id"] == "native-thread")
+            .unwrap();
+        assert_eq!(former_import["is_imported"], false);
+        assert!(former_import.get("imported_from").is_none());
+        assert_eq!(new_import["is_imported"], true);
+        assert_eq!(new_import["imported_from"], "copilot");
     }
 
     #[test]
