@@ -879,6 +879,7 @@ dependencies = [
  "criterion",
  "dirs 5.0.1",
  "fake",
+ "fs2",
  "futures",
  "insta",
  "lazy_static",

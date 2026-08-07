@@ -126,6 +126,14 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_sessions(&args));
         }
+        // Targeted authoritative listing metadata. A capable provider can avoid
+        // the provider-wide listing while preserving the same flattened row.
+        if args
+            .iter()
+            .any(|a| a == "--session-metadata" || a.starts_with("--session-metadata="))
+        {
+            std::process::exit(headless_dump::run_session_metadata(&args));
+        }
         // Immutable ccmsg backup listing. Unlike --list-sessions, this never
         // scans provider-owned current roots.
         if args

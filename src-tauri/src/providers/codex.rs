@@ -10,6 +10,7 @@ use crate::utils::{
 };
 use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use memchr::{memchr_iter, memmem};
 use memmap2::Mmap;
 use rusqlite::{Connection, OpenFlags};
@@ -18,8 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[cfg(test)]
@@ -330,6 +330,10 @@ fn metadata_cache_path(base_path: &Path) -> PathBuf {
     base_path.join(SESSION_METADATA_CACHE_FILENAME)
 }
 
+fn metadata_cache_lock_path(base_path: &Path) -> PathBuf {
+    base_path.join(format!("{SESSION_METADATA_CACHE_FILENAME}.lock"))
+}
+
 fn load_session_metadata_cache(base_path: &Path) -> CodexSessionMetadataCache {
     let Ok(content) = fs::read_to_string(metadata_cache_path(base_path)) else {
         return CodexSessionMetadataCache::default();
@@ -345,6 +349,22 @@ fn load_session_metadata_cache(base_path: &Path) -> CodexSessionMetadataCache {
 }
 
 fn save_session_metadata_cache(base_path: &Path, cache: &CodexSessionMetadataCache) {
+    let Ok(lock_file) = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(metadata_cache_lock_path(base_path))
+    else {
+        return;
+    };
+    if FileExt::lock_exclusive(&lock_file).is_err() {
+        return;
+    }
+    write_session_metadata_cache(base_path, cache);
+}
+
+fn write_session_metadata_cache(base_path: &Path, cache: &CodexSessionMetadataCache) {
     let Ok(content) = serde_json::to_vec(cache) else {
         return;
     };
@@ -364,6 +384,33 @@ fn save_session_metadata_cache(base_path: &Path, cache: &CodexSessionMetadataCac
     if fs::rename(&temp, &path).is_err() {
         let _ = fs::remove_file(temp);
     }
+}
+
+fn merge_session_metadata_cache_entry(
+    base_path: &Path,
+    rollout_path: &Path,
+    key: String,
+    entry: CachedSessionInfo,
+) {
+    let Ok(lock_file) = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(metadata_cache_lock_path(base_path))
+    else {
+        return;
+    };
+    if FileExt::lock_exclusive(&lock_file).is_err()
+        || session_info_fingerprint(rollout_path).as_ref() != Some(&entry.fingerprint)
+        || !is_discoverable_rollout(rollout_path)
+    {
+        return;
+    }
+    let mut latest = load_session_metadata_cache(base_path);
+    latest.version = SESSION_METADATA_CACHE_VERSION;
+    latest.entries.insert(key, entry);
+    write_session_metadata_cache(base_path, &latest);
 }
 
 fn session_info_fingerprint(path: &Path) -> Option<SessionInfoFingerprint> {
@@ -392,7 +439,7 @@ fn probe_cached_session_info(
     rollout_path: &Path,
     old: &CodexSessionMetadataCache,
     next: &mut CodexSessionMetadataCache,
-) -> Result<SessionInfo, String> {
+) -> Result<(SessionInfo, bool), String> {
     let key = session_metadata_cache_key(base_path, rollout_path);
     let before = session_info_fingerprint(rollout_path);
     if let (Some(key), Some(fingerprint)) = (key.as_ref(), before) {
@@ -401,13 +448,14 @@ fn probe_cached_session_info(
                 next.entries.insert(key.clone(), hit.clone());
                 let mut info = hit.info.clone();
                 info.file_path = rollout_path.to_string_lossy().to_string();
-                return Ok(info);
+                return Ok((info, false));
             }
         }
     }
 
     let info = extract_session_info(rollout_path)?;
     let after = session_info_fingerprint(rollout_path);
+    let mut cache_updated = false;
     if let (Some(key), Some(before), Some(after)) = (key, before, after) {
         if before == after {
             next.entries.insert(
@@ -417,9 +465,10 @@ fn probe_cached_session_info(
                     info: info.clone(),
                 },
             );
+            cache_updated = true;
         }
     }
-    Ok(info)
+    Ok((info, cache_updated))
 }
 
 // Codex generates these filenames itself, always lowercase — a
@@ -574,7 +623,7 @@ struct CachedSessionInfo {
     info: SessionInfo,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct CodexSessionMetadataCache {
     version: u32,
     entries: HashMap<String, CachedSessionInfo>,
@@ -817,7 +866,7 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
             .filter(|entry| is_discoverable_rollout(entry.path()))
         {
             let rollout_path = entry.path();
-            let Ok(info) =
+            let Ok((info, _)) =
                 probe_cached_session_info(&base_path, rollout_path, &old_cache, &mut next_cache)
             else {
                 continue;
@@ -854,6 +903,153 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
         sessions.extend(group.sessions);
     }
     Ok(sessions)
+}
+
+/// Load one Codex listing row from an exact live rollout path without walking
+/// any other rollout. Lexical and canonical confinement plus archive provenance
+/// are validated against the active/archive roots, while the exact provider path
+/// is retained for cache identity and serialized parity with `load_all_sessions`.
+pub(crate) fn load_session_metadata_by_path(
+    session_path: &str,
+) -> Result<Option<CodexSessionListing>, String> {
+    let base_path_string = get_base_path().ok_or("Codex base path not found")?;
+    crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
+    let base_path = PathBuf::from(&base_path_string);
+    let rollout_path = Path::new(session_path);
+    if !rollout_path.is_absolute() {
+        return Err("Codex session path must be a non-empty absolute path".to_string());
+    }
+    let mut root_provenance = None;
+    for (root, is_archived) in [
+        (base_path.join("sessions"), false),
+        (base_path.join("archived_sessions"), true),
+    ] {
+        let Ok(relative_path) = rollout_path.strip_prefix(&root) else {
+            continue;
+        };
+        let components: Vec<_> = relative_path.components().collect();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(format!(
+                "Session path is not an exact Codex rollout path: {session_path}"
+            ));
+        }
+        let mut exact_path = root.clone();
+        for component in &components {
+            let Component::Normal(name) = component else {
+                unreachable!("relative components were validated above");
+            };
+            exact_path.push(name);
+        }
+        if exact_path.as_os_str() != rollout_path.as_os_str() {
+            return Err(format!(
+                "Session path is not an exact Codex rollout path: {session_path}"
+            ));
+        }
+
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect Codex session directory: {error}"
+                ));
+            }
+        };
+        if !root_metadata.file_type().is_dir() || is_symlink_or_reparse(&root_metadata) {
+            return Err(format!(
+                "Codex session directory is not a direct directory: {}",
+                root.display()
+            ));
+        }
+
+        let mut current = root.clone();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(name) = component else {
+                unreachable!("relative components were validated above");
+            };
+            current.push(name);
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!("Failed to inspect session path: {error}"));
+                }
+            };
+            if is_symlink_or_reparse(&metadata) {
+                return Err(format!(
+                    "Session path contains a symbolic link or reparse point: {session_path}"
+                ));
+            }
+            let is_final = index + 1 == components.len();
+            if (is_final && !metadata.file_type().is_file())
+                || (!is_final && !metadata.file_type().is_dir())
+            {
+                return Ok(None);
+            }
+        }
+
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve Codex session directory: {error}"))?;
+        let canonical_rollout = rollout_path
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve session path: {error}"))?;
+        if !canonical_rollout.starts_with(&canonical_root) {
+            return Err(format!(
+                "Session path is outside Codex session directories: {session_path}"
+            ));
+        }
+        root_provenance = Some(is_archived);
+        break;
+    }
+    let Some(is_archived) = root_provenance else {
+        return Err(format!(
+            "Session path is outside Codex session directories: {session_path}"
+        ));
+    };
+    if !is_discoverable_rollout(rollout_path) {
+        return Ok(None);
+    }
+    let old_cache = load_session_metadata_cache(&base_path);
+    let mut next_cache = old_cache.clone();
+    next_cache.version = SESSION_METADATA_CACHE_VERSION;
+    let (info, cache_updated) =
+        probe_cached_session_info(&base_path, rollout_path, &old_cache, &mut next_cache)?;
+    if cache_updated {
+        if let Some(key) = session_metadata_cache_key(&base_path, rollout_path) {
+            if let Some(entry) = next_cache.entries.remove(&key) {
+                merge_session_metadata_cache_entry(&base_path, rollout_path, key, entry);
+            }
+        }
+    }
+    let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+    let title_index = load_native_title_index(&base_path_string);
+    let session = session_from_info(info, &project_path, &title_index);
+    Ok(Some(CodexSessionListing {
+        session,
+        project_path,
+        is_archived,
+    }))
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Load sessions for a Codex project (filtered by cwd)
@@ -3287,8 +3483,18 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
-    use std::sync::atomic::Ordering;
+    use std::sync::{atomic::Ordering, Arc, Barrier};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -3399,6 +3605,153 @@ mod tests {
 
     #[test]
     #[serial]
+    fn targeted_session_metadata_rejects_a_rollout_outside_codex_home() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        fs::create_dir_all(codex_home.join("sessions")).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let outside = write_codex_rollout(
+            tmp.path(),
+            "rollout-outside.jsonl",
+            "outside",
+            "C:/Outside",
+            "outside prompt",
+        );
+
+        let error = match load_session_metadata_by_path(outside.to_str().unwrap()) {
+            Ok(_) => panic!("outside rollout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("outside Codex session directories"));
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_rejects_parent_directory_aliases() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = write_codex_rollout(
+            &sessions_dir,
+            "rollout-parent-alias.jsonl",
+            "parent-alias",
+            "C:/Repo",
+            "parent alias prompt",
+        );
+        let aliased = sessions_dir
+            .join("..")
+            .join("sessions")
+            .join(rollout.file_name().unwrap());
+
+        let error = match load_session_metadata_by_path(aliased.to_str().unwrap()) {
+            Ok(_) => panic!("parent-directory alias should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("not an exact Codex rollout path"));
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_rejects_dot_and_redundant_separator_aliases() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        let nested_dir = sessions_dir.join("2026");
+        fs::create_dir_all(&nested_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = write_codex_rollout(
+            &nested_dir,
+            "rollout-lexical-alias.jsonl",
+            "lexical-alias",
+            "C:/Repo",
+            "lexical alias prompt",
+        );
+        let dot_alias = sessions_dir
+            .join("2026")
+            .join(".")
+            .join(rollout.file_name().unwrap());
+        let redundant_separator_alias = format!(
+            "{}{}{}2026{}{}",
+            sessions_dir.display(),
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            rollout.file_name().unwrap().to_string_lossy()
+        );
+
+        for alias in [
+            dot_alias.to_string_lossy().to_string(),
+            redundant_separator_alias,
+        ] {
+            let error = match load_session_metadata_by_path(&alias) {
+                Ok(_) => panic!("lexical alias should be rejected: {alias}"),
+                Err(error) => error,
+            };
+            assert!(error.contains("not an exact Codex rollout path"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_rejects_an_outside_symlink_alias() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = write_codex_rollout(
+            &sessions_dir,
+            "rollout-outside-alias.jsonl",
+            "outside-alias",
+            "C:/Repo",
+            "outside alias prompt",
+        );
+        let alias = tmp.path().join("sessions-alias");
+        if try_symlink_dir(&sessions_dir, &alias).is_err() {
+            return;
+        }
+        let aliased = alias.join(rollout.file_name().unwrap());
+
+        let error = match load_session_metadata_by_path(aliased.to_str().unwrap()) {
+            Ok(_) => panic!("outside symlink alias should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("outside Codex session directories"));
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_rejects_an_intermediate_symlink() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        let real_dir = sessions_dir.join("real");
+        fs::create_dir_all(&real_dir).expect("real sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = write_codex_rollout(
+            &real_dir,
+            "rollout-intermediate-alias.jsonl",
+            "intermediate-alias",
+            "C:/Repo",
+            "intermediate alias prompt",
+        );
+        let alias = sessions_dir.join("alias");
+        if try_symlink_dir(&real_dir, &alias).is_err() {
+            return;
+        }
+        let aliased = alias.join(rollout.file_name().unwrap());
+
+        let error = match load_session_metadata_by_path(aliased.to_str().unwrap()) {
+            Ok(_) => panic!("intermediate symlink should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("symbolic link or reparse point"));
+    }
+
+    #[test]
+    #[serial]
     fn all_session_metadata_cache_reuses_stable_rollouts_and_refreshes_changes() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let codex_home = tmp.path().join("codex-home");
@@ -3465,6 +3818,15 @@ mod tests {
         fs::create_dir_all(&archived_dir).expect("archive dir should be created");
         let archived_alpha = archived_dir.join("rollout-alpha.jsonl");
         fs::rename(alpha, &archived_alpha).expect("alpha should move to archive root");
+        assert!(load_session_metadata_by_path(
+            sessions_dir.join("rollout-alpha.jsonl").to_str().unwrap()
+        )
+        .expect("old active path should be a clean miss")
+        .is_none());
+        let targeted_archive = load_session_metadata_by_path(archived_alpha.to_str().unwrap())
+            .expect("archived target should load")
+            .expect("archived target should remain listed");
+        assert!(targeted_archive.is_archived);
         let after_archive = load_all_sessions().expect("archived listing should succeed");
         assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 4);
         assert_eq!(after_archive.len(), 1);
@@ -3486,13 +3848,114 @@ mod tests {
 
     #[test]
     #[serial]
-    fn all_session_metadata_cache_keeps_native_titles_live() {
+    fn targeted_session_metadata_refreshes_only_its_rollout_and_preserves_the_cache() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let codex_home = tmp.path().join("codex-home");
         let sessions_dir = codex_home.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
         let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let alpha = write_codex_rollout(
+            &sessions_dir,
+            "rollout-alpha.jsonl",
+            "alpha",
+            "C:/Repo",
+            "alpha prompt",
+        );
         write_codex_rollout(
+            &sessions_dir,
+            "rollout-beta.jsonl",
+            "beta",
+            "C:/Other",
+            "beta prompt",
+        );
+        SESSION_INFO_PARSE_COUNT.store(0, Ordering::SeqCst);
+
+        assert_eq!(load_all_sessions().unwrap().len(), 2);
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 2);
+        append_rollout_lines(
+            &alpha,
+            &[json!({
+                "timestamp": "2026-08-07T10:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "function_call", "name": "shell", "arguments": "{}" }
+            })],
+        );
+
+        let targeted = load_session_metadata_by_path(alpha.to_str().unwrap())
+            .expect("targeted metadata should load")
+            .expect("targeted session should remain listed");
+        assert_eq!(targeted.session.actual_session_id, "alpha");
+        assert_eq!(targeted.session.message_count, 2);
+        assert!(targeted.session.has_tool_use);
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 3);
+
+        let cache: CodexSessionMetadataCache = serde_json::from_slice(
+            &fs::read(metadata_cache_path(&codex_home)).expect("cache should be readable"),
+        )
+        .expect("cache should deserialize");
+        assert_eq!(cache.entries.len(), 2);
+
+        assert_eq!(load_all_sessions().unwrap().len(), 2);
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_cache_merges_concurrent_entries() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let alpha = write_codex_rollout(
+            &sessions_dir,
+            "rollout-alpha.jsonl",
+            "alpha",
+            "C:/Repo",
+            "alpha prompt",
+        );
+        let beta = write_codex_rollout(
+            &sessions_dir,
+            "rollout-beta.jsonl",
+            "beta",
+            "C:/Other",
+            "beta prompt",
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let threads = [alpha, beta].map(|rollout| {
+            let base_path = codex_home.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let key = session_metadata_cache_key(&base_path, &rollout)
+                    .expect("rollout should have a cache key");
+                let entry = CachedSessionInfo {
+                    fingerprint: session_info_fingerprint(&rollout)
+                        .expect("rollout should have a fingerprint"),
+                    info: extract_session_info(&rollout).expect("rollout should parse"),
+                };
+                barrier.wait();
+                merge_session_metadata_cache_entry(&base_path, &rollout, key, entry);
+            })
+        });
+        for thread in threads {
+            thread.join().expect("cache merge thread should finish");
+        }
+
+        let cache = load_session_metadata_cache(&codex_home);
+        assert_eq!(cache.version, SESSION_METADATA_CACHE_VERSION);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.entries.contains_key("sessions/rollout-alpha.jsonl"));
+        assert!(cache.entries.contains_key("sessions/rollout-beta.jsonl"));
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_keeps_native_titles_live() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = write_codex_rollout(
             &sessions_dir,
             "rollout-title.jsonl",
             "title-session",
@@ -3516,10 +3979,12 @@ mod tests {
                 json!({"id":"title-session","thread_name":"Renamed title"}),
             ],
         );
-        let warm = load_all_sessions().expect("warm listing should succeed");
+        let warm = load_session_metadata_by_path(rollout.to_str().unwrap())
+            .expect("targeted metadata should load")
+            .expect("targeted session should remain listed");
         assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(warm[0].session.summary.as_deref(), Some("Renamed title"));
-        assert!(warm[0].session.is_renamed);
+        assert_eq!(warm.session.summary.as_deref(), Some("Renamed title"));
+        assert!(warm.session.is_renamed);
     }
 
     #[test]
@@ -3693,6 +4158,13 @@ mod tests {
 
         let plain_path = zst_path.with_extension("");
         fs::write(&plain_path, format!("{body}\n")).expect("plain twin should be written");
+        assert!(load_session_metadata_by_path(zst_path.to_str().unwrap())
+            .expect("suppressed compressed twin should be a clean miss")
+            .is_none());
+        let targeted_plain = load_session_metadata_by_path(plain_path.to_str().unwrap())
+            .expect("plain twin target should load")
+            .expect("plain twin should remain listed");
+        assert_eq!(targeted_plain.session.actual_session_id, "cached-zst");
         let plain = load_all_sessions().expect("plain-twin listing should succeed");
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].session.file_path, plain_path.to_string_lossy());

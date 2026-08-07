@@ -121,6 +121,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "dump-backup-session",
             "list-sessions",
             "list-backup-sessions",
+            "session-metadata",
             "hide-session",
             "archive-session",
             "unarchive-session",
@@ -604,6 +605,11 @@ sessions are listed (path is the provider storage dir, e.g. a folder under\n\
 ~/.claude/projects); otherwise sessions across all of the provider's projects\n\
 are returned. Each session is also stamped with `project_path` (the decoded\n\
 project directory) when known. --provider defaults to 'claude'.";
+
+const METADATA_USAGE: &str = "Usage: --session-metadata <session-id|session-path> [--provider <name>] [--format json] [--output <file>]\n\n\
+Return one authoritative session-listing row, or null when the session is no\n\
+longer listed. An absolute Codex rollout path is loaded directly without a\n\
+provider-wide scan. --provider defaults to 'claude'.";
 
 /// The Claude Code VS Code extension "deletes" a session by adding its id to a
 /// `hiddenSessionIds` array in the editor's global-state DB — a soft hide that
@@ -1312,6 +1318,28 @@ struct SessionWithProjectPath {
     remote_session_id: Option<String>,
 }
 
+fn wrap_codex_listing(
+    listed: codex::CodexSessionListing,
+    imports: &HashMap<String, Option<String>>,
+) -> SessionWithProjectPath {
+    let imported_from = imports
+        .get(&listed.session.actual_session_id)
+        .cloned()
+        .flatten();
+    SessionWithProjectPath {
+        is_hidden: false,
+        is_orphan: false,
+        is_archived: listed.is_archived,
+        is_pinned: false,
+        is_teleported: false,
+        is_imported: imports.contains_key(&listed.session.actual_session_id),
+        imported_from,
+        remote_session_id: None,
+        session: listed.session,
+        project_path: Some(listed.project_path),
+    }
+}
+
 /// A teleport redirect stub: a Claude session whose local `.jsonl` was emptied to
 /// a single `teleported-from` record when its conversation was relocated to a
 /// cloud (web) session. The base's normal metadata scan drops such a file (it has
@@ -1535,11 +1563,7 @@ async fn list_sessions(
     if provider == "codex" {
         return Ok(codex::load_all_sessions()?
             .into_iter()
-            .map(|listed| {
-                let mut wrapped = wrap(listed.session, Some(listed.project_path));
-                wrapped.is_archived = listed.is_archived;
-                wrapped
-            })
+            .map(|listed| wrap_codex_listing(listed, &codex_imports))
             .collect());
     }
 
@@ -1581,6 +1605,112 @@ fn listed_paths(wrapped: &[SessionWithProjectPath]) -> HashSet<String> {
         .iter()
         .map(|w| w.session.file_path.clone())
         .collect()
+}
+
+fn listed_session_path_matches(row: &SessionWithProjectPath, selector: &str) -> bool {
+    if row.session.session_id == selector || row.session.file_path == selector {
+        return true;
+    }
+    let left = Path::new(&row.session.file_path);
+    let right = Path::new(selector);
+    left.is_absolute()
+        && right.is_absolute()
+        && left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn listed_session_file_stem(row: &SessionWithProjectPath) -> Option<&str> {
+    Path::new(&row.session.file_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+}
+
+fn select_session_metadata(
+    mut rows: Vec<SessionWithProjectPath>,
+    provider: &str,
+    selector: &str,
+) -> Result<Option<SessionWithProjectPath>, String> {
+    if looks_like_session_path(selector) {
+        return Ok(rows
+            .into_iter()
+            .find(|row| listed_session_path_matches(row, selector)));
+    }
+
+    let by_stem: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (listed_session_file_stem(row) == Some(selector) || row.session.session_id == selector)
+                .then_some(index)
+        })
+        .collect();
+    let by_id: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| (row.session.actual_session_id == selector).then_some(index))
+        .collect();
+    let by_prefix: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (row.session.actual_session_id.starts_with(selector)
+                || listed_session_file_stem(row).is_some_and(|value| value.starts_with(selector)))
+            .then_some(index)
+        })
+        .collect();
+    let matches = if !by_stem.is_empty() {
+        by_stem
+    } else if !by_id.is_empty() {
+        by_id
+    } else {
+        by_prefix
+    };
+    match matches.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(rows.swap_remove(*index))),
+        _ => Err(format!(
+            "'{selector}' is ambiguous — {} {provider} sessions match; use the full id or a session path",
+            matches.len()
+        )),
+    }
+}
+
+async fn session_metadata(
+    provider: &str,
+    selector: &str,
+) -> Result<Option<SessionWithProjectPath>, String> {
+    if provider == "codex" && looks_like_session_path(selector) {
+        let imports = codex::external_agent_imports();
+        return codex::load_session_metadata_by_path(selector)
+            .map(|listed| listed.map(|row| wrap_codex_listing(row, &imports)));
+    }
+    select_session_metadata(list_sessions(provider, None).await?, provider, selector)
+}
+
+/// Handle the targeted authoritative session metadata command. Returns one
+/// ordinary flattened listing row, or JSON null when no row remains listed.
+pub fn run_session_metadata(args: &[String]) -> i32 {
+    let Some(selector) = extract_flag_value(args, "--session-metadata") else {
+        eprintln!("{METADATA_USAGE}");
+        return 2;
+    };
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("{METADATA_USAGE}");
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    match block_on(session_metadata(&provider, &selector)) {
+        Ok(row) => emit_json(args, &row),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
 }
 
 /// Handle the `--list-sessions` CLI flag. Returns the process exit code.
@@ -1699,7 +1829,10 @@ mod tests {
             json!([
                 "dump-session",
                 "dump-session-snapshot",
+                "dump-backup-session",
                 "list-sessions",
+                "list-backup-sessions",
+                "session-metadata",
                 "hide-session",
                 "archive-session",
                 "unarchive-session",
@@ -2399,6 +2532,154 @@ mod tests {
         assert!(former_import.get("imported_from").is_none());
         assert_eq!(new_import["is_imported"], true);
         assert_eq!(new_import["imported_from"], "copilot");
+    }
+
+    #[test]
+    #[serial]
+    fn session_metadata_matches_the_codex_listing_row_and_keeps_import_state_live() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let archived_dir = codex_home.join("archived_sessions");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout = archived_dir.join("rollout-targeted.jsonl");
+        let records = [
+            json!({"type":"session_meta","payload":{"id":"targeted-thread","cwd":"/redacted/project","source":"vscode"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","created_at":"2026-08-07T00:00:00Z","content":[{"type":"input_text","text":"hello"}]}}),
+        ];
+        std::fs::write(
+            &rollout,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("external_agent_session_imports.json"),
+            serde_json::to_vec(&json!({
+                "records": [{
+                    "source_path": "/home/test/.claude/projects/source.jsonl",
+                    "content_sha256": "abc",
+                    "imported_thread_id": "targeted-thread",
+                    "imported_at": 1,
+                    "source_modified_at": 1
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let list_output = temp.path().join("sessions.json");
+        let list_args = args(&[
+            "viewer",
+            "--list-sessions",
+            "--provider",
+            "codex",
+            "--output",
+            list_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_list_sessions(&list_args), 0);
+        let listed: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&list_output).unwrap()).unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let metadata_output = temp.path().join("metadata.json");
+        let metadata_args = args(&[
+            "viewer",
+            "--session-metadata",
+            rollout.to_str().unwrap(),
+            "--provider",
+            "codex",
+            "--output",
+            metadata_output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_session_metadata(&metadata_args), 0);
+        let targeted: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+        assert_eq!(targeted, listed[0]);
+        assert_eq!(targeted["is_archived"], true);
+        assert_eq!(targeted["is_imported"], true);
+        assert_eq!(targeted["imported_from"], "claude");
+
+        std::fs::write(
+            codex_home.join("external_agent_session_imports.json"),
+            serde_json::to_vec(&json!({ "records": [] })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(run_session_metadata(&metadata_args), 0);
+        let refreshed: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+        assert_eq!(refreshed["is_imported"], false);
+        assert!(refreshed.get("imported_from").is_none());
+
+        std::fs::remove_file(&rollout).unwrap();
+        assert_eq!(run_session_metadata(&metadata_args), 0);
+        let missing: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+        assert!(missing.is_null());
+    }
+
+    #[test]
+    fn session_metadata_selector_preserves_id_precedence_and_path_exactness() {
+        let temp = TempDir::new().unwrap();
+        let wrap = |path: &Path, id: &str| SessionWithProjectPath {
+            session: session(path, id, None),
+            project_path: Some("/project".to_string()),
+            is_hidden: false,
+            is_orphan: false,
+            is_archived: false,
+            is_pinned: false,
+            is_teleported: false,
+            is_imported: false,
+            imported_from: None,
+            remote_session_id: None,
+        };
+        let main_path = temp.path().join("thread-abc.jsonl");
+        let side_path = temp.path().join("agent-sidechain.jsonl");
+
+        let main = select_session_metadata(
+            vec![
+                wrap(&main_path, "thread-abc"),
+                wrap(&side_path, "thread-abc"),
+            ],
+            "claude",
+            "thread-abc",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(main.session.file_path, main_path.to_string_lossy());
+
+        let side = select_session_metadata(
+            vec![
+                wrap(&main_path, "thread-abc"),
+                wrap(&side_path, "thread-abc"),
+            ],
+            "claude",
+            side_path.to_str().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(side.session.file_path, side_path.to_string_lossy());
+
+        let ambiguous = match select_session_metadata(
+            vec![
+                wrap(&main_path, "thread-abc"),
+                wrap(&side_path, "thread-abc"),
+            ],
+            "claude",
+            "thread",
+        ) {
+            Ok(_) => panic!("ambiguous prefix should be rejected"),
+            Err(error) => error,
+        };
+        assert!(ambiguous.contains("ambiguous"));
+        assert!(
+            select_session_metadata(vec![wrap(&main_path, "thread-abc")], "claude", "missing")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
