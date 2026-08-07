@@ -2,7 +2,7 @@ use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{
     ClaudeMessage, ClaudeProject, ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage,
-    TokenUsage,
+    SubagentProvenance, TokenUsage,
 };
 use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
@@ -444,6 +444,9 @@ pub(crate) struct SessionInfo {
     pub(crate) entrypoint: Option<String>,
     /// Authoritative parent id from the rollout's first `session_meta`.
     pub(crate) forked_from_id: Option<String>,
+    /// Authenticated child-agent identity and fork boundary from the rollout's
+    /// first `session_meta` only.
+    pub(crate) subagent_provenance: Option<SubagentProvenance>,
     #[allow(dead_code)]
     pub(crate) model: Option<String>,
     pub(crate) message_count: usize,
@@ -484,6 +487,39 @@ fn codex_entrypoint(source: Option<&Value>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn codex_subagent_provenance(
+    timestamp: Option<&Value>,
+    source: Option<&Value>,
+) -> Option<SubagentProvenance> {
+    let spawned_at = timestamp?.as_str()?.trim();
+    if spawned_at.is_empty() || DateTime::parse_from_rfc3339(spawned_at).is_err() {
+        return None;
+    }
+
+    let thread_spawn = source?
+        .as_object()?
+        .get("subagent")?
+        .as_object()?
+        .get("thread_spawn")?
+        .as_object()?;
+    let agent_path = thread_spawn.get("agent_path")?.as_str()?.trim();
+    if agent_path.is_empty() {
+        return None;
+    }
+    let agent_nickname = thread_spawn
+        .get("agent_nickname")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|nickname| !nickname.is_empty())
+        .map(String::from);
+
+    Some(SubagentProvenance {
+        spawned_at: spawned_at.to_string(),
+        agent_path: agent_path.to_string(),
+        agent_nickname,
+    })
 }
 
 /// Lightweight metadata used by project-level scans.
@@ -641,6 +677,7 @@ pub fn load_sessions(
                     storage_type: None,
                     entrypoint: info.entrypoint,
                     forked_from_id: info.forked_from_id,
+                    subagent_provenance: info.subagent_provenance,
                 });
             }
         }
@@ -680,6 +717,7 @@ pub(crate) fn load_offline_session_metadata(
             storage_type: None,
             entrypoint: info.entrypoint,
             forked_from_id: info.forked_from_id,
+            subagent_provenance: info.subagent_provenance,
         },
         project_path,
     ))
@@ -1819,6 +1857,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     let mut cwd = None;
     let mut source = None;
     let mut forked_from_id = None;
+    let mut subagent_provenance = None;
     let mut turn_context_cwd = None;
     let mut model = None;
     let mut message_count = 0usize;
@@ -1857,6 +1896,8 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                         .and_then(|v| v.as_str())
                         .map(String::from);
                     source = payload.get("source").cloned();
+                    subagent_provenance =
+                        codex_subagent_provenance(val.get("timestamp"), payload.get("source"));
                     forked_from_id = payload
                         .get("forked_from_id")
                         .and_then(|v| v.as_str())
@@ -1968,6 +2009,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
         cwd,
         entrypoint: codex_entrypoint(source.as_ref()),
         forked_from_id,
+        subagent_provenance,
         model,
         message_count,
         first_message_time: first_time,
@@ -6469,8 +6511,110 @@ mod tests {
 
         assert_eq!(info.entrypoint.as_deref(), Some("codex-subagent"));
         assert_eq!(info.forked_from_id.as_deref(), Some("sess-parent"));
+        let provenance = info
+            .subagent_provenance
+            .expect("valid thread_spawn metadata should expose provenance");
+        assert_eq!(provenance.spawned_at, "2026-05-13T08:00:00Z");
+        assert_eq!(provenance.agent_path, "/root/research");
+        assert_eq!(provenance.agent_nickname.as_deref(), Some("Parfit"));
         assert_eq!(codex_entrypoint(Some(&json!({ "subagent": {} }))), None);
         assert_eq!(codex_entrypoint(Some(&json!({ "future": {} }))), None);
+    }
+
+    #[test]
+    fn extract_session_info_omits_malformed_subagent_provenance() {
+        let invalid_meta = [
+            json!({
+                "timestamp": "",
+                "type": "session_meta",
+                "payload": {
+                    "id": "missing-time",
+                    "cwd": "/tmp/proj",
+                    "source": { "subagent": { "thread_spawn": {
+                        "agent_path": "/root/research",
+                        "agent_nickname": "Parfit"
+                    } } }
+                }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "missing-path",
+                    "cwd": "/tmp/proj",
+                    "source": { "subagent": { "thread_spawn": {
+                        "agent_nickname": "Parfit"
+                    } } }
+                }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "unknown-source",
+                    "cwd": "/tmp/proj",
+                    "source": { "future": {} }
+                }
+            }),
+        ];
+
+        for meta in invalid_meta {
+            let info = run_extract_session_info_on_lines(vec![meta]);
+            assert_eq!(info.subagent_provenance, None);
+        }
+
+        let info = run_extract_session_info_on_lines(vec![json!({
+            "timestamp": "2026-05-13T08:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "malformed-nickname",
+                "cwd": "/tmp/proj",
+                "source": { "subagent": { "thread_spawn": {
+                    "agent_path": "/root/research",
+                    "agent_nickname": 42
+                } } }
+            }
+        })]);
+        assert_eq!(
+            info.subagent_provenance.unwrap().agent_nickname,
+            None,
+            "a malformed optional nickname should be omitted without losing valid provenance"
+        );
+    }
+
+    #[test]
+    fn extract_session_info_keeps_first_subagent_provenance() {
+        let info = run_extract_session_info_on_lines(vec![
+            json!({
+                "timestamp": "2026-05-13T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "sess-child",
+                    "cwd": "/tmp/proj",
+                    "source": { "subagent": { "thread_spawn": {
+                        "agent_path": "/root/implement",
+                        "agent_nickname": "Singer"
+                    } } }
+                }
+            }),
+            json!({
+                "timestamp": "2026-05-12T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "sess-parent",
+                    "cwd": "/tmp/older",
+                    "source": { "subagent": { "thread_spawn": {
+                        "agent_path": "/root/replayed",
+                        "agent_nickname": "Wrong"
+                    } } }
+                }
+            }),
+        ]);
+
+        let provenance = info.subagent_provenance.unwrap();
+        assert_eq!(provenance.spawned_at, "2026-05-13T08:00:00Z");
+        assert_eq!(provenance.agent_path, "/root/implement");
+        assert_eq!(provenance.agent_nickname.as_deref(), Some("Singer"));
     }
 
     #[test]

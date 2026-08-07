@@ -152,6 +152,7 @@ fn load_sessions_conn(conn: &Connection, project_dir: &str) -> Result<Vec<Claude
                 storage_type: Some("sqlite".to_string()),
                 entrypoint: None,
                 forked_from_id: None,
+                subagent_provenance: None,
             }
         })
         .collect();

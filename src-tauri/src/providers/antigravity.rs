@@ -423,6 +423,7 @@ pub fn load_sessions(path: &str, _exclude_sidechain: bool) -> Result<Vec<ClaudeS
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 

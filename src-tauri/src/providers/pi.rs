@@ -187,6 +187,7 @@ pub(crate) fn load_sessions_of(
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 

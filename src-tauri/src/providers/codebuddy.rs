@@ -804,6 +804,7 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
         storage_type: None,
         entrypoint: Some("cli".to_string()),
         forked_from_id: None,
+        subagent_provenance: None,
     })
 }
 

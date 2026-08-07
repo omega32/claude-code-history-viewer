@@ -61,6 +61,15 @@ export interface ClaudeProject {
   custom_directory_label?: string;
 }
 
+export interface SubagentProvenance {
+  /** Top-level timestamp of the child's first Codex session_meta record. */
+  spawned_at: string;
+  /** Stable path assigned by the spawning agent tree. */
+  agent_path: string;
+  /** Human-readable Codex agent nickname, when supplied. */
+  agent_nickname?: string;
+}
+
 export interface ClaudeSession {
   session_id: string; // Unique ID based on file path
   actual_session_id: string; // Actual session ID from the messages
@@ -90,6 +99,8 @@ export interface ClaudeSession {
   entrypoint?: string;
   /** Parent session id for a provider-reported fork (currently Codex). */
   forked_from_id?: string;
+  /** Structurally authenticated child-agent identity and fork boundary. */
+  subagent_provenance?: SubagentProvenance;
 }
 
 export interface SessionPage {

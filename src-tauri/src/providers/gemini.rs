@@ -198,6 +198,7 @@ pub fn load_sessions(
             storage_type: Some("json".to_string()),
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 

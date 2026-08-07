@@ -171,6 +171,7 @@ pub fn load_sessions_from_base_path(
             storage_type: Some("jsonl".to_string()),
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 

@@ -392,6 +392,7 @@ fn extract_session_info(file_path: &Path, project_name: &str) -> Option<ClaudeSe
         storage_type: Some("json".to_string()),
         entrypoint: None,
         forked_from_id: None,
+        subagent_provenance: None,
     })
 }
 

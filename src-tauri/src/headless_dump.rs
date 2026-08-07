@@ -1409,6 +1409,7 @@ fn synthesize_teleport_session(
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         },
         project_path,
         is_hidden,
@@ -1647,6 +1648,7 @@ mod tests {
             storage_type: None,
             entrypoint: entrypoint.map(str::to_string),
             forked_from_id: None,
+            subagent_provenance: None,
         }
     }
 
@@ -2216,6 +2218,77 @@ mod tests {
             .unwrap();
         assert_eq!(active["is_archived"], false);
         assert_eq!(archived["is_archived"], true);
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_serializes_codex_subagent_provenance() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let output = temp.path().join("sessions.json");
+        let records = [
+            json!({
+                "timestamp": "2026-08-07T04:54:54.433Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "child-thread",
+                    "cwd": "/redacted/project",
+                    "forked_from_id": "parent-thread",
+                    "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "parent-thread",
+                        "agent_path": "/root/base_provenance",
+                        "agent_nickname": "Singer"
+                    } } }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-07T04:54:55Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type":"input_text","text":"implement"}]
+                }
+            }),
+        ];
+        let content = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join("rollout-2026-08-07T00-00-00-child-thread.jsonl"),
+            format!("{content}\n"),
+        )
+        .unwrap();
+        let argv = args(&[
+            "viewer",
+            "--list-sessions",
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_sessions(&argv), 0);
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["forked_from_id"], "parent-thread");
+        assert_eq!(
+            rows[0]["subagent_provenance"],
+            json!({
+                "spawned_at": "2026-08-07T04:54:54.433Z",
+                "agent_path": "/root/base_provenance",
+                "agent_nickname": "Singer"
+            })
+        );
     }
 
     #[test]

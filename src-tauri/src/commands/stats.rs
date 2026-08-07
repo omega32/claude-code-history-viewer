@@ -4996,6 +4996,7 @@ mod tests {
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         };
 
         let (billing_stats, _) =

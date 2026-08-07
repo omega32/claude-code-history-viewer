@@ -518,6 +518,7 @@ pub fn load_sessions(
             storage_type: None,
             entrypoint: Some(info.client_kind.entrypoint().to_string()),
             forked_from_id: None,
+            subagent_provenance: None,
         })
         .collect();
 
@@ -555,6 +556,7 @@ pub(crate) fn load_offline_session_metadata(
             storage_type: None,
             entrypoint: Some(info.client_kind.entrypoint().to_string()),
             forked_from_id: None,
+            subagent_provenance: None,
         },
         project_path,
     ))

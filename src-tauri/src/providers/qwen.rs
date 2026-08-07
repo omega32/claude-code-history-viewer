@@ -209,6 +209,7 @@ pub fn load_sessions(
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 

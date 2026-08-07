@@ -79,6 +79,24 @@ pub struct ClaudeSession {
     /// providers and native sessions leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<String>,
+    /// Provider-authenticated provenance for a spawned sub-agent session.
+    ///
+    /// Codex derives this only from the rollout's first
+    /// `session_meta.payload.source.subagent.thread_spawn` object. The direct
+    /// parent remains available separately as `forked_from_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_provenance: Option<SubagentProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentProvenance {
+    /// Top-level timestamp of the child's first `session_meta` record.
+    pub spawned_at: String,
+    /// Stable path assigned by the spawning agent tree (for example `/root/research`).
+    pub agent_path: String,
+    /// Human-readable agent nickname, when the provider supplied a non-empty value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,10 +131,12 @@ mod tests {
             storage_type: None,
             entrypoint: None,
             forked_from_id: None,
+            subagent_provenance: None,
         };
 
         let serialized = serde_json::to_string(&session).unwrap();
         assert!(!serialized.contains("forked_from_id"));
+        assert!(!serialized.contains("subagent_provenance"));
         let deserialized: ClaudeSession = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.project_name, "my-project");
@@ -144,5 +164,6 @@ mod tests {
 
         let session: ClaudeSession = serde_json::from_str(json).unwrap();
         assert_eq!(session.forked_from_id, None);
+        assert_eq!(session.subagent_provenance, None);
     }
 }

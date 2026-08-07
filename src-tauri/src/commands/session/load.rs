@@ -712,6 +712,7 @@ fn extract_session_metadata_internal(
             storage_type: None,
             entrypoint,
             forked_from_id: None,
+            subagent_provenance: None,
         },
         project_path: session_cwd,
         sidechain_count,

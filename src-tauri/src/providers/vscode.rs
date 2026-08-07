@@ -573,6 +573,7 @@ fn load_sessions_from_chat_dir(
             storage_type: None,
             entrypoint: Some(ENTRYPOINT.to_string()),
             forked_from_id: None,
+            subagent_provenance: None,
         });
     }
 
@@ -607,6 +608,7 @@ pub(crate) fn load_offline_session_metadata(
         storage_type: None,
         entrypoint: Some(ENTRYPOINT.to_string()),
         forked_from_id: None,
+        subagent_provenance: None,
     })
 }
 
