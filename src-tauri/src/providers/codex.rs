@@ -36,7 +36,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 3;
+const SNAPSHOT_CURSOR_VERSION: u32 = 4;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -50,6 +50,8 @@ struct CodexParserState {
     prev_cached_tokens: u32,
     prev_cache_write_tokens: u32,
     prev_reasoning_tokens: u32,
+    #[serde(default)]
+    pending_usage: CodexTokenUsage,
     msg_counter: u64,
 }
 
@@ -64,6 +66,7 @@ impl CodexParserState {
             prev_cached_tokens: 0,
             prev_cache_write_tokens: 0,
             prev_reasoning_tokens: 0,
+            pending_usage: CodexTokenUsage::default(),
             msg_counter: 0,
         }
     }
@@ -1418,6 +1421,16 @@ fn parse_rollout_slice(
                             usage
                         };
 
+                        // A cumulative snapshot can repeat without any new model output,
+                        // especially in the bookkeeping sequence around compaction. It
+                        // does not describe a zero-token visible assistant response. Keep
+                        // any input/cache delta pending until output advances, then attach
+                        // the combined invocation usage to the actual assistant record.
+                        state.pending_usage.accumulate(delta);
+                        if delta.output == 0 {
+                            continue;
+                        }
+
                         // Apply to the last assistant message without usage.
                         if resumed && active_turn_id.is_none() {
                             return Err(());
@@ -1429,8 +1442,10 @@ fn parse_rollout_slice(
                                 message.message_type == "assistant" && message.usage.is_none()
                             })
                         else {
+                            state.pending_usage = CodexTokenUsage::default();
                             continue;
                         };
+                        let delta = std::mem::take(&mut state.pending_usage);
 
                         // Separate non-cached input from cached input for correct billing.
                         // OpenAI's input_tokens includes cached_input_tokens as a subset,
@@ -3093,13 +3108,29 @@ fn codex_inference_settings(settings: &Value) -> InferenceMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 struct CodexTokenUsage {
     input: u32,
     output: u32,
     cached: Option<u32>,
     cache_write: Option<u32>,
     reasoning: Option<u32>,
+}
+
+impl CodexTokenUsage {
+    fn accumulate(&mut self, usage: Self) {
+        let accumulate_optional = |current: &mut Option<u32>, incoming: Option<u32>| {
+            if let Some(incoming) = incoming {
+                *current = Some(current.unwrap_or(0).saturating_add(incoming));
+            }
+        };
+
+        self.input = self.input.saturating_add(usage.input);
+        self.output = self.output.saturating_add(usage.output);
+        accumulate_optional(&mut self.cached, usage.cached);
+        accumulate_optional(&mut self.cache_write, usage.cache_write);
+        accumulate_optional(&mut self.reasoning, usage.reasoning);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5022,6 +5053,140 @@ mod tests {
                 ..CodexTokenUsage::default()
             })
         );
+    }
+
+    #[test]
+    fn zero_output_token_snapshots_wait_for_real_model_output() {
+        let tmp = TempDir::new().expect("temp dir");
+        let rollout_path = tmp
+            .path()
+            .join("rollout-2026-08-09-zero-token-snapshot.jsonl");
+        let lines = [
+            json!({"timestamp":"2026-08-09T10:00:00Z","type":"session_meta","payload":{"id":"zero-token-snapshot"}}),
+            json!({"timestamp":"2026-08-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-08-09T10:00:02Z","type":"response_item","payload":{"id":"intro","type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect it."}]}}),
+            json!({"timestamp":"2026-08-09T10:00:03Z","type":"response_item","payload":{"id":"tool-call","type":"custom_tool_call","name":"exec","call_id":"call-1","input":"pwd"}}),
+            json!({"timestamp":"2026-08-09T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"done"}}),
+            json!({"timestamp":"2026-08-09T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":20}}}}),
+            json!({"timestamp":"2026-08-09T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-08-09T10:00:07Z","type":"compacted","payload":{"replacement_history":[{"type":"summary"}]}}),
+            json!({"timestamp":"2026-08-09T10:00:08Z","type":"world_state","payload":{}}),
+            json!({"timestamp":"2026-08-09T10:00:09Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}),
+            json!({"timestamp":"2026-08-09T10:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":20}}}}),
+            json!({"timestamp":"2026-08-09T10:00:11Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+            json!({"timestamp":"2026-08-09T10:00:12Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":35,"output_tokens":20}}}}),
+            json!({"timestamp":"2026-08-09T10:00:13Z","type":"response_item","payload":{"id":"final","type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}),
+            json!({"timestamp":"2026-08-09T10:00:14Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"cached_input_tokens":45,"output_tokens":30}}}}),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("write rollout");
+
+        let messages = parse_rollout_file(&rollout_path).expect("parse rollout");
+        let intro = messages
+            .iter()
+            .find(|message| message.uuid == "intro")
+            .expect("intro message");
+        assert!(intro.usage.is_none());
+
+        let tool = messages
+            .iter()
+            .find(|message| message.uuid == "tool-call")
+            .expect("tool call");
+        assert_eq!(
+            tool.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(20)
+        );
+
+        let final_message = messages
+            .iter()
+            .find(|message| message.uuid == "final")
+            .expect("final message");
+        let usage = final_message.usage.as_ref().expect("combined usage");
+        assert_eq!(usage.input_tokens, Some(55));
+        assert_eq!(usage.cache_read_input_tokens, Some(25));
+        assert_eq!(usage.output_tokens, Some(10));
+        let inference_usage = final_message
+            .inference
+            .as_ref()
+            .and_then(|inference| inference.usage.as_ref())
+            .expect("detailed combined usage");
+        assert_eq!(inference_usage.input_tokens, Some(80));
+        assert_eq!(inference_usage.cached_input_tokens, Some(25));
+        assert_eq!(inference_usage.output_tokens, Some(10));
+        assert!(messages.iter().all(|message| {
+            message.usage.as_ref().and_then(|usage| usage.output_tokens) != Some(0)
+        }));
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_cursor_preserves_pending_zero_output_usage() {
+        let tmp = TempDir::new().expect("temp dir");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir
+            .join("rollout-2026-08-09T10-00-00-snapshot-pending-zero-output-usage.jsonl");
+        fs::write(&rollout_path, "").expect("empty rollout");
+        append_rollout_lines(
+            &rollout_path,
+            &[
+                json!({"timestamp":"2026-08-09T10:00:00Z","type":"session_meta","payload":{"id":"snapshot-pending-zero-output-usage"}}),
+                json!({"timestamp":"2026-08-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+                json!({"timestamp":"2026-08-09T10:00:02Z","type":"response_item","payload":{"id":"first","type":"message","role":"assistant","content":[{"type":"output_text","text":"First."}]}}),
+                json!({"timestamp":"2026-08-09T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":20}}}}),
+                json!({"timestamp":"2026-08-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
+                json!({"timestamp":"2026-08-09T10:00:05Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+                json!({"timestamp":"2026-08-09T10:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":35,"output_tokens":20}}}}),
+                json!({"timestamp":"2026-08-09T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2"}}),
+            ],
+        );
+        let path_text = rollout_path.to_string_lossy();
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+
+        append_rollout_lines(
+            &rollout_path,
+            &[
+                json!({"timestamp":"2026-08-09T10:00:08Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}),
+                json!({"timestamp":"2026-08-09T10:00:09Z","type":"response_item","payload":{"id":"final","type":"message","role":"assistant","content":[{"type":"output_text","text":"Final."}]}}),
+                json!({"timestamp":"2026-08-09T10:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"cached_input_tokens":45,"output_tokens":30}}}}),
+                json!({"timestamp":"2026-08-09T10:00:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3"}}),
+            ],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("usage delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("appended usage should produce a replacement"),
+        }
+        assert_snapshot_matches_fresh(&cached, &rollout_path);
+        let final_message = cached
+            .iter()
+            .find(|message| message.uuid == "final")
+            .expect("final message");
+        let usage = final_message.usage.as_ref().expect("combined usage");
+        assert_eq!(usage.input_tokens, Some(55));
+        assert_eq!(usage.cache_read_input_tokens, Some(25));
+        assert_eq!(usage.output_tokens, Some(10));
     }
 
     #[test]
