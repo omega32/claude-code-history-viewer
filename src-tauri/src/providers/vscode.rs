@@ -1536,6 +1536,10 @@ fn build_assistant_message(
     let usage = req
         .get("completionTokens")
         .and_then(Value::as_u64)
+        // Some third-party model adapters persist zero when token accounting is
+        // unavailable. This function already requires a non-empty visible response,
+        // so zero is an absence sentinel rather than an authoritative usage count.
+        .filter(|out| *out > 0)
         .map(|out| TokenUsage {
             input_tokens: None,
             output_tokens: Some(out as u32),
@@ -2345,6 +2349,25 @@ mod tests {
         assert_eq!(blocks[2]["id"], "tc-1");
         assert_eq!(blocks[3]["tool_use_id"], "tc-1");
         assert!(msgs[1].tool_use.is_some());
+    }
+
+    #[test]
+    fn messages_treat_zero_completion_tokens_as_unavailable() {
+        let state = json!({
+            "sessionId": "sess-zero-usage",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "completionTokens": 0,
+                "message": {"text": "Answer this"},
+                "response": [{"value": "A substantial answer."}]
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].usage.is_none());
     }
 
     #[test]
