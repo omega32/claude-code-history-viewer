@@ -1466,6 +1466,15 @@ fn build_assistant_message(
                 if let Some(command) = terminal_command_line(part) {
                     input.insert("command".to_string(), Value::String(command));
                 }
+                // Search tools omit structured arguments from the serialized part,
+                // while the request metadata retains their native call. Recover only
+                // the allowlisted observed fields from one exact/name-correlated call;
+                // any serialized projection added here later remains authoritative.
+                if let Some(arguments) = metadata_search_arguments(req, &tool_id, &call_id) {
+                    for (key, value) in arguments {
+                        input.entry(key).or_insert(value);
+                    }
+                }
                 // The to-do tool (`manage_todo_list`) carries its structured list
                 // in `toolSpecificData.todoList` — surface it beside the prose
                 // `message` so the consumer can render a real checklist instead of
@@ -1913,6 +1922,61 @@ fn metadata_hidden_edit_file_path(
         "copilot_replaceString" => "replace_string_in_file",
         _ => return None,
     };
+    metadata_tool_arguments(req, metadata_tool_name, serialized_call_id)?
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(String::from)
+}
+
+/// Structured search arguments omitted by VS Code's serialized response parts.
+/// Only the two observed built-in tool mappings and their stable primitive fields
+/// are projected. A malformed optional field rejects the complete fallback so a
+/// partially trusted argument set is never emitted.
+fn metadata_search_arguments(
+    req: &Value,
+    serialized_tool_id: &str,
+    serialized_call_id: &str,
+) -> Option<serde_json::Map<String, Value>> {
+    let metadata_tool_name = match serialized_tool_id {
+        "copilot_findFiles" => "file_search",
+        "copilot_findTextInFiles" => "grep_search",
+        _ => return None,
+    };
+    let arguments = metadata_tool_arguments(req, metadata_tool_name, serialized_call_id)?;
+    let query = arguments
+        .get("query")?
+        .as_str()
+        .filter(|query| !query.is_empty())?;
+    let mut projected = serde_json::Map::new();
+    projected.insert("query".to_string(), Value::String(query.to_string()));
+
+    if metadata_tool_name == "grep_search" {
+        if let Some(value) = arguments.get("includePattern") {
+            let include_pattern = value.as_str()?;
+            if !include_pattern.is_empty() {
+                projected.insert(
+                    "includePattern".to_string(),
+                    Value::String(include_pattern.to_string()),
+                );
+            }
+        }
+        if let Some(value) = arguments.get("isRegexp") {
+            projected.insert("isRegexp".to_string(), Value::Bool(value.as_bool()?));
+        }
+    }
+
+    Some(projected)
+}
+
+/// Return the parsed arguments of one uniquely correlated native metadata call.
+/// VS Code can persist arguments either as an object or as a JSON string and adds
+/// an internal suffix to native call ids; ambiguity and malformed JSON fail closed.
+fn metadata_tool_arguments(
+    req: &Value,
+    metadata_tool_name: &str,
+    serialized_call_id: &str,
+) -> Option<serde_json::Map<String, Value>> {
     let rounds = req
         .get("result")?
         .get("metadata")?
@@ -1936,17 +2000,8 @@ fn metadata_hidden_edit_file_path(
 
     let arguments = call.get("arguments")?;
     match arguments {
-        Value::Object(map) => map
-            .get("filePath")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-            .map(String::from),
-        Value::String(raw) => serde_json::from_str::<Value>(raw)
-            .ok()?
-            .get("filePath")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-            .map(String::from),
+        Value::Object(map) => Some(map.clone()),
+        Value::String(raw) => serde_json::from_str(raw).ok(),
         _ => None,
     }
 }
@@ -2873,6 +2928,125 @@ mod tests {
         );
         assert_eq!(
             metadata_hidden_edit_file_path(&request, "copilot_readFile", "tc-edit"),
+            None
+        );
+    }
+
+    #[test]
+    fn search_tools_fall_back_to_correlated_metadata_arguments() {
+        let state = json!({
+            "sessionId": "sess-search-arguments",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "message": {"text": "search"},
+                "response": [
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_findFiles",
+                        "toolCallId": "tc-files",
+                        "invocationMessage": {"value": "Searching for files"},
+                        "isComplete": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_findTextInFiles",
+                        "toolCallId": "tc-grep",
+                        "invocationMessage": {"value": "Searching for text"},
+                        "isComplete": true
+                    }
+                ],
+                "result": {"metadata": {"toolCallRounds": [{"toolCalls": [
+                    {
+                        "id": "tc-files__vscode-1",
+                        "name": "file_search",
+                        "arguments": "{\"query\":\"**/SECURITY*\",\"ignored\":\"value\"}"
+                    },
+                    {
+                        "id": "tc-grep__vscode-2",
+                        "name": "grep_search",
+                        "arguments": {
+                            "query": "Read-JsoncAsJson",
+                            "includePattern": "Get-OpenSshStatus.ps1",
+                            "isRegexp": false,
+                            "ignored": 10
+                        }
+                    }
+                ]}]}}
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        let blocks = messages[1].content.as_ref().unwrap().as_array().unwrap();
+        let file_search = blocks
+            .iter()
+            .find(|block| block["name"] == "copilot_findFiles")
+            .unwrap();
+        assert_eq!(file_search["input"]["query"], "**/SECURITY*");
+        assert_eq!(file_search["input"]["message"], "Searching for files");
+        assert!(file_search["input"].get("ignored").is_none());
+        assert!(file_search["input"].get("includePattern").is_none());
+
+        let grep_search = blocks
+            .iter()
+            .find(|block| block["name"] == "copilot_findTextInFiles")
+            .unwrap();
+        assert_eq!(grep_search["input"]["query"], "Read-JsoncAsJson");
+        assert_eq!(
+            grep_search["input"]["includePattern"],
+            "Get-OpenSshStatus.ps1"
+        );
+        assert_eq!(grep_search["input"]["isRegexp"], false);
+        assert!(grep_search["input"].get("ignored").is_none());
+    }
+
+    #[test]
+    fn search_metadata_fallback_rejects_ambiguous_and_malformed_arguments() {
+        let ambiguous = json!({
+            "result": {"metadata": {"toolCallRounds": [{"toolCalls": [
+                {"id": "tc-files", "name": "file_search", "arguments": {"query": "first"}},
+                {"id": "tc-files__vscode-2", "name": "file_search", "arguments": {"query": "second"}}
+            ]}]}}
+        });
+        assert_eq!(
+            metadata_search_arguments(&ambiguous, "copilot_findFiles", "tc-files"),
+            None
+        );
+
+        let wrong_name = json!({
+            "result": {"metadata": {"toolCallRounds": [{"toolCalls": [{
+                "id": "tc-files__vscode-1",
+                "name": "grep_search",
+                "arguments": {"query": "needle"}
+            }]}]}}
+        });
+        assert_eq!(
+            metadata_search_arguments(&wrong_name, "copilot_findFiles", "tc-files"),
+            None
+        );
+
+        let malformed_json = json!({
+            "result": {"metadata": {"toolCallRounds": [{"toolCalls": [{
+                "id": "tc-files__vscode-1",
+                "name": "file_search",
+                "arguments": "not json"
+            }]}]}}
+        });
+        assert_eq!(
+            metadata_search_arguments(&malformed_json, "copilot_findFiles", "tc-files"),
+            None
+        );
+
+        let malformed_optional = json!({
+            "result": {"metadata": {"toolCallRounds": [{"toolCalls": [{
+                "id": "tc-grep__vscode-1",
+                "name": "grep_search",
+                "arguments": {"query": "needle", "isRegexp": "false"}
+            }]}]}}
+        });
+        assert_eq!(
+            metadata_search_arguments(&malformed_optional, "copilot_findTextInFiles", "tc-grep"),
             None
         );
     }
