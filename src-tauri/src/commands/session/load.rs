@@ -2245,6 +2245,55 @@ pub struct SubagentSession {
     /// them to the spawning `Workflow` tool call via this run id instead
     /// (the `tool_result` text contains the run's transcript dir) — #449.
     pub workflow_run_id: Option<String>,
+    /// Timestamp of the unique parent `Agent` / legacy `Task` tool call whose id
+    /// matches `tool_use_id`. Missing or ambiguous parent evidence stays unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_at: Option<String>,
+}
+
+/// Build exact regular-subagent spawn timestamps from the normalized parent.
+/// Duplicate ids and non-Agent/Task calls are deliberately unusable.
+fn subagent_spawn_times(messages: &[ClaudeMessage]) -> HashMap<String, Option<String>> {
+    let mut times = HashMap::new();
+    for message in messages {
+        if message.message_type != "assistant" {
+            continue;
+        }
+        let Some(blocks) = message
+            .content
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use")
+                || !matches!(
+                    block.get("name").and_then(serde_json::Value::as_str),
+                    Some("Agent" | "Task")
+                )
+            {
+                continue;
+            }
+            let Some(id) = block
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let timestamp = (!message.timestamp.is_empty()).then(|| message.timestamp.clone());
+            match times.entry(id.to_string()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(timestamp);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    times
 }
 
 /// Derive the workflow run id (`wf_…`) for a subagent transcript path.
@@ -2269,10 +2318,12 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
         return Err("session_path must be an absolute path".to_string());
     }
     let subagent_files = find_subagent_files(&path);
-
     if subagent_files.is_empty() {
         return Ok(Vec::new());
     }
+    let spawn_times = load_session_messages_sync(&session_path)
+        .map(|messages| subagent_spawn_times(&messages))
+        .unwrap_or_default();
 
     let mut sessions: Vec<SubagentSession> = Vec::new();
     for sa_path in subagent_files {
@@ -2299,6 +2350,11 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
         let meta_path = sa_path.with_file_name(format!("{file_name}.meta.json"));
         let tool_use_id = read_subagent_tool_use_id(&meta_path);
         let workflow_run_id = workflow_run_id_for(&sa_path);
+        let spawned_at = tool_use_id
+            .as_ref()
+            .and_then(|id| spawn_times.get(id))
+            .cloned()
+            .flatten();
 
         sessions.push(SubagentSession {
             agent_id,
@@ -2310,6 +2366,7 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
             summary,
             tool_use_id,
             workflow_run_id,
+            spawned_at,
         });
     }
 
@@ -4254,6 +4311,45 @@ mod tests {
             workflow_run_id_for(Path::new("/p/abc/subagents/agent-x.jsonl")),
             None
         );
+    }
+
+    #[test]
+    fn subagent_spawn_times_require_one_agent_or_task_call() {
+        let messages: Vec<ClaudeMessage> = serde_json::from_value(serde_json::json!([
+            {
+                "uuid": "one",
+                "sessionId": "session",
+                "timestamp": "2026-08-09T12:00:00Z",
+                "type": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "agent-one", "name": "Agent", "input": {}},
+                    {"type": "tool_use", "id": "not-agent", "name": "Read", "input": {}}
+                ]
+            },
+            {
+                "uuid": "two",
+                "sessionId": "session",
+                "timestamp": "2026-08-09T12:01:00Z",
+                "type": "assistant",
+                "content": [{"type": "tool_use", "id": "duplicate", "name": "Task", "input": {}}]
+            },
+            {
+                "uuid": "three",
+                "sessionId": "session",
+                "timestamp": "2026-08-09T12:02:00Z",
+                "type": "assistant",
+                "content": [{"type": "tool_use", "id": "duplicate", "name": "Task", "input": {}}]
+            }
+        ]))
+        .unwrap();
+
+        let times = subagent_spawn_times(&messages);
+        assert_eq!(
+            times.get("agent-one"),
+            Some(&Some("2026-08-09T12:00:00Z".to_string()))
+        );
+        assert_eq!(times.get("duplicate"), Some(&None));
+        assert!(!times.contains_key("not-agent"));
     }
 
     #[test]

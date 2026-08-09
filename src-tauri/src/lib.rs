@@ -126,6 +126,13 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_sessions(&args));
         }
+        // Read-only structural child transcript relations for one Claude parent.
+        if args
+            .iter()
+            .any(|a| a == "--list-session-subagents" || a.starts_with("--list-session-subagents="))
+        {
+            std::process::exit(headless_dump::run_list_session_subagents(&args));
+        }
         // Targeted authoritative listing metadata. A capable provider can avoid
         // the provider-wide listing while preserving the same flattened row.
         if args

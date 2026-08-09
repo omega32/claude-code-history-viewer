@@ -120,6 +120,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "dump-session-snapshot",
             "dump-backup-session",
             "list-sessions",
+            "list-session-subagents",
             "list-backup-sessions",
             "session-metadata",
             "hide-session",
@@ -610,6 +611,38 @@ const METADATA_USAGE: &str = "Usage: --session-metadata <session-id|session-path
 Return one authoritative session-listing row, or null when the session is no\n\
 longer listed. An absolute Codex rollout or Copilot carrier path is loaded\n\
 directly without a provider-wide scan. --provider defaults to 'claude'.";
+
+const SUBAGENT_LIST_USAGE: &str = "Usage: --list-session-subagents <session-id|session-path> --provider claude [--format json] [--output <file>]\n\n\
+Return structurally discovered Claude child transcript relations for one parent\n\
+session. Regular children include `spawned_at` only when their sibling meta file's\n\
+tool id uniquely matches a parent Agent/Task call. Child transcript content is not\n\
+returned or merged.";
+
+/// Handle the read-only Claude child-relation command.
+pub fn run_list_session_subagents(args: &[String]) -> i32 {
+    let Some(selector) = extract_flag_value(args, "--list-session-subagents") else {
+        eprintln!("{SUBAGENT_LIST_USAGE}");
+        return 2;
+    };
+    let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if provider != "claude" || format != "json" {
+        eprintln!("{SUBAGENT_LIST_USAGE}");
+        return 2;
+    }
+
+    let result = block_on(async {
+        let session_path = resolve_session_path("claude", &selector).await?;
+        crate::commands::session::get_session_subagents(session_path).await
+    });
+    match result {
+        Ok(sessions) => emit_json(args, &sessions),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
 
 /// The Claude Code VS Code extension "deletes" a session by adding its id to a
 /// `hiddenSessionIds` array in the editor's global-state DB — a soft hide that
@@ -1862,6 +1895,7 @@ mod tests {
                 "dump-session-snapshot",
                 "dump-backup-session",
                 "list-sessions",
+                "list-session-subagents",
                 "list-backup-sessions",
                 "session-metadata",
                 "hide-session",
@@ -1870,6 +1904,55 @@ mod tests {
                 "capabilities"
             ])
         );
+    }
+
+    #[test]
+    fn list_session_subagents_emits_exact_parent_spawn_relation() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("parent.jsonl");
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"uuid":"parent-assistant","parentUuid":null,"sessionId":"parent","timestamp":"2026-08-09T12:00:00Z","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"inspect"}}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let subagents = temp.path().join("parent").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let child = subagents.join("agent-alpha.jsonl");
+        std::fs::write(
+            &child,
+            concat!(
+                r#"{"uuid":"child-assistant","parentUuid":null,"sessionId":"parent","timestamp":"2026-08-09T12:00:01Z","type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-alpha.meta.json"),
+            r#"{"toolUseId":"toolu_agent"}"#,
+        )
+        .unwrap();
+        let output = temp.path().join("subagents.json");
+        let argv = args(&[
+            "viewer",
+            "--list-session-subagents",
+            parent.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_session_subagents(&argv), 0);
+        let rows: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["agent_id"], "alpha");
+        assert_eq!(rows[0]["file_path"], child.to_string_lossy().as_ref());
+        assert_eq!(rows[0]["tool_use_id"], "toolu_agent");
+        assert_eq!(rows[0]["spawned_at"], "2026-08-09T12:00:00Z");
+        assert!(rows[0]["workflow_run_id"].is_null());
     }
 
     #[test]
