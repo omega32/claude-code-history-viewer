@@ -1328,6 +1328,41 @@ fn build_assistant_message(
     // initial snapshot. Both serialized invocations share one toolCallId; emit
     // the logical question call once, using the resolved carousel selected above.
     let mut emitted_question_calls = std::collections::HashSet::new();
+    // Resolve serialized result authority across every retained snapshot before
+    // walking them. Otherwise an earlier duplicate without `pastTenseMessage`
+    // could emit the metadata fallback before a later duplicate supplies it.
+    let mut serialized_tool_results = std::collections::HashMap::new();
+    for part in response {
+        if part.get("kind").and_then(Value::as_str) != Some("toolInvocationSerialized")
+            || !part
+                .get("isComplete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(call_id) = part
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(text) = part
+            .get("pastTenseMessage")
+            .and_then(markdown_or_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        serialized_tool_results
+            .entry(call_id)
+            .or_insert_with(|| text.to_string());
+    }
+    // Other completed invocations can likewise retain duplicate serialized
+    // snapshots. Keep their existing tool-use blocks, but emit one authoritative
+    // result per call id when falling back to request metadata.
+    let mut emitted_tool_results = std::collections::HashSet::new();
     // Track whether the previous visible block was plain prose or an inline
     // reference, so consecutive spans from the same response (split at every
     // inlineReference boundary) can be coalesced into one text block. Thinking,
@@ -1478,12 +1513,21 @@ fn build_assistant_message(
                         "tool_use_id": call_id,
                         "content": answers,
                     }));
-                } else if !has_question_carousel && is_complete && !past_text.is_empty() {
-                    blocks.push(serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": past_text,
-                    }));
+                } else if !has_question_carousel && is_complete {
+                    let result_text = serialized_tool_results
+                        .get(call_id.as_str())
+                        .cloned()
+                        .or_else(|| (!past_text.is_empty()).then(|| past_text.to_string()))
+                        .or_else(|| metadata_tool_result_text(req, &call_id));
+                    if let Some(content) = result_text {
+                        if emitted_tool_results.insert(call_id.clone()) {
+                            blocks.push(serde_json::json!({
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": content,
+                            }));
+                        }
+                    }
                 }
             }
             Some("progressTaskSerialized") => {
@@ -1913,6 +1957,67 @@ fn metadata_call_id_matches(metadata_id: &str, serialized_id: &str) -> bool {
             .strip_prefix(serialized_id)
             .and_then(|suffix| suffix.strip_prefix("__vscode-"))
             .is_some_and(|suffix| !suffix.is_empty())
+}
+
+/// Result fallback for a completed serialized invocation whose response part has
+/// no `pastTenseMessage`. VS Code retains authoritative results in an object keyed
+/// by the native call id plus an optional `__vscode-*` suffix. Require one unique
+/// id match and accept only the two observed text carriers: one direct string, or
+/// one flat serialized text-node tree. Unknown/ambiguous shapes fail closed.
+fn metadata_tool_result_text(req: &Value, serialized_call_id: &str) -> Option<String> {
+    let results = req
+        .get("result")?
+        .get("metadata")?
+        .get("toolCallResults")?
+        .as_object()?;
+    let mut matches = results
+        .iter()
+        .filter(|(id, _)| metadata_call_id_matches(id, serialized_call_id));
+    let (_, result) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    let content = result.get("content")?.as_array()?;
+    if content.len() != 1 {
+        return None;
+    }
+    let value = content[0].get("value")?;
+    if let Some(text) = value.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+
+    let value = value.as_object()?;
+    if value.len() != 1 {
+        return None;
+    }
+    flat_serialized_text_node(value.get("node")?)
+}
+
+fn flat_serialized_text_node(node: &Value) -> Option<String> {
+    let node = node.as_object()?;
+    if node.get("type").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let children = node.get("children")?.as_array()?;
+    if children.is_empty() {
+        return None;
+    }
+
+    let mut text = String::new();
+    for child in children {
+        let child = child.as_object()?;
+        if child.get("type").and_then(Value::as_u64) != Some(2)
+            || child
+                .get("lineBreakBefore")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        text.push_str(child.get("text")?.as_str()?);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 /// The terminal tool's exact command line
@@ -2770,6 +2875,119 @@ mod tests {
             metadata_hidden_edit_file_path(&request, "copilot_readFile", "tc-edit"),
             None
         );
+    }
+
+    #[test]
+    fn missing_serialized_results_fall_back_to_unique_metadata_text() {
+        let state = json!({
+            "sessionId": "sess-result-fallback",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "message": {"text": "run and edit"},
+                "response": [
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "run_in_terminal",
+                        "toolCallId": "tc-term",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Running command"}
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "run_in_terminal",
+                        "toolCallId": "tc-term",
+                        "isComplete": true,
+                        "invocationMessage": {"value": "Running command"}
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_replaceString",
+                        "toolCallId": "tc-edit",
+                        "presentation": "hidden",
+                        "isComplete": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_readFile",
+                        "toolCallId": "tc-read",
+                        "isComplete": true
+                    },
+                    {
+                        "kind": "toolInvocationSerialized",
+                        "toolId": "copilot_readFile",
+                        "toolCallId": "tc-read",
+                        "isComplete": true,
+                        "pastTenseMessage": {"value": "Read file"}
+                    }
+                ],
+                "result": {"metadata": {"toolCallResults": {
+                    "tc-term__vscode-1": {"$mid": 1, "content": [{"$mid": 1, "value": "stdout"}]},
+                    "tc-edit__vscode-2": {"$mid": 1, "content": [{"$mid": 1, "value": {"node": {
+                        "type": 1,
+                        "children": [
+                            {"type": 2, "text": "The following files were successfully edited:", "lineBreakBefore": false},
+                            {"type": 2, "text": "\n", "lineBreakBefore": false},
+                            {"type": 2, "text": "E:\\repo\\file.ts", "lineBreakBefore": false},
+                            {"type": 2, "text": "\n", "lineBreakBefore": false}
+                        ]
+                    }}}]},
+                    "tc-read__vscode-3": {"$mid": 1, "content": [{"$mid": 1, "value": "raw file contents"}]}
+                }}}
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        let blocks = messages[1].content.as_ref().unwrap().as_array().unwrap();
+        let results = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result["tool_use_id"] == "tc-term")
+                .unwrap()["content"],
+            "stdout"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result["tool_use_id"] == "tc-edit")
+                .unwrap()["content"],
+            "The following files were successfully edited:\nE:\\repo\\file.ts\n"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result["tool_use_id"] == "tc-read")
+                .unwrap()["content"],
+            "Read file"
+        );
+    }
+
+    #[test]
+    fn metadata_tool_result_fallback_rejects_ambiguous_and_unknown_shapes() {
+        let ambiguous = json!({"result": {"metadata": {"toolCallResults": {
+            "tc-1": {"content": [{"value": "first"}]},
+            "tc-1__vscode-2": {"content": [{"value": "second"}]}
+        }}}});
+        assert_eq!(metadata_tool_result_text(&ambiguous, "tc-1"), None);
+
+        let nested_node = json!({"result": {"metadata": {"toolCallResults": {
+            "tc-1__vscode-1": {"content": [{"value": {"node": {
+                "type": 1,
+                "children": [{"type": 1, "children": [{"type": 2, "text": "nested"}]}]
+            }}}]}
+        }}}});
+        assert_eq!(metadata_tool_result_text(&nested_node, "tc-1"), None);
+
+        let multiple_content = json!({"result": {"metadata": {"toolCallResults": {
+            "tc-1__vscode-1": {"content": [{"value": "first"}, {"value": "second"}]}
+        }}}});
+        assert_eq!(metadata_tool_result_text(&multiple_content, "tc-1"), None);
     }
 
     #[test]
