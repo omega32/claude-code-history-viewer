@@ -1423,7 +1423,9 @@ fn build_assistant_message(
                 // (machine-readable next to the prose `message`): file-target
                 // tools resolve their target into `invocationMessage.uris`, the
                 // terminal tool carries the exact command line.
-                if let Some(path) = first_invocation_uri_path(part) {
+                if let Some(path) = first_invocation_uri_path(part)
+                    .or_else(|| metadata_hidden_edit_file_path(req, &tool_id, &call_id))
+                {
                     input.insert("path".to_string(), Value::String(path));
                 }
                 if let Some(command) = terminal_command_line(part) {
@@ -1847,6 +1849,66 @@ fn first_invocation_uri_path(part: &Value) -> Option<String> {
     uris.values()
         .find_map(|u| u.get("path").and_then(Value::as_str))
         .map(String::from)
+}
+
+/// File path fallback for hidden edit invocations whose serialized response part
+/// omits `invocationMessage.uris`. The native request metadata retains the original
+/// tool call with JSON-string arguments, but appends a VS Code suffix to its id.
+/// Require one unique id/name match and project only `filePath`; malformed or
+/// ambiguous metadata stays unset rather than guessing.
+fn metadata_hidden_edit_file_path(
+    req: &Value,
+    serialized_tool_id: &str,
+    serialized_call_id: &str,
+) -> Option<String> {
+    let metadata_tool_name = match serialized_tool_id {
+        "copilot_replaceString" => "replace_string_in_file",
+        _ => return None,
+    };
+    let rounds = req
+        .get("result")?
+        .get("metadata")?
+        .get("toolCallRounds")?
+        .as_array()?;
+    let mut matches = rounds
+        .iter()
+        .filter_map(|round| round.get("toolCalls").and_then(Value::as_array))
+        .flatten()
+        .filter(|call| {
+            call.get("name").and_then(Value::as_str) == Some(metadata_tool_name)
+                && call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| metadata_call_id_matches(id, serialized_call_id))
+        });
+    let call = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    let arguments = call.get("arguments")?;
+    match arguments {
+        Value::Object(map) => map
+            .get("filePath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(String::from),
+        Value::String(raw) => serde_json::from_str::<Value>(raw)
+            .ok()?
+            .get("filePath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(String::from),
+        _ => None,
+    }
+}
+
+fn metadata_call_id_matches(metadata_id: &str, serialized_id: &str) -> bool {
+    metadata_id == serialized_id
+        || metadata_id
+            .strip_prefix(serialized_id)
+            .and_then(|suffix| suffix.strip_prefix("__vscode-"))
+            .is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// The terminal tool's exact command line
@@ -2622,6 +2684,69 @@ mod tests {
         assert!(blocks[1]["input"].get("path").is_none());
         assert_eq!(blocks[2]["input"]["message"], "Apply Patch");
         assert!(blocks[2]["input"].get("command").is_none());
+    }
+
+    #[test]
+    fn hidden_edit_tool_falls_back_to_metadata_file_path() {
+        let state = json!({
+            "sessionId": "sess-hidden-edit",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "responseId": "resp-1",
+                "message": {"text": "edit it"},
+                "response": [{
+                    "kind": "toolInvocationSerialized",
+                    "toolId": "copilot_replaceString",
+                    "toolCallId": "tc-edit",
+                    "presentation": "hidden",
+                    "isComplete": true,
+                    "invocationMessage": {"value": ""}
+                }],
+                "result": {"metadata": {"toolCallRounds": [{"toolCalls": [{
+                    "id": "tc-edit__vscode-123",
+                    "name": "replace_string_in_file",
+                    "arguments": "{\"filePath\":\"E:\\\\repo\\\\src\\\\hidden.ts\",\"oldString\":\"old\",\"newString\":\"new\"}"
+                }]}]}}
+            }]
+        });
+
+        let messages = messages_from_state(&state);
+        let blocks = messages[1].content.as_ref().unwrap().as_array().unwrap();
+        let tool = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(tool["input"]["path"], "E:\\repo\\src\\hidden.ts");
+        assert!(tool["input"].get("oldString").is_none());
+        assert!(tool["input"].get("newString").is_none());
+    }
+
+    #[test]
+    fn hidden_edit_metadata_fallback_rejects_ambiguous_matches() {
+        let request = json!({
+            "result": {"metadata": {"toolCallRounds": [{"toolCalls": [
+                {
+                    "id": "tc-edit",
+                    "name": "replace_string_in_file",
+                    "arguments": {"filePath": "E:\\repo\\first.ts"}
+                },
+                {
+                    "id": "tc-edit__vscode-123",
+                    "name": "replace_string_in_file",
+                    "arguments": "{\"filePath\":\"E:\\\\repo\\\\second.ts\"}"
+                }
+            ]}]}}
+        });
+
+        assert_eq!(
+            metadata_hidden_edit_file_path(&request, "copilot_replaceString", "tc-edit"),
+            None
+        );
+        assert_eq!(
+            metadata_hidden_edit_file_path(&request, "copilot_readFile", "tc-edit"),
+            None
+        );
     }
 
     #[test]
