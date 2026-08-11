@@ -46,6 +46,12 @@ struct CachedSessionMetadata {
     /// Rename name from /rename command
     #[serde(default)]
     rename_name: Option<String>,
+    /// Claude Code's generated session title
+    #[serde(default)]
+    ai_title: Option<String>,
+    /// Legacy top-level `type:"summary"` session title
+    #[serde(default)]
+    legacy_summary: Option<String>,
 }
 
 /// Session metadata cache file structure
@@ -76,7 +82,9 @@ struct SessionMetadataCache {
 // boundaries instead of generic local-command plumbing.
 // Bumped 14 -> 15: provider-generated task-notification user records no longer
 // count as authored conversation or participate in title fallbacks.
-const CACHE_VERSION: u32 = 15;
+// Bumped 15 -> 16: Claude's generated `ai-title` now precedes the legacy
+// `summary` and conversational preview fallbacks.
+const CACHE_VERSION: u32 = 16;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -163,8 +171,8 @@ struct IncrementalParseState {
     session_id: Option<String>,
     /// First timestamp (already known)
     first_timestamp: Option<String>,
-    /// Summary (already known)
-    summary: Option<String>,
+    /// Legacy top-level `type:"summary"` session title (already known)
+    legacy_summary: Option<String>,
     /// First user content (already known)
     first_user_content: Option<String>,
     /// Last user content (already known, for fallback)
@@ -173,6 +181,8 @@ struct IncrementalParseState {
     first_assistant_text: Option<String>,
     /// Rename name from /rename command (already known)
     rename_name: Option<String>,
+    /// Claude Code's generated session title (already known)
+    ai_title: Option<String>,
     /// Originating client entrypoint (already known)
     entrypoint: Option<String>,
     /// Project display name (already known)
@@ -215,6 +225,8 @@ struct SessionMetadataEntry {
     message: Option<SessionMetadataMessage>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
     attachment: Option<serde_json::Value>,
     origin: Option<serde_json::Value>,
 }
@@ -240,6 +252,8 @@ struct QuickLineClassifier {
     entrypoint: Option<String>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
     attachment: Option<serde_json::Value>,
     message: Option<SessionMetadataMessage>,
     origin: Option<serde_json::Value>,
@@ -266,6 +280,10 @@ struct SessionExtractionResult {
     first_assistant_text: Option<String>,
     /// Rename name from /rename command (for caching)
     rename_name: Option<String>,
+    /// Claude Code's generated session title (for caching)
+    ai_title: Option<String>,
+    /// Legacy top-level `type:"summary"` session title (for caching)
+    legacy_summary: Option<String>,
 }
 
 /// Fast session metadata extraction with two-phase parsing:
@@ -318,6 +336,7 @@ fn extract_session_metadata_internal(
         mut last_user_content,
         mut first_assistant_text,
         mut rename_name,
+        mut ai_title,
         mut entrypoint,
         mut session_cwd,
         incremental_project_name,
@@ -329,13 +348,14 @@ fn extract_session_metadata_internal(
             state.first_timestamp.clone(),
             state.last_timestamp.clone(),
             state.session_id.clone(),
-            state.summary.clone(),
+            state.legacy_summary.clone(),
             state.has_tool_use,
             state.has_errors,
             state.first_user_content.clone(),
             state.last_user_content.clone(),
             state.first_assistant_text.clone(),
             state.rename_name.clone(),
+            state.ai_title.clone(),
             state.entrypoint.clone(),
             None,
             state.project_name.clone(),
@@ -343,7 +363,7 @@ fn extract_session_metadata_internal(
     } else {
         (
             0u64, 0usize, 0usize, None, None, None, None, false, false, None, None, None, None,
-            None, None, None,
+            None, None, None, None,
         )
     };
 
@@ -390,6 +410,15 @@ fn extract_session_metadata_internal(
                 if entry.message_type == "summary" {
                     if session_summary.is_none() {
                         session_summary = entry.summary;
+                    }
+                    continue;
+                }
+
+                // Claude Code's current generated title. Capture it before the
+                // conversational allowlist drops this metadata-only record.
+                if entry.message_type == "ai-title" {
+                    if ai_title.is_none() {
+                        ai_title = non_empty_title(entry.ai_title.as_deref());
                     }
                     continue;
                 }
@@ -557,6 +586,15 @@ fn extract_session_metadata_internal(
 
         // Phase 2: Fast counting with minimal parsing
         if let Ok(classifier) = serde_json::from_str::<QuickLineClassifier>(&line) {
+            // Claude can repeat the same generated title throughout the file;
+            // the first non-empty value is the stable native title.
+            if classifier.message_type == "ai-title" {
+                if ai_title.is_none() {
+                    ai_title = non_empty_title(classifier.ai_title.as_deref());
+                }
+                continue;
+            }
+
             // Skip summary
             if classifier.message_type == "summary" {
                 // Still capture summary if we don't have one
@@ -684,10 +722,12 @@ fn extract_session_metadata_internal(
         })
         .or(incremental_project_name)
         .unwrap_or_else(|| extract_project_name(&raw_project_name));
-    // Rename name takes highest priority, then existing summary fallback chain
+    // Manual naming takes highest priority, followed by Claude's current
+    // generated title, the legacy summary title, then conversational previews.
     let final_summary = rename_name
         .clone()
-        .or(session_summary)
+        .or(ai_title.clone())
+        .or(session_summary.clone())
         .or(first_user_content.clone())
         .or(first_assistant_text.clone())
         .or(last_user_content.clone());
@@ -723,6 +763,8 @@ fn extract_session_metadata_internal(
         last_user_content,
         first_assistant_text,
         rename_name,
+        ai_title,
+        legacy_summary: session_summary,
     })
 }
 
@@ -828,11 +870,12 @@ fn try_extract_custom_title(message_type: &str, custom_title: Option<&str>) -> O
     if message_type != "custom-title" {
         return None;
     }
-    let name = custom_title?.trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_string())
+    non_empty_title(custom_title)
+}
+
+fn non_empty_title(title: Option<&str>) -> Option<String> {
+    let title = title?.trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 /// Derive a project display name from a real working-directory path (its leaf).
@@ -1337,6 +1380,8 @@ pub async fn load_project_sessions_page(
                         last_user_content,
                         first_assistant_text,
                         cached_rename_name,
+                        cached_ai_title,
+                        cached_legacy_summary,
                     ) = match &result_opt {
                         Some(result) => (
                             Some(result.session.clone()),
@@ -1348,8 +1393,10 @@ pub async fn load_project_sessions_page(
                             result.last_user_content.clone(),
                             result.first_assistant_text.clone(),
                             result.rename_name.clone(),
+                            result.ai_title.clone(),
+                            result.legacy_summary.clone(),
                         ),
-                        None => (None, 0, 0, false, false, None, None, None, None),
+                        None => (None, 0, 0, false, false, None, None, None, None, None, None),
                     };
 
                     cache.entries.insert(
@@ -1366,6 +1413,8 @@ pub async fn load_project_sessions_page(
                             last_user_content,
                             first_assistant_text,
                             rename_name: cached_rename_name,
+                            ai_title: cached_ai_title,
+                            legacy_summary: cached_legacy_summary,
                         },
                     );
                     cache_updated = true;
@@ -1496,11 +1545,12 @@ pub async fn load_project_sessions(
                             has_errors: cached.has_errors,
                             session_id: Some(session.actual_session_id.clone()),
                             first_timestamp: Some(session.first_message_time.clone()),
-                            summary: session.summary.clone(),
+                            legacy_summary: cached.legacy_summary.clone(),
                             first_user_content: cached.first_user_content.clone(),
                             last_user_content: cached.last_user_content.clone(),
                             first_assistant_text: cached.first_assistant_text.clone(),
                             rename_name: cached.rename_name.clone(),
+                            ai_title: cached.ai_title.clone(),
                             entrypoint: session.entrypoint.clone(),
                             project_name: Some(session.project_name.clone()),
                         },
@@ -1570,6 +1620,8 @@ pub async fn load_project_sessions(
                     last_user_content,
                     first_assistant_text,
                     cached_rename_name,
+                    cached_ai_title,
+                    cached_legacy_summary,
                 ) = match &result_opt {
                     Some(result) => (
                         Some(result.session.clone()),
@@ -1581,8 +1633,10 @@ pub async fn load_project_sessions(
                         result.last_user_content.clone(),
                         result.first_assistant_text.clone(),
                         result.rename_name.clone(),
+                        result.ai_title.clone(),
+                        result.legacy_summary.clone(),
                     ),
-                    None => (None, 0, 0, false, false, None, None, None, None),
+                    None => (None, 0, 0, false, false, None, None, None, None, None, None),
                 };
 
                 cache.entries.insert(
@@ -1599,6 +1653,8 @@ pub async fn load_project_sessions(
                         last_user_content,
                         first_assistant_text,
                         rename_name: cached_rename_name,
+                        ai_title: cached_ai_title,
+                        legacy_summary: cached_legacy_summary,
                     },
                 );
                 cache_updated = true;
@@ -3681,6 +3737,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ai_title_precedes_legacy_summary_and_first_user_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"uuid":"uuid-1","sessionId":"session-1","timestamp":"2025-06-26T10:00:00Z","type":"user","message":{"role":"user","content":"Original first prompt"}}"#,
+            "\n",
+            r#"{"type":"summary","summary":"Legacy generated title","leafUuid":"uuid-1"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"   ","sessionId":"session-1"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Current Claude title","sessionId":"session-1"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Later conflicting title","sessionId":"session-1"}"#,
+            "\n",
+        );
+        std::fs::write(temp_dir.path().join("test.jsonl"), content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].summary, Some("Current Claude title".to_string()));
+        assert!(!result[0].is_renamed);
+        assert_eq!(result[0].message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_manual_rename_precedes_ai_title() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = format!(
+            "{}\n{}\n{}\n",
+            create_sample_user_message("uuid-1", "session-1", "Original first prompt"),
+            r#"{"type":"ai-title","aiTitle":"Current Claude title","sessionId":"session-1"}"#,
+            create_sample_rename_message("Manual title")
+        );
+        std::fs::write(temp_dir.path().join("test.jsonl"), content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].summary, Some("Manual title".to_string()));
+        assert!(result[0].is_renamed);
+        assert_eq!(result[0].message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_summary_remains_the_title_fallback_without_ai_title() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"uuid":"uuid-1","sessionId":"session-1","timestamp":"2025-06-26T10:00:00Z","type":"user","message":{"role":"user","content":"Original first prompt"}}"#,
+            "\n",
+            r#"{"type":"summary","summary":"Legacy generated title","leafUuid":"uuid-1"}"#,
+            "\n",
+        );
+        std::fs::write(temp_dir.path().join("test.jsonl"), content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].summary,
+            Some("Legacy generated title".to_string())
+        );
+        assert!(!result[0].is_renamed);
+    }
+
+    #[tokio::test]
     async fn test_session_summary_fallback_first_user_message() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -4298,6 +4425,96 @@ mod tests {
         assert_eq!(result[0].message_count, 5);
     }
 
+    #[tokio::test]
+    async fn test_incremental_append_ai_title_replaces_the_first_user_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+        std::fs::write(
+            &file_path,
+            format!(
+                "{}\n{}\n",
+                create_sample_user_message("uuid-1", "session-1", "Original first prompt"),
+                create_sample_assistant_message("uuid-2", "session-1", "Reply")
+            ),
+        )
+        .unwrap();
+
+        let initial = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            initial[0].summary,
+            Some("Original first prompt".to_string())
+        );
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+        file.write_all(
+            br#"{"type":"ai-title","aiTitle":"Current Claude title","sessionId":"session-1"}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let refreshed = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed[0].summary,
+            Some("Current Claude title".to_string())
+        );
+        assert!(!refreshed[0].is_renamed);
+        assert_eq!(refreshed[0].message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_append_legacy_summary_replaces_the_first_user_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+        std::fs::write(
+            &file_path,
+            format!(
+                "{}\n{}\n",
+                create_sample_user_message("uuid-1", "session-1", "Original first prompt"),
+                create_sample_assistant_message("uuid-2", "session-1", "Reply")
+            ),
+        )
+        .unwrap();
+
+        let initial = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            initial[0].summary,
+            Some("Original first prompt".to_string())
+        );
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+        file.write_all(
+            br#"{"type":"summary","summary":"Legacy generated title","leafUuid":"uuid-1"}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let refreshed = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed[0].summary,
+            Some("Legacy generated title".to_string())
+        );
+        assert!(!refreshed[0].is_renamed);
+        assert_eq!(refreshed[0].message_count, 2);
+    }
+
     #[test]
     fn workflow_run_id_for_detects_workflow_layout_only() {
         assert_eq!(
@@ -4413,7 +4630,8 @@ mod tests {
 
         let result = extract_session_metadata_from_file(&path).unwrap();
         assert_eq!(result.session.message_count, 4);
-        assert_eq!(result.session.summary.as_deref(), Some("authored prompt"));
+        assert_eq!(result.session.summary.as_deref(), Some("Generated"));
+        assert!(!result.session.is_renamed);
     }
 
     #[test]
