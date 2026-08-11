@@ -36,7 +36,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 5;
+const SNAPSHOT_CURSOR_VERSION: u32 = 6;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -137,8 +137,45 @@ struct PendingCodexUserMessage {
     response_text: Option<String>,
     authored_turn_id: Option<String>,
     precedes_input_boundary: bool,
-    saw_same_turn_agent_activity_after_boundary: bool,
-    parse_sequence_is_complete: bool,
+    terminal_evidence: TerminalContextEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalContextEvidence {
+    AwaitingBoundary,
+    AwaitingSameTurnActivity,
+    SameTurnActivitySeen,
+    Invalid,
+}
+
+impl TerminalContextEvidence {
+    fn observe_boundary(&mut self) {
+        *self = match self {
+            Self::AwaitingBoundary | Self::AwaitingSameTurnActivity => {
+                Self::AwaitingSameTurnActivity
+            }
+            Self::SameTurnActivitySeen | Self::Invalid => Self::Invalid,
+        };
+    }
+
+    fn observe_same_turn_activity(&mut self) {
+        *self = match self {
+            Self::AwaitingSameTurnActivity | Self::SameTurnActivitySeen => {
+                Self::SameTurnActivitySeen
+            }
+            Self::AwaitingBoundary | Self::Invalid => Self::Invalid,
+        };
+    }
+
+    fn invalidate(&mut self) {
+        *self = Self::Invalid;
+    }
+}
+
+#[derive(Debug)]
+struct CodexAuthoredUserIdentity {
+    response_item_id: String,
+    client_id: Option<String>,
 }
 
 fn codex_user_response_text(payload: &Value) -> Option<String> {
@@ -167,56 +204,114 @@ fn codex_authored_turn_id(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn non_empty_string(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn merge_codex_message_provenance(
+    message: &mut ClaudeMessage,
+    provider_turn_id: Option<&str>,
+    client_message_id: Option<&str>,
+) {
+    let provider_turn_id = provider_turn_id.filter(|value| !value.is_empty());
+    let client_message_id = client_message_id.filter(|value| !value.is_empty());
+    if provider_turn_id.is_none() && client_message_id.is_none() {
+        return;
+    }
+
+    let data = message
+        .data
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(data) = data.as_object_mut() else {
+        return;
+    };
+    if let Some(provider_turn_id) = provider_turn_id {
+        data.entry("providerTurnId")
+            .or_insert_with(|| Value::String(provider_turn_id.to_string()));
+    }
+    if let Some(client_message_id) = client_message_id {
+        data.entry("clientMessageId")
+            .or_insert_with(|| Value::String(client_message_id.to_string()));
+    }
+}
+
 fn classify_pending_user_event(
     messages: &mut [ClaudeMessage],
     pending: &mut Vec<PendingCodexUserMessage>,
     event_payload: &Value,
-    authored_user_messages_in_turn: usize,
+    authored_user_identities_in_turn: &[CodexAuthoredUserIdentity],
     active_turn_id: Option<&str>,
-) -> bool {
+) -> Option<CodexAuthoredUserIdentity> {
     let Some(event_text) = event_payload.get("message").and_then(Value::as_str) else {
         pending.clear();
-        return false;
+        return None;
     };
-    let Some(matched) = pending.last() else {
-        return false;
-    };
+    let matched = pending.last()?;
     if matched.response_text.as_deref() != Some(event_text) {
         // A missing, reordered, or non-text pairing is ambiguous. Preserve every
         // candidate as authorship_unknown instead of guessing from its content.
         pending.clear();
-        return false;
+        return None;
     }
 
     let matched_index = matched.message_index;
     let matched_turn_id = matched.authored_turn_id.clone();
+    if active_turn_id.is_some()
+        && matched_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| active_turn_id != Some(turn_id))
+    {
+        pending.clear();
+        return None;
+    }
+    let client_id = non_empty_string(event_payload.get("client_id")).map(str::to_string);
+    let response_item_id = messages[matched_index].uuid.clone();
+    if authored_user_identities_in_turn.iter().any(|identity| {
+        identity.response_item_id == response_item_id
+            || client_id
+                .as_deref()
+                .is_some_and(|client_id| identity.client_id.as_deref() == Some(client_id))
+    }) {
+        pending.clear();
+        return None;
+    }
+
     let matched_turn_is_consistent = matched_turn_id
         .as_deref()
         .is_some_and(|turn_id| active_turn_id.is_none() || active_turn_id == Some(turn_id));
-    let matched_pair_belongs_to_active_turn = matched_turn_id.as_deref().map_or(true, |turn_id| {
-        active_turn_id.is_none() || active_turn_id == Some(turn_id)
-    });
     let unmatched_len = pending.len().saturating_sub(1);
     for unmatched in pending.drain(..unmatched_len) {
         let unmatched_turn_is_consistent =
-            unmatched.authored_turn_id.is_none() || unmatched.authored_turn_id == matched_turn_id;
+            unmatched.authored_turn_id.is_some() && unmatched.authored_turn_id == matched_turn_id;
         if matched_turn_is_consistent
             && unmatched_turn_is_consistent
             && unmatched.precedes_input_boundary
+            && unmatched.terminal_evidence != TerminalContextEvidence::Invalid
         {
             messages[unmatched.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
         }
     }
     messages[matched_index].subtype = Some(
-        if active_turn_id.is_some() && authored_user_messages_in_turn > 0 {
+        if active_turn_id.is_some() && !authored_user_identities_in_turn.is_empty() {
             STEER_SUBTYPE
         } else {
             AUTHORED_USER_SUBTYPE
         }
         .to_string(),
     );
+    let confirmed_turn_id = matched_turn_id.as_deref().or(active_turn_id);
+    merge_codex_message_provenance(
+        &mut messages[matched_index],
+        confirmed_turn_id,
+        client_id.as_deref(),
+    );
     pending.clear();
-    matched_pair_belongs_to_active_turn
+    Some(CodexAuthoredUserIdentity {
+        response_item_id,
+        client_id,
+    })
 }
 
 fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &str) -> bool {
@@ -239,17 +334,138 @@ fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &
     }
 }
 
+fn codex_event_is_known_terminal_bookkeeping(payload: &Value, active_turn_id: &str) -> bool {
+    match payload.get("type").and_then(Value::as_str) {
+        Some("token_count" | "agent_message" | "agent_reasoning") => true,
+        Some(
+            "exec_command_begin"
+            | "exec_command_end"
+            | "mcp_tool_call_begin"
+            | "mcp_tool_call_end"
+            | "patch_apply_begin"
+            | "patch_apply_end"
+            | "web_search_begin"
+            | "web_search_end",
+        ) => payload.get("turn_id").and_then(Value::as_str) == Some(active_turn_id),
+        _ => false,
+    }
+}
+
+fn observe_pending_terminal_record(
+    pending: &mut [PendingCodexUserMessage],
+    line_type: &str,
+    event_type: &str,
+    payload: Option<&Value>,
+    active_turn_id: Option<&str>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    match line_type {
+        "turn_context" | "world_state" => {
+            let payload_is_object = payload.is_some_and(Value::is_object);
+            let explicit_turn_id = payload
+                .and_then(|payload| payload.get("turn_id"))
+                .and_then(Value::as_str)
+                .filter(|turn_id| !turn_id.is_empty());
+            for candidate in pending {
+                let boundary_turn_is_consistent = explicit_turn_id.map_or(true, |turn_id| {
+                    active_turn_id.map_or(true, |active_turn_id| turn_id == active_turn_id)
+                        && candidate
+                            .authored_turn_id
+                            .as_deref()
+                            .map_or(true, |authored_turn_id| turn_id == authored_turn_id)
+                });
+                let boundary_is_valid = match line_type {
+                    "turn_context" => {
+                        payload_is_object
+                            && explicit_turn_id.is_some()
+                            && boundary_turn_is_consistent
+                    }
+                    "world_state" => payload_is_object && boundary_turn_is_consistent,
+                    _ => unreachable!("the boundary match restricts line_type"),
+                };
+                if boundary_is_valid {
+                    candidate.precedes_input_boundary = true;
+                    candidate.terminal_evidence.observe_boundary();
+                } else {
+                    candidate.terminal_evidence.invalidate();
+                }
+            }
+        }
+        "response_item" => {
+            let Some(payload) = payload else {
+                for candidate in pending {
+                    candidate.terminal_evidence.invalidate();
+                }
+                return;
+            };
+            let is_user_message = payload.get("type").and_then(Value::as_str) == Some("message")
+                && payload.get("role").and_then(Value::as_str) == Some("user");
+            if is_user_message {
+                return;
+            }
+            let is_same_turn_activity = active_turn_id.is_some_and(|turn_id| {
+                codex_response_is_same_turn_agent_activity(payload, turn_id)
+            });
+            for candidate in pending {
+                if is_same_turn_activity {
+                    candidate.terminal_evidence.observe_same_turn_activity();
+                } else {
+                    candidate.terminal_evidence.invalidate();
+                }
+            }
+        }
+        "event_msg" => {
+            if event_type == "user_message" {
+                return;
+            }
+            if event_type == "task_complete" {
+                let completion_matches = active_turn_id.is_some_and(|turn_id| {
+                    payload
+                        .and_then(|payload| payload.get("turn_id"))
+                        .and_then(Value::as_str)
+                        == Some(turn_id)
+                });
+                if completion_matches {
+                    return;
+                }
+                for candidate in pending {
+                    candidate.terminal_evidence.invalidate();
+                }
+                return;
+            }
+            let is_known_bookkeeping = active_turn_id.is_some_and(|turn_id| {
+                payload.is_some_and(|payload| {
+                    codex_event_is_known_terminal_bookkeeping(payload, turn_id)
+                })
+            });
+            if !is_known_bookkeeping {
+                for candidate in pending {
+                    candidate.terminal_evidence.invalidate();
+                }
+            }
+        }
+        _ => {
+            for candidate in pending {
+                candidate.terminal_evidence.invalidate();
+            }
+        }
+    }
+}
+
 fn classify_pending_terminal_context(
     messages: &mut [ClaudeMessage],
     pending: &[PendingCodexUserMessage],
-    authored_user_messages_in_turn: usize,
+    authored_user_identities_in_turn: &[CodexAuthoredUserIdentity],
     active_turn_id: &str,
     terminal_payload: &Value,
 ) {
     // A context refresh injected while a task is already running has no companion
     // user_message event. Resolve it only when the surrounding provider sequence is
     // complete and unambiguous; every incomplete or reordered shape stays unknown.
-    if authored_user_messages_in_turn == 0
+    if authored_user_identities_in_turn.is_empty()
         || terminal_payload.get("turn_id").and_then(Value::as_str) != Some(active_turn_id)
     {
         return;
@@ -260,8 +476,7 @@ fn classify_pending_terminal_context(
     };
     if candidate.authored_turn_id.as_deref() == Some(active_turn_id)
         && candidate.precedes_input_boundary
-        && candidate.saw_same_turn_agent_activity_after_boundary
-        && candidate.parse_sequence_is_complete
+        && candidate.terminal_evidence == TerminalContextEvidence::SameTurnActivitySeen
     {
         messages[candidate.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
     }
@@ -1245,7 +1460,7 @@ fn parse_rollout_slice(
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
     let mut active_turn_id: Option<String> = None;
     let mut active_turn_message_start = 0usize;
-    let mut authored_user_messages_in_turn = 0usize;
+    let mut authored_user_identities_in_turn = Vec::<CodexAuthoredUserIdentity>::new();
     let mut pending_user_messages = Vec::<PendingCodexUserMessage>::new();
     let mut pending_compacted_notification = false;
 
@@ -1259,7 +1474,7 @@ fn parse_rollout_slice(
             value
         } else {
             for candidate in &mut pending_user_messages {
-                candidate.parse_sequence_is_complete = false;
+                candidate.terminal_evidence.invalidate();
             }
             continue;
         };
@@ -1283,6 +1498,13 @@ fn parse_rollout_slice(
         } else {
             ""
         };
+        observe_pending_terminal_record(
+            &mut pending_user_messages,
+            line_type,
+            event_type,
+            val.get("payload"),
+            active_turn_id.as_deref(),
+        );
 
         // Current Codex rollouts persist one logical compaction twice: the
         // authoritative `compacted` record carries replacement history, then
@@ -1311,9 +1533,6 @@ fn parse_rollout_slice(
                 }
             }
             "turn_context" => {
-                for candidate in &mut pending_user_messages {
-                    candidate.precedes_input_boundary = true;
-                }
                 if let Some(payload) = val.get("payload") {
                     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
                         state.current_inference.model = Some(m.to_string());
@@ -1332,15 +1551,6 @@ fn parse_rollout_slice(
             }
             "response_item" => {
                 if let Some(payload) = val.get("payload") {
-                    if active_turn_id.as_deref().is_some_and(|turn_id| {
-                        codex_response_is_same_turn_agent_activity(payload, turn_id)
-                    }) {
-                        for candidate in &mut pending_user_messages {
-                            if candidate.precedes_input_boundary {
-                                candidate.saw_same_turn_agent_activity_after_boundary = true;
-                            }
-                        }
-                    }
                     let is_user_message = payload.get("type").and_then(Value::as_str)
                         == Some("message")
                         && payload.get("role").and_then(Value::as_str) == Some("user");
@@ -1352,6 +1562,8 @@ fn parse_rollout_slice(
                         &mut state.msg_counter,
                     ) {
                         let mut msg = msg;
+                        let provider_turn_id = codex_authored_turn_id(payload);
+                        merge_codex_message_provenance(&mut msg, provider_turn_id.as_deref(), None);
                         if msg.message_type == "assistant" {
                             msg.inference = (!state.current_inference.is_empty())
                                 .then(|| state.current_inference.clone());
@@ -1375,18 +1587,12 @@ fn parse_rollout_slice(
                             pending_user_messages.push(PendingCodexUserMessage {
                                 message_index,
                                 response_text: codex_user_response_text(payload),
-                                authored_turn_id: codex_authored_turn_id(payload),
+                                authored_turn_id: provider_turn_id,
                                 precedes_input_boundary: false,
-                                saw_same_turn_agent_activity_after_boundary: false,
-                                parse_sequence_is_complete: true,
+                                terminal_evidence: TerminalContextEvidence::AwaitingBoundary,
                             });
                         }
                     }
-                }
-            }
-            "world_state" => {
-                for candidate in &mut pending_user_messages {
-                    candidate.precedes_input_boundary = true;
                 }
             }
             "event_msg" => {
@@ -1403,22 +1609,22 @@ fn parse_rollout_slice(
                     // distinguish same-turn steering from injected user-role context.
                     if event_type == "user_message" {
                         if active_turn_id.is_some() {
-                            let positively_paired = classify_pending_user_event(
+                            let identity = classify_pending_user_event(
                                 &mut messages,
                                 &mut pending_user_messages,
                                 payload,
-                                authored_user_messages_in_turn,
+                                &authored_user_identities_in_turn,
                                 active_turn_id.as_deref(),
                             );
-                            if positively_paired {
-                                authored_user_messages_in_turn += 1;
+                            if let Some(identity) = identity {
+                                authored_user_identities_in_turn.push(identity);
                             }
                         } else {
                             let _ = classify_pending_user_event(
                                 &mut messages,
                                 &mut pending_user_messages,
                                 payload,
-                                authored_user_messages_in_turn,
+                                &authored_user_identities_in_turn,
                                 None,
                             );
                         }
@@ -1450,7 +1656,7 @@ fn parse_rollout_slice(
                         {
                             state.current_inference.interaction_mode = Some(mode.to_string());
                         }
-                        authored_user_messages_in_turn = 0;
+                        authored_user_identities_in_turn.clear();
                         pending_user_messages.clear();
                     }
 
@@ -1552,6 +1758,11 @@ fn parse_rollout_slice(
                         &line_timestamp,
                         &mut state.msg_counter,
                     ) {
+                        merge_codex_message_provenance(
+                            &mut msg,
+                            non_empty_string(payload.get("turn_id")),
+                            None,
+                        );
                         if msg.message_type == "assistant" {
                             if msg.model.is_none() {
                                 msg.model.clone_from(&state.current_inference.model);
@@ -1569,7 +1780,7 @@ fn parse_rollout_slice(
                         classify_pending_terminal_context(
                             &mut messages,
                             &pending_user_messages,
-                            authored_user_messages_in_turn,
+                            &authored_user_identities_in_turn,
                             active_turn_id.as_deref().expect("matching active turn"),
                             payload,
                         );
@@ -1588,7 +1799,7 @@ fn parse_rollout_slice(
                                 .and_then(Value::as_u64);
                         }
                         active_turn_id = None;
-                        authored_user_messages_in_turn = 0;
+                        authored_user_identities_in_turn.clear();
                         pending_user_messages.clear();
                         let next_offset = ranges
                             .get(range_index + 1)
@@ -3628,6 +3839,14 @@ mod tests {
         }
     }
 
+    fn message_data_str<'a>(message: &'a ClaudeMessage, key: &str) -> Option<&'a str> {
+        message
+            .data
+            .as_ref()
+            .and_then(|data| data.get(key))
+            .and_then(Value::as_str)
+    }
+
     #[test]
     fn imported_provider_classifies_known_storage_roots() {
         assert_eq!(
@@ -5495,7 +5714,7 @@ mod tests {
         assert!(!serialized.contains("d5aa3020"));
 
         let mut counter = 0;
-        let message = convert_codex_item(
+        let mut message = convert_codex_item(
             &json!({ "type": "message", "role": "user", "content": content }),
             "session-1",
             None,
@@ -5503,6 +5722,11 @@ mod tests {
             &mut counter,
         )
         .expect("user message should be converted");
+        merge_codex_message_provenance(
+            &mut message,
+            Some("turn-with-pasted-note"),
+            Some("client-with-pasted-note"),
+        );
         assert_eq!(
             message.data,
             Some(json!({
@@ -5510,7 +5734,9 @@ mod tests {
                     "kind": "note",
                     "name": "pasted-text.txt",
                     "label": "Build output"
-                }]
+                }],
+                "providerTurnId": "turn-with-pasted-note",
+                "clientMessageId": "client-with-pasted-note"
             }))
         );
         assert!(message.content.is_none());
@@ -6652,7 +6878,11 @@ mod tests {
             json!({
                 "timestamp": "2026-07-14T10:00:03Z",
                 "type": "event_msg",
-                "payload": { "type": "user_message", "message": "start the work" }
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-turn-1-primary",
+                    "message": "start the work"
+                }
             }),
             json!({
                 "timestamp": "2026-07-14T10:00:04Z",
@@ -6674,7 +6904,11 @@ mod tests {
             json!({
                 "timestamp": "2026-07-14T10:00:05Z",
                 "type": "event_msg",
-                "payload": { "type": "user_message", "message": "focus on tests first" }
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-turn-1-steer",
+                    "message": "focus on tests first"
+                }
             }),
             json!({
                 "timestamp": "2026-07-14T10:00:06Z",
@@ -6698,7 +6932,11 @@ mod tests {
             json!({
                 "timestamp": "2026-07-14T10:00:08Z",
                 "type": "event_msg",
-                "payload": { "type": "user_message", "message": "ordinary follow-up" }
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-turn-2-primary",
+                    "message": "ordinary follow-up"
+                }
             }),
             json!({
                 "timestamp": "2026-07-14T10:00:09Z",
@@ -6743,6 +6981,373 @@ mod tests {
             Some(AUTHORED_USER_SUBTYPE),
             "the next task's first prompt resets steer detection and remains authored"
         );
+        assert_eq!(message_data_str(users[0], "providerTurnId"), Some("turn-1"));
+        assert_eq!(message_data_str(users[0], "clientMessageId"), None);
+        assert_eq!(message_data_str(users[1], "providerTurnId"), Some("turn-1"));
+        assert_eq!(
+            message_data_str(users[1], "clientMessageId"),
+            Some("client-turn-1-primary")
+        );
+        assert_eq!(message_data_str(users[2], "providerTurnId"), Some("turn-1"));
+        assert_eq!(
+            message_data_str(users[2], "clientMessageId"),
+            Some("client-turn-1-steer")
+        );
+        assert_eq!(message_data_str(users[3], "providerTurnId"), Some("turn-2"));
+        assert_eq!(
+            message_data_str(users[3], "clientMessageId"),
+            Some("client-turn-2-primary")
+        );
+    }
+
+    #[test]
+    fn load_messages_matches_captured_app_server_authorship_shape() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("app-server-authorship-oracle.jsonl");
+        let authored_per_turn = [1usize, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 2, 2, 1, 1];
+        let mut lines = vec![json!({
+            "timestamp": "2026-08-11T05:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "app-server-authorship-oracle" }
+        })];
+        let mut expected_client_ids = Vec::new();
+
+        for (turn_index, authored_count) in authored_per_turn.into_iter().enumerate() {
+            let turn_id = format!("turn-{}", turn_index + 1);
+            lines.push(json!({
+                "timestamp": "2026-08-11T05:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": turn_id }
+            }));
+            for authored_index in 0..authored_count {
+                let text = format!("turn {} input {}", turn_index + 1, authored_index + 1);
+                let client_id = format!("client-{}-{}", turn_index + 1, authored_index + 1);
+                expected_client_ids.push(client_id.clone());
+                lines.extend([
+                    json!({
+                        "timestamp": "2026-08-11T05:00:02Z",
+                        "type": "response_item",
+                        "payload": {
+                            "id": format!("item-{}-{}", turn_index + 1, authored_index + 1),
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": text }],
+                            "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                        }
+                    }),
+                    json!({
+                        "timestamp": "2026-08-11T05:00:03Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "client_id": client_id,
+                            "message": text
+                        }
+                    }),
+                ]);
+            }
+            if turn_index + 1 == authored_per_turn.len() {
+                lines.extend([
+                    json!({
+                        "timestamp": "2026-08-11T05:00:04Z",
+                        "type": "response_item",
+                        "payload": {
+                            "id": "terminal-context",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": "<environment_context>refresh</environment_context>" }],
+                            "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                        }
+                    }),
+                    json!({
+                        "timestamp": "2026-08-11T05:00:05Z",
+                        "type": "world_state",
+                        "payload": {}
+                    }),
+                    json!({
+                        "timestamp": "2026-08-11T05:00:06Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": "opaque",
+                            "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                        }
+                    }),
+                ]);
+            }
+            lines.push(json!({
+                "timestamp": "2026-08-11T05:00:07Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": turn_id }
+            }));
+        }
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let messages = parse_rollout_file(&rollout_path).expect("oracle fixture should parse");
+        let authored = messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.subtype.as_deref(),
+                    Some(AUTHORED_USER_SUBTYPE | STEER_SUBTYPE)
+                )
+            })
+            .collect::<Vec<_>>();
+        let steers = authored
+            .iter()
+            .filter(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE))
+            .count();
+        let client_ids = authored
+            .iter()
+            .filter_map(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("clientMessageId"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        let mut provider_turn_ids = authored
+            .iter()
+            .filter_map(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("providerTurnId"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        provider_turn_ids.sort_unstable();
+        provider_turn_ids.dedup();
+
+        assert_eq!(authored.len(), 18);
+        assert_eq!(steers, 3);
+        assert_eq!(client_ids, expected_client_ids);
+        assert_eq!(provider_turn_ids.len(), 15);
+        let context = messages
+            .iter()
+            .find(|message| message.uuid == "terminal-context")
+            .expect("terminal context should remain projected");
+        assert_eq!(context.subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(
+            context
+                .data
+                .as_ref()
+                .and_then(|data| data.get("providerTurnId"))
+                .and_then(Value::as_str),
+            Some("turn-15")
+        );
+        assert!(context
+            .data
+            .as_ref()
+            .map_or(true, |data| data.get("clientMessageId").is_none()));
+    }
+
+    #[test]
+    fn load_messages_rejects_cross_turn_boundary_in_ordinary_pairing() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("cross-turn-ordinary-boundary.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-11T05:30:00Z",
+                "type": "session_meta",
+                "payload": { "id": "cross-turn-ordinary-boundary" }
+            }),
+            json!({
+                "timestamp": "2026-08-11T05:30:01Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "context",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "<environment_context>refresh</environment_context>" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T05:30:02Z",
+                "type": "turn_context",
+                "payload": { "turn_id": "turn-2" }
+            }),
+            json!({
+                "timestamp": "2026-08-11T05:30:03Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "authored",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "real prompt" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T05:30:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-real",
+                    "message": "real prompt"
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let messages = parse_rollout_file(&rollout_path).expect("rollout should parse");
+        let context = messages
+            .iter()
+            .find(|message| message.uuid == "context")
+            .expect("context candidate should remain projected");
+        let authored = messages
+            .iter()
+            .find(|message| message.uuid == "authored")
+            .expect("authored message should remain projected");
+
+        assert_eq!(
+            context.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a boundary from another physical turn must fail open"
+        );
+        assert_eq!(authored.subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(message_data_str(authored, "providerTurnId"), Some("turn-1"));
+        assert_eq!(
+            message_data_str(authored, "clientMessageId"),
+            Some("client-real")
+        );
+
+        let stale_boundary_path = tmp.path().join("stale-ordinary-boundary.jsonl");
+        let stale_boundary_lines = [
+            lines[0].clone(),
+            lines[1].clone(),
+            json!({
+                "timestamp": "2026-08-11T05:30:01.5Z",
+                "type": "turn_context",
+                "payload": { "turn_id": "turn-1" }
+            }),
+            lines[2].clone(),
+            lines[3].clone(),
+            lines[4].clone(),
+        ];
+        write_terminal_context_fixture(&stale_boundary_path, &stale_boundary_lines, false);
+        let stale_boundary_messages =
+            parse_rollout_file(&stale_boundary_path).expect("rollout should parse");
+        let stale_boundary_context = stale_boundary_messages
+            .iter()
+            .find(|message| message.uuid == "context")
+            .expect("context candidate should remain projected");
+        assert_eq!(
+            stale_boundary_context.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a later cross-turn boundary must invalidate an earlier valid boundary"
+        );
+
+        let missing_candidate_turn_path = tmp.path().join("missing-candidate-turn.jsonl");
+        let mut missing_candidate_turn_lines = lines.clone();
+        missing_candidate_turn_lines[1]
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .expect("candidate payload should be an object")
+            .remove("internal_chat_message_metadata_passthrough");
+        write_terminal_context_fixture(
+            &missing_candidate_turn_path,
+            &missing_candidate_turn_lines,
+            false,
+        );
+        let missing_candidate_turn_messages =
+            parse_rollout_file(&missing_candidate_turn_path).expect("rollout should parse");
+        let missing_candidate_turn_context = missing_candidate_turn_messages
+            .iter()
+            .find(|message| message.uuid == "context")
+            .expect("context candidate should remain projected");
+        assert_eq!(
+            missing_candidate_turn_context.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a candidate without a physical turn cannot borrow a later boundary turn"
+        );
+    }
+
+    #[test]
+    fn duplicate_client_id_cannot_create_a_steer() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("duplicate-client-id.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-11T06:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "duplicate-client-id" }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "primary",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "primary" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "duplicate-client",
+                    "message": "primary"
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "duplicate",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "duplicate" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "duplicate-client",
+                    "message": "duplicate"
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-11T06:00:06Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-1" }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let messages = parse_rollout_file(&rollout_path).expect("fixture should parse");
+        let primary = messages
+            .iter()
+            .find(|message| message.uuid == "primary")
+            .expect("primary input should be projected");
+        let duplicate = messages
+            .iter()
+            .find(|message| message.uuid == "duplicate")
+            .expect("duplicate input should fail open visibly");
+        assert_eq!(primary.subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            message_data_str(primary, "clientMessageId"),
+            Some("duplicate-client")
+        );
+        assert_eq!(
+            duplicate.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+        );
+        assert_eq!(message_data_str(duplicate, "clientMessageId"), None);
     }
 
     #[test]
@@ -6930,7 +7535,7 @@ mod tests {
     fn load_messages_marks_completed_same_turn_context_refresh_as_injected() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("terminal-context.jsonl");
-        let lines = terminal_context_fixture(
+        let mut lines = terminal_context_fixture(
             "turn-1",
             Some("turn-1"),
             "turn-1",
@@ -6938,6 +7543,36 @@ mod tests {
             Some("turn-1"),
             false,
             "turn-1",
+        );
+        lines.splice(
+            lines.len() - 1..lines.len() - 1,
+            [
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.1Z",
+                    "type": "event_msg",
+                    "payload": { "type": "token_count" }
+                }),
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.2Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "duplicate activity" }
+                }),
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.3Z",
+                    "type": "event_msg",
+                    "payload": { "type": "patch_apply_end", "turn_id": "turn-1" }
+                }),
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.4Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": "done",
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                    }
+                }),
+            ],
         );
         write_terminal_context_fixture(&rollout_path, &lines, false);
 
@@ -6953,11 +7588,211 @@ mod tests {
             })
             .expect("context refresh should remain in the base projection");
         assert_eq!(context.subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        let authored = messages
+            .iter()
+            .find(|message| message.subtype.as_deref() == Some(AUTHORED_USER_SUBTYPE))
+            .expect("authored prompt should remain projected");
+        assert_eq!(message_data_str(authored, "providerTurnId"), Some("turn-1"));
+        assert_eq!(message_data_str(authored, "clientMessageId"), None);
     }
 
     #[test]
     fn load_messages_terminal_context_inference_fails_open_without_each_proof() {
         let tmp = TempDir::new().expect("temp dir should be created");
+        let unexpected_valid_record = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines.insert(
+                lines.len() - 1,
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.5Z",
+                    "type": "future_protocol_record",
+                    "payload": { "turn_id": "turn-1" }
+                }),
+            );
+            lines
+        };
+        let unexpected_event = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines.insert(
+                lines.len() - 1,
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.5Z",
+                    "type": "event_msg",
+                    "payload": { "type": "future_event", "turn_id": "turn-1" }
+                }),
+            );
+            lines
+        };
+        let unexpected_response_item = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines.insert(
+                lines.len() - 1,
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.5Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "future_agent_activity",
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                    }
+                }),
+            );
+            lines
+        };
+        let boundary_after_activity = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines.insert(
+                lines.len() - 1,
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.5Z",
+                    "type": "turn_context",
+                    "payload": { "turn_id": "turn-1" }
+                }),
+            );
+            lines
+        };
+        let activity_before_boundary = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines.swap(5, 6);
+            lines.insert(
+                lines.len() - 1,
+                json!({
+                    "timestamp": "2026-08-11T04:00:06.5Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-again",
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                    }
+                }),
+            );
+            lines
+        };
+        let mismatched_then_matching_completion = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "other-turn",
+            );
+            lines.push(json!({
+                "timestamp": "2026-08-11T04:00:08Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-1" }
+            }));
+            lines
+        };
+        let cross_turn_turn_context = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines[5] = json!({
+                "timestamp": "2026-08-11T04:00:05Z",
+                "type": "turn_context",
+                "payload": { "turn_id": "other-turn" }
+            });
+            lines
+        };
+        let cross_turn_world_state = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines[5] = json!({
+                "timestamp": "2026-08-11T04:00:05Z",
+                "type": "world_state",
+                "payload": { "turn_id": "other-turn" }
+            });
+            lines
+        };
+        let turn_context_without_turn_id = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines[5] = json!({
+                "timestamp": "2026-08-11T04:00:05Z",
+                "type": "turn_context",
+                "payload": {}
+            });
+            lines
+        };
+        let malformed_world_state = {
+            let mut lines = terminal_context_fixture(
+                "turn-1",
+                Some("turn-1"),
+                "turn-1",
+                true,
+                Some("turn-1"),
+                false,
+                "turn-1",
+            );
+            lines[5] = json!({
+                "timestamp": "2026-08-11T04:00:05Z",
+                "type": "world_state",
+                "payload": "malformed"
+            });
+            lines
+        };
         let cases = [
             (
                 "no-prior-authored-pair",
@@ -7076,6 +7911,24 @@ mod tests {
                 ),
                 true,
             ),
+            ("unexpected-valid-record", unexpected_valid_record, false),
+            ("unexpected-event", unexpected_event, false),
+            ("unexpected-response-item", unexpected_response_item, false),
+            ("boundary-after-activity", boundary_after_activity, false),
+            ("activity-before-boundary", activity_before_boundary, false),
+            (
+                "mismatched-then-matching-completion",
+                mismatched_then_matching_completion,
+                false,
+            ),
+            ("cross-turn-turn-context", cross_turn_turn_context, false),
+            ("cross-turn-world-state", cross_turn_world_state, false),
+            (
+                "turn-context-without-turn-id",
+                turn_context_without_turn_id,
+                false,
+            ),
+            ("malformed-world-state", malformed_world_state, false),
         ];
 
         for (name, lines, malformed_gap) in cases {
@@ -7252,7 +8105,11 @@ mod tests {
                 json!({
                     "timestamp": "2026-08-07T10:01:03Z",
                     "type": "event_msg",
-                    "payload": { "type": "user_message", "message": "authored prompt" }
+                    "payload": {
+                        "type": "user_message",
+                        "client_id": "incremental-authored-client",
+                        "message": "authored prompt"
+                    }
                 }),
                 json!({
                     "timestamp": "2026-08-07T10:01:04Z",
@@ -7281,6 +8138,17 @@ mod tests {
                     .as_ref()
                     .is_some_and(|content| content.to_string().contains("future_context"))
         }));
+        let authored = cached
+            .iter()
+            .find(|message| {
+                message_data_str(message, "clientMessageId") == Some("incremental-authored-client")
+            })
+            .expect("appended authored input should be reclassified");
+        assert_eq!(message_data_str(authored, "providerTurnId"), Some("turn-2"));
+        assert_eq!(
+            message_data_str(authored, "clientMessageId"),
+            Some("incremental-authored-client")
+        );
     }
 
     #[test]
