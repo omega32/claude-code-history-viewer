@@ -36,7 +36,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 4;
+const SNAPSHOT_CURSOR_VERSION: u32 = 5;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -137,6 +137,8 @@ struct PendingCodexUserMessage {
     response_text: Option<String>,
     authored_turn_id: Option<String>,
     precedes_input_boundary: bool,
+    saw_same_turn_agent_activity_after_boundary: bool,
+    parse_sequence_is_complete: bool,
 }
 
 fn codex_user_response_text(payload: &Value) -> Option<String> {
@@ -171,19 +173,19 @@ fn classify_pending_user_event(
     event_payload: &Value,
     authored_user_messages_in_turn: usize,
     active_turn_id: Option<&str>,
-) {
+) -> bool {
     let Some(event_text) = event_payload.get("message").and_then(Value::as_str) else {
         pending.clear();
-        return;
+        return false;
     };
     let Some(matched) = pending.last() else {
-        return;
+        return false;
     };
     if matched.response_text.as_deref() != Some(event_text) {
         // A missing, reordered, or non-text pairing is ambiguous. Preserve every
         // candidate as authorship_unknown instead of guessing from its content.
         pending.clear();
-        return;
+        return false;
     }
 
     let matched_index = matched.message_index;
@@ -191,6 +193,9 @@ fn classify_pending_user_event(
     let matched_turn_is_consistent = matched_turn_id
         .as_deref()
         .is_some_and(|turn_id| active_turn_id.is_none() || active_turn_id == Some(turn_id));
+    let matched_pair_belongs_to_active_turn = matched_turn_id.as_deref().map_or(true, |turn_id| {
+        active_turn_id.is_none() || active_turn_id == Some(turn_id)
+    });
     let unmatched_len = pending.len().saturating_sub(1);
     for unmatched in pending.drain(..unmatched_len) {
         let unmatched_turn_is_consistent =
@@ -211,6 +216,55 @@ fn classify_pending_user_event(
         .to_string(),
     );
     pending.clear();
+    matched_pair_belongs_to_active_turn
+}
+
+fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &str) -> bool {
+    if codex_authored_turn_id(payload).as_deref() != Some(active_turn_id) {
+        return false;
+    }
+
+    match payload.get("type").and_then(Value::as_str) {
+        Some("message") => payload.get("role").and_then(Value::as_str) == Some("assistant"),
+        Some(
+            "reasoning"
+            | "local_shell_call"
+            | "function_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "web_search_call",
+        ) => true,
+        _ => false,
+    }
+}
+
+fn classify_pending_terminal_context(
+    messages: &mut [ClaudeMessage],
+    pending: &[PendingCodexUserMessage],
+    authored_user_messages_in_turn: usize,
+    active_turn_id: &str,
+    terminal_payload: &Value,
+) {
+    // A context refresh injected while a task is already running has no companion
+    // user_message event. Resolve it only when the surrounding provider sequence is
+    // complete and unambiguous; every incomplete or reordered shape stays unknown.
+    if authored_user_messages_in_turn == 0
+        || terminal_payload.get("turn_id").and_then(Value::as_str) != Some(active_turn_id)
+    {
+        return;
+    }
+
+    let [candidate] = pending else {
+        return;
+    };
+    if candidate.authored_turn_id.as_deref() == Some(active_turn_id)
+        && candidate.precedes_input_boundary
+        && candidate.saw_same_turn_agent_activity_after_boundary
+        && candidate.parse_sequence_is_complete
+    {
+        messages[candidate.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
+    }
 }
 
 /// Detect Codex CLI installation
@@ -1201,9 +1255,13 @@ fn parse_rollout_slice(
         }
         let line = &bytes[start..end];
         let mut buf = line.to_vec();
-        let val: Value = match simd_json::from_slice(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let val: Value = if let Ok(value) = simd_json::from_slice(&mut buf) {
+            value
+        } else {
+            for candidate in &mut pending_user_messages {
+                candidate.parse_sequence_is_complete = false;
+            }
+            continue;
         };
         accepted_len = if bytes.get(end) == Some(&b'\n') {
             end + 1
@@ -1274,6 +1332,15 @@ fn parse_rollout_slice(
             }
             "response_item" => {
                 if let Some(payload) = val.get("payload") {
+                    if active_turn_id.as_deref().is_some_and(|turn_id| {
+                        codex_response_is_same_turn_agent_activity(payload, turn_id)
+                    }) {
+                        for candidate in &mut pending_user_messages {
+                            if candidate.precedes_input_boundary {
+                                candidate.saw_same_turn_agent_activity_after_boundary = true;
+                            }
+                        }
+                    }
                     let is_user_message = payload.get("type").and_then(Value::as_str)
                         == Some("message")
                         && payload.get("role").and_then(Value::as_str) == Some("user");
@@ -1310,6 +1377,8 @@ fn parse_rollout_slice(
                                 response_text: codex_user_response_text(payload),
                                 authored_turn_id: codex_authored_turn_id(payload),
                                 precedes_input_boundary: false,
+                                saw_same_turn_agent_activity_after_boundary: false,
+                                parse_sequence_is_complete: true,
                             });
                         }
                     }
@@ -1334,16 +1403,18 @@ fn parse_rollout_slice(
                     // distinguish same-turn steering from injected user-role context.
                     if event_type == "user_message" {
                         if active_turn_id.is_some() {
-                            classify_pending_user_event(
+                            let positively_paired = classify_pending_user_event(
                                 &mut messages,
                                 &mut pending_user_messages,
                                 payload,
                                 authored_user_messages_in_turn,
                                 active_turn_id.as_deref(),
                             );
-                            authored_user_messages_in_turn += 1;
+                            if positively_paired {
+                                authored_user_messages_in_turn += 1;
+                            }
                         } else {
-                            classify_pending_user_event(
+                            let _ = classify_pending_user_event(
                                 &mut messages,
                                 &mut pending_user_messages,
                                 payload,
@@ -1495,6 +1566,13 @@ fn parse_rollout_slice(
                         && payload.get("turn_id").and_then(Value::as_str)
                             == active_turn_id.as_deref()
                     {
+                        classify_pending_terminal_context(
+                            &mut messages,
+                            &pending_user_messages,
+                            authored_user_messages_in_turn,
+                            active_turn_id.as_deref().expect("matching active turn"),
+                            payload,
+                        );
                         if let Some(last_msg) = messages[active_turn_message_start..]
                             .iter_mut()
                             .rev()
@@ -6753,6 +6831,349 @@ mod tests {
                 .and_then(Value::as_str),
             Some(authored)
         );
+    }
+
+    fn terminal_context_fixture(
+        active_turn_id: &str,
+        prior_authored_turn_id: Option<&str>,
+        context_turn_id: &str,
+        include_boundary: bool,
+        activity_turn_id: Option<&str>,
+        include_second_pending: bool,
+        terminal_turn_id: &str,
+    ) -> Vec<Value> {
+        let mut lines = vec![
+            json!({
+                "timestamp": "2026-08-11T04:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "terminal-context" }
+            }),
+            json!({
+                "timestamp": "2026-08-11T04:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": active_turn_id }
+            }),
+        ];
+        if let Some(prior_authored_turn_id) = prior_authored_turn_id {
+            lines.extend([
+                json!({
+                    "timestamp": "2026-08-11T04:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "implement the change" }],
+                        "internal_chat_message_metadata_passthrough": { "turn_id": prior_authored_turn_id }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-11T04:00:03Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "implement the change" }
+                }),
+            ]);
+        }
+        lines.push(json!({
+            "timestamp": "2026-08-11T04:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": "<environment_context>refresh</environment_context>" }],
+                "internal_chat_message_metadata_passthrough": { "turn_id": context_turn_id }
+            }
+        }));
+        if include_second_pending {
+            lines.push(json!({
+                "timestamp": "2026-08-11T04:00:04.5Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "second unresolved record" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": active_turn_id }
+                }
+            }));
+        }
+        if include_boundary {
+            lines.push(json!({
+                "timestamp": "2026-08-11T04:00:05Z",
+                "type": "world_state",
+                "payload": { "full": false }
+            }));
+        }
+        if let Some(activity_turn_id) = activity_turn_id {
+            lines.push(json!({
+                "timestamp": "2026-08-11T04:00:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning", "summary": [], "encrypted_content": "opaque",
+                    "internal_chat_message_metadata_passthrough": { "turn_id": activity_turn_id }
+                }
+            }));
+        }
+        lines.push(json!({
+            "timestamp": "2026-08-11T04:00:07Z",
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": terminal_turn_id }
+        }));
+        lines
+    }
+
+    fn write_terminal_context_fixture(path: &Path, lines: &[Value], malformed_gap: bool) {
+        let mut serialized = lines.iter().map(Value::to_string).collect::<Vec<_>>();
+        if malformed_gap {
+            serialized.insert(serialized.len() - 1, "{malformed".to_string());
+        }
+        fs::write(path, format!("{}\n", serialized.join("\n")))
+            .expect("terminal context fixture should be written");
+    }
+
+    #[test]
+    fn load_messages_marks_completed_same_turn_context_refresh_as_injected() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("terminal-context.jsonl");
+        let lines = terminal_context_fixture(
+            "turn-1",
+            Some("turn-1"),
+            "turn-1",
+            true,
+            Some("turn-1"),
+            false,
+            "turn-1",
+        );
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let messages = parse_rollout_file(&rollout_path).expect("rollout should parse");
+        let context = messages
+            .iter()
+            .find(|message| {
+                message.message_type == "user"
+                    && message
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| content.to_string().contains("environment_context"))
+            })
+            .expect("context refresh should remain in the base projection");
+        assert_eq!(context.subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+    }
+
+    #[test]
+    fn load_messages_terminal_context_inference_fails_open_without_each_proof() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let cases = [
+            (
+                "no-prior-authored-pair",
+                terminal_context_fixture(
+                    "turn-1",
+                    None,
+                    "turn-1",
+                    true,
+                    Some("turn-1"),
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "cross-turn-prior-authored-pair",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("other-turn"),
+                    "turn-1",
+                    true,
+                    Some("turn-1"),
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "cross-turn-context",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "other-turn",
+                    true,
+                    Some("turn-1"),
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "no-input-boundary",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    false,
+                    Some("turn-1"),
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "no-agent-activity",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    true,
+                    None,
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "cross-turn-agent-activity",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    true,
+                    Some("other-turn"),
+                    false,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "multiple-pending-records",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    true,
+                    Some("turn-1"),
+                    true,
+                    "turn-1",
+                ),
+                false,
+            ),
+            (
+                "mismatched-terminal",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    true,
+                    Some("turn-1"),
+                    false,
+                    "other-turn",
+                ),
+                false,
+            ),
+            (
+                "malformed-gap",
+                terminal_context_fixture(
+                    "turn-1",
+                    Some("turn-1"),
+                    "turn-1",
+                    true,
+                    Some("turn-1"),
+                    false,
+                    "turn-1",
+                ),
+                true,
+            ),
+        ];
+
+        for (name, lines, malformed_gap) in cases {
+            let rollout_path = tmp.path().join(format!("{name}.jsonl"));
+            write_terminal_context_fixture(&rollout_path, &lines, malformed_gap);
+            let messages = parse_rollout_file(&rollout_path).expect("rollout should parse");
+            let unresolved = messages
+                .iter()
+                .find(|message| {
+                    message.message_type == "user"
+                        && message.content.as_ref().is_some_and(|content| {
+                            content.to_string().contains("environment_context")
+                        })
+                })
+                .expect("candidate should remain visible");
+            assert_eq!(
+                unresolved.subtype.as_deref(),
+                Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+                "{name} must fail open"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_reclassifies_same_turn_context_only_after_matching_completion() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions_dir, "snapshot-terminal-context");
+        let path_text = path.to_string_lossy();
+
+        let mut active_lines = terminal_context_fixture(
+            "turn-2",
+            Some("turn-2"),
+            "turn-2",
+            true,
+            Some("turn-2"),
+            false,
+            "turn-2",
+        );
+        active_lines.remove(0);
+        active_lines.pop();
+        append_rollout_lines(&path, &active_lines);
+
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("unresolved snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+        let unresolved = cached
+            .iter()
+            .find(|message| {
+                message.message_type == "user"
+                    && message
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| content.to_string().contains("environment_context"))
+            })
+            .expect("context refresh should be visible before completion");
+        assert_eq!(
+            unresolved.subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+        );
+
+        append_rollout_lines(
+            &path,
+            &[json!({
+                "timestamp": "2026-08-11T04:00:07Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-2" }
+            })],
+        );
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("resolved replacement") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("matching completion should replace the active suffix"),
+        }
+        assert_snapshot_matches_fresh(&cached, &path);
+        assert!(cached.iter().any(|message| {
+            message.subtype.as_deref() == Some(INJECTED_CONTEXT_SUBTYPE)
+                && message
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| content.to_string().contains("environment_context"))
+        }));
     }
 
     #[test]
