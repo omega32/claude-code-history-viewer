@@ -91,6 +91,7 @@ struct CodexSnapshotCursor {
 
 struct CodexParseOutcome {
     messages: Vec<ClaudeMessage>,
+    diagnostics: Vec<CodexAuthorshipDiagnostic>,
     checkpoint: CodexParserCheckpoint,
     accepted_len: usize,
 }
@@ -134,10 +135,31 @@ struct ExternalAgentImportRecord {
 #[derive(Debug)]
 struct PendingCodexUserMessage {
     message_index: usize,
+    message_id: String,
+    source_line: usize,
     response_text: Option<String>,
     authored_turn_id: Option<String>,
     precedes_input_boundary: bool,
     terminal_evidence: TerminalContextEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexAuthorshipDiagnostic {
+    pub(crate) kind: String,
+    pub(crate) message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_turn_id: Option<String>,
+    pub(crate) source_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) discriminator: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CodexAuthorshipAuditProjection {
+    pub(crate) session_id: String,
+    pub(crate) messages: Vec<ClaudeMessage>,
+    pub(crate) diagnostics: Vec<CodexAuthorshipDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +191,52 @@ impl TerminalContextEvidence {
 
     fn invalidate(&mut self) {
         *self = Self::Invalid;
+    }
+}
+
+fn bounded_discriminator(value: Option<&str>) -> Option<String> {
+    const MAX_DISCRIMINATOR_CHARS: usize = 128;
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(MAX_DISCRIMINATOR_CHARS).collect())
+}
+
+fn invalidate_pending_authorship(
+    pending: &mut [PendingCodexUserMessage],
+    diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
+    kind: &str,
+    source_line: usize,
+    discriminator: Option<&str>,
+) {
+    for candidate in pending {
+        if candidate.terminal_evidence == TerminalContextEvidence::Invalid {
+            continue;
+        }
+        candidate.terminal_evidence.invalidate();
+        diagnostics.push(CodexAuthorshipDiagnostic {
+            kind: kind.to_string(),
+            message_id: candidate.message_id.clone(),
+            provider_turn_id: candidate.authored_turn_id.clone(),
+            source_line,
+            discriminator: bounded_discriminator(discriminator),
+        });
+    }
+}
+
+fn diagnose_unresolved_candidate(
+    candidate: &PendingCodexUserMessage,
+    diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
+    kind: &str,
+    source_line: usize,
+) {
+    if candidate.terminal_evidence != TerminalContextEvidence::Invalid {
+        diagnostics.push(CodexAuthorshipDiagnostic {
+            kind: kind.to_string(),
+            message_id: candidate.message_id.clone(),
+            provider_turn_id: candidate.authored_turn_id.clone(),
+            source_line,
+            discriminator: None,
+        });
     }
 }
 
@@ -243,8 +311,17 @@ fn classify_pending_user_event(
     event_payload: &Value,
     authored_user_identities_in_turn: &[CodexAuthoredUserIdentity],
     active_turn_id: Option<&str>,
+    diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
+    source_line: usize,
 ) -> Option<CodexAuthoredUserIdentity> {
     let Some(event_text) = event_payload.get("message").and_then(Value::as_str) else {
+        invalidate_pending_authorship(
+            pending,
+            diagnostics,
+            "missing-user-message-text",
+            source_line,
+            Some("user_message"),
+        );
         pending.clear();
         return None;
     };
@@ -252,6 +329,13 @@ fn classify_pending_user_event(
     if matched.response_text.as_deref() != Some(event_text) {
         // A missing, reordered, or non-text pairing is ambiguous. Preserve every
         // candidate as authorship_unknown instead of guessing from its content.
+        invalidate_pending_authorship(
+            pending,
+            diagnostics,
+            "pair-text-mismatch",
+            source_line,
+            Some("user_message"),
+        );
         pending.clear();
         return None;
     }
@@ -263,6 +347,13 @@ fn classify_pending_user_event(
             .as_deref()
             .is_some_and(|turn_id| active_turn_id != Some(turn_id))
     {
+        invalidate_pending_authorship(
+            pending,
+            diagnostics,
+            "cross-turn-pairing",
+            source_line,
+            active_turn_id,
+        );
         pending.clear();
         return None;
     }
@@ -274,6 +365,13 @@ fn classify_pending_user_event(
                 .as_deref()
                 .is_some_and(|client_id| identity.client_id.as_deref() == Some(client_id))
     }) {
+        invalidate_pending_authorship(
+            pending,
+            diagnostics,
+            "duplicate-authored-identity",
+            source_line,
+            client_id.as_deref(),
+        );
         pending.clear();
         return None;
     }
@@ -291,6 +389,17 @@ fn classify_pending_user_event(
             && unmatched.terminal_evidence != TerminalContextEvidence::Invalid
         {
             messages[unmatched.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
+        } else {
+            let kind = if unmatched.authored_turn_id.is_none() {
+                "missing-candidate-turn-id"
+            } else if !unmatched_turn_is_consistent {
+                "cross-turn-pairing"
+            } else if !unmatched.precedes_input_boundary {
+                "missing-input-boundary"
+            } else {
+                "terminal-sequence-invalidated"
+            };
+            diagnose_unresolved_candidate(&unmatched, diagnostics, kind, source_line);
         }
     }
     messages[matched_index].subtype = Some(
@@ -353,10 +462,12 @@ fn codex_event_is_known_terminal_bookkeeping(payload: &Value, active_turn_id: &s
 
 fn observe_pending_terminal_record(
     pending: &mut [PendingCodexUserMessage],
+    diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
     line_type: &str,
     event_type: &str,
     payload: Option<&Value>,
     active_turn_id: Option<&str>,
+    source_line: usize,
 ) {
     if pending.is_empty() {
         return;
@@ -390,15 +501,25 @@ fn observe_pending_terminal_record(
                     candidate.precedes_input_boundary = true;
                     candidate.terminal_evidence.observe_boundary();
                 } else {
-                    candidate.terminal_evidence.invalidate();
+                    invalidate_pending_authorship(
+                        std::slice::from_mut(candidate),
+                        diagnostics,
+                        "invalid-input-boundary",
+                        source_line,
+                        explicit_turn_id,
+                    );
                 }
             }
         }
         "response_item" => {
             let Some(payload) = payload else {
-                for candidate in pending {
-                    candidate.terminal_evidence.invalidate();
-                }
+                invalidate_pending_authorship(
+                    pending,
+                    diagnostics,
+                    "malformed-response-item",
+                    source_line,
+                    None,
+                );
                 return;
             };
             let is_user_message = payload.get("type").and_then(Value::as_str) == Some("message")
@@ -413,7 +534,14 @@ fn observe_pending_terminal_record(
                 if is_same_turn_activity {
                     candidate.terminal_evidence.observe_same_turn_activity();
                 } else {
-                    candidate.terminal_evidence.invalidate();
+                    let discriminator = payload.get("type").and_then(Value::as_str);
+                    invalidate_pending_authorship(
+                        std::slice::from_mut(candidate),
+                        diagnostics,
+                        "unknown-or-cross-turn-response-item",
+                        source_line,
+                        discriminator,
+                    );
                 }
             }
         }
@@ -431,9 +559,15 @@ fn observe_pending_terminal_record(
                 if completion_matches {
                     return;
                 }
-                for candidate in pending {
-                    candidate.terminal_evidence.invalidate();
-                }
+                invalidate_pending_authorship(
+                    pending,
+                    diagnostics,
+                    "mismatched-task-completion",
+                    source_line,
+                    payload
+                        .and_then(|payload| payload.get("turn_id"))
+                        .and_then(Value::as_str),
+                );
                 return;
             }
             let is_known_bookkeeping = active_turn_id.is_some_and(|turn_id| {
@@ -442,15 +576,27 @@ fn observe_pending_terminal_record(
                 })
             });
             if !is_known_bookkeeping {
-                for candidate in pending {
-                    candidate.terminal_evidence.invalidate();
-                }
+                invalidate_pending_authorship(
+                    pending,
+                    diagnostics,
+                    "unknown-event-type",
+                    source_line,
+                    (!event_type.is_empty()).then_some(event_type),
+                );
             }
         }
         _ => {
-            for candidate in pending {
-                candidate.terminal_evidence.invalidate();
-            }
+            invalidate_pending_authorship(
+                pending,
+                diagnostics,
+                if line_type.is_empty() {
+                    "missing-record-type"
+                } else {
+                    "unknown-top-level-record"
+                },
+                source_line,
+                (!line_type.is_empty()).then_some(line_type),
+            );
         }
     }
 }
@@ -461,6 +607,8 @@ fn classify_pending_terminal_context(
     authored_user_identities_in_turn: &[CodexAuthoredUserIdentity],
     active_turn_id: &str,
     terminal_payload: &Value,
+    diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
+    source_line: usize,
 ) {
     // A context refresh injected while a task is already running has no companion
     // user_message event. Resolve it only when the surrounding provider sequence is
@@ -468,10 +616,26 @@ fn classify_pending_terminal_context(
     if authored_user_identities_in_turn.is_empty()
         || terminal_payload.get("turn_id").and_then(Value::as_str) != Some(active_turn_id)
     {
+        for candidate in pending {
+            diagnose_unresolved_candidate(
+                candidate,
+                diagnostics,
+                "terminal-context-missing-prior-authorship",
+                source_line,
+            );
+        }
         return;
     }
 
     let [candidate] = pending else {
+        for candidate in pending {
+            diagnose_unresolved_candidate(
+                candidate,
+                diagnostics,
+                "competing-pending-candidates",
+                source_line,
+            );
+        }
         return;
     };
     if candidate.authored_turn_id.as_deref() == Some(active_turn_id)
@@ -479,6 +643,15 @@ fn classify_pending_terminal_context(
         && candidate.terminal_evidence == TerminalContextEvidence::SameTurnActivitySeen
     {
         messages[candidate.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
+    } else {
+        let kind = if candidate.authored_turn_id.as_deref() != Some(active_turn_id) {
+            "cross-turn-terminal-context"
+        } else if !candidate.precedes_input_boundary {
+            "missing-input-boundary"
+        } else {
+            "incomplete-terminal-sequence"
+        };
+        diagnose_unresolved_candidate(candidate, diagnostics, kind, source_line);
     }
 }
 
@@ -1448,6 +1621,96 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
         .map_err(|()| "Codex rollout unexpectedly referenced an earlier prefix".to_string())
 }
 
+pub(crate) fn validate_authorship_audit_path(session_path: &Path) -> Result<PathBuf, String> {
+    if !session_path.is_absolute() {
+        return Err("Codex audit rollout path must be absolute".to_string());
+    }
+    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
+    for root in [
+        base_path.join("sessions"),
+        base_path.join("archived_sessions"),
+    ] {
+        let Ok(relative) = session_path.strip_prefix(&root) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("Codex audit rollout path is not an exact provider path".to_string());
+        }
+        let root_metadata = fs::symlink_metadata(&root)
+            .map_err(|error| format!("Failed to inspect Codex session directory: {error}"))?;
+        if !root_metadata.is_dir() || is_symlink_or_reparse(&root_metadata) {
+            return Err("Codex audit session directory is not a direct directory".to_string());
+        }
+        let mut current = root.clone();
+        let component_count = relative.components().count();
+        for (index, component) in relative.components().enumerate() {
+            let Component::Normal(name) = component else {
+                unreachable!("relative path components were validated");
+            };
+            current.push(name);
+            let metadata = fs::symlink_metadata(&current)
+                .map_err(|error| format!("Failed to inspect Codex audit rollout: {error}"))?;
+            if is_symlink_or_reparse(&metadata) {
+                return Err(
+                    "Codex audit rollout path contains a symbolic link or reparse point"
+                        .to_string(),
+                );
+            }
+            let is_final = index + 1 == component_count;
+            if (is_final && !metadata.is_file()) || (!is_final && !metadata.is_dir()) {
+                return Err("Codex audit rollout path is not a regular file".to_string());
+            }
+        }
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve Codex session directory: {error}"))?;
+        let canonical_path = session_path
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve Codex audit rollout: {error}"))?;
+        if !canonical_path.starts_with(canonical_root) {
+            return Err(
+                "Codex audit rollout path is outside provider session directories".to_string(),
+            );
+        }
+        if !is_discoverable_rollout(&canonical_path) {
+            return Err("Codex audit path is not a supported rollout carrier".to_string());
+        }
+        return Ok(canonical_path);
+    }
+    Err("Codex audit rollout path is outside provider session directories".to_string())
+}
+
+pub(crate) fn parse_authorship_audit(
+    session_path: &Path,
+) -> Result<CodexAuthorshipAuditProjection, String> {
+    let canonical_path = validate_authorship_audit_path(session_path)?;
+    let bytes = read_rollout_bytes(&canonical_path)?;
+    let ranges = find_line_ranges(&bytes);
+    let state = CodexParserState::initial(&canonical_path);
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        state: state.clone(),
+    };
+    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
+        .map_err(|()| "Codex audit parse unexpectedly crossed its prefix".to_string())?;
+    let session_id = outcome
+        .messages
+        .first()
+        .map(|message| message.session_id.clone())
+        .filter(|session_id| !session_id.is_empty() && session_id != "unknown")
+        .ok_or("Codex audit rollout did not expose a stable thread id")?;
+    Ok(CodexAuthorshipAuditProjection {
+        session_id,
+        messages: finalize_loaded_messages(outcome.messages),
+        diagnostics: outcome.diagnostics,
+    })
+}
+
 fn parse_rollout_slice(
     bytes: &[u8],
     ranges: &[(usize, usize)],
@@ -1456,6 +1719,7 @@ fn parse_rollout_slice(
     resumed: bool,
 ) -> Result<CodexParseOutcome, ()> {
     let mut messages = Vec::new();
+    let mut diagnostics = Vec::new();
     let slice_base_replace_from = checkpoint.replace_from;
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
     let mut active_turn_id: Option<String> = None;
@@ -1470,12 +1734,17 @@ fn parse_rollout_slice(
         }
         let line = &bytes[start..end];
         let mut buf = line.to_vec();
+        let source_line = range_index + 1;
         let val: Value = if let Ok(value) = simd_json::from_slice(&mut buf) {
             value
         } else {
-            for candidate in &mut pending_user_messages {
-                candidate.terminal_evidence.invalidate();
-            }
+            invalidate_pending_authorship(
+                &mut pending_user_messages,
+                &mut diagnostics,
+                "malformed-json",
+                source_line,
+                None,
+            );
             continue;
         };
         accepted_len = if bytes.get(end) == Some(&b'\n') {
@@ -1500,10 +1769,12 @@ fn parse_rollout_slice(
         };
         observe_pending_terminal_record(
             &mut pending_user_messages,
+            &mut diagnostics,
             line_type,
             event_type,
             val.get("payload"),
             active_turn_id.as_deref(),
+            source_line,
         );
 
         // Current Codex rollouts persist one logical compaction twice: the
@@ -1586,6 +1857,8 @@ fn parse_rollout_slice(
                                 Some(AUTHORSHIP_UNKNOWN_SUBTYPE.to_string());
                             pending_user_messages.push(PendingCodexUserMessage {
                                 message_index,
+                                message_id: messages[message_index].uuid.clone(),
+                                source_line,
                                 response_text: codex_user_response_text(payload),
                                 authored_turn_id: provider_turn_id,
                                 precedes_input_boundary: false,
@@ -1615,6 +1888,8 @@ fn parse_rollout_slice(
                                 payload,
                                 &authored_user_identities_in_turn,
                                 active_turn_id.as_deref(),
+                                &mut diagnostics,
+                                source_line,
                             );
                             if let Some(identity) = identity {
                                 authored_user_identities_in_turn.push(identity);
@@ -1626,6 +1901,8 @@ fn parse_rollout_slice(
                                 payload,
                                 &authored_user_identities_in_turn,
                                 None,
+                                &mut diagnostics,
+                                source_line,
                             );
                         }
                         continue;
@@ -1641,6 +1918,14 @@ fn parse_rollout_slice(
                     }
 
                     if event_type == "task_started" {
+                        for candidate in &pending_user_messages {
+                            diagnose_unresolved_candidate(
+                                candidate,
+                                &mut diagnostics,
+                                "unresolved-before-task-start",
+                                source_line,
+                            );
+                        }
                         active_turn_id = payload
                             .get("turn_id")
                             .and_then(Value::as_str)
@@ -1783,6 +2068,8 @@ fn parse_rollout_slice(
                             &authored_user_identities_in_turn,
                             active_turn_id.as_deref().expect("matching active turn"),
                             payload,
+                            &mut diagnostics,
+                            source_line,
                         );
                         if let Some(last_msg) = messages[active_turn_message_start..]
                             .iter_mut()
@@ -1828,8 +2115,18 @@ fn parse_rollout_slice(
         }
     }
 
+    for candidate in &pending_user_messages {
+        diagnose_unresolved_candidate(
+            candidate,
+            &mut diagnostics,
+            "unresolved-at-eof",
+            candidate.source_line,
+        );
+    }
+
     Ok(CodexParseOutcome {
         messages,
+        diagnostics,
         checkpoint,
         accepted_len,
     })

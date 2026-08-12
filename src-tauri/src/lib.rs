@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod cli_args;
+pub mod codex_audit;
 pub mod commands;
 pub mod export;
 pub mod headless_dump;
@@ -93,6 +94,14 @@ pub fn run() {
             .any(|a| a == "--export" || a.starts_with("--export="))
         {
             std::process::exit(export::run_export(&args));
+        }
+        // Opt-in, identity-only differential audit between one Codex rollout
+        // and a separately captured, hash-bound app-server thread/read result.
+        if args
+            .iter()
+            .any(|a| a == "--audit-codex-authorship" || a.starts_with("--audit-codex-authorship="))
+        {
+            std::process::exit(headless_dump::run_audit_codex_authorship(&args));
         }
         // Headless normalized, multi-provider dump (`--dump-session <id|path>
         // [--provider <name>]`). Like `--export`, handled before any GUI/webview.

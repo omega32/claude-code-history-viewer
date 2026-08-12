@@ -31,7 +31,8 @@
 //! archive state), and `--capabilities` (a tiny version/feature probe so callers
 //! can fail fast on an incompatible build).
 
-use crate::cli_args::extract_flag_value;
+use crate::cli_args::{extract_flag_value, has_explicit_empty_flag};
+use crate::codex_audit::{self, CodexAuthorshipAuditStatus};
 use crate::commands::multi_provider::{
     finalize_loaded_messages, load_provider_messages, load_provider_sessions, scan_all_projects,
 };
@@ -43,6 +44,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
@@ -97,6 +99,84 @@ fn emit_json<T: serde::Serialize>(args: &[String], value: &T) -> i32 {
     }
 }
 
+/// Emit an audit report without ever replacing an existing path. A temporary
+/// file is hard-linked into the requested name, making target creation atomic
+/// even when another process races the initial existence check.
+fn emit_read_only_audit_json<T: serde::Serialize>(args: &[String], value: &T) -> i32 {
+    let Some(path) = extract_flag_value(args, "--output") else {
+        return emit_json(args, value);
+    };
+    let json = match serde_json::to_vec_pretty(value) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("Failed to serialize JSON: {error}");
+            return 1;
+        }
+    };
+    let output = Path::new(&path);
+    if output.exists() {
+        eprintln!("Refusing to replace an existing audit output path");
+        return 1;
+    }
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = output.file_name().and_then(|name| name.to_str()) else {
+        eprintln!("Audit output must name a regular file");
+        return 1;
+    };
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut temporary = None;
+    for _ in 0..16 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.cchv-audit-{}-{counter}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file.write_all(&json).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&candidate);
+                    eprintln!("Failed to write audit report: {error}");
+                    return 1;
+                }
+                drop(file);
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                eprintln!("Failed to create audit report: {error}");
+                return 1;
+            }
+        }
+    }
+    let Some(temporary) = temporary else {
+        eprintln!("Failed to allocate a temporary audit report");
+        return 1;
+    };
+    let link_result = std::fs::hard_link(&temporary, output);
+    let cleanup_result = std::fs::remove_file(&temporary);
+    if let Err(error) = link_result {
+        eprintln!("Failed to create audit report without replacing existing data: {error}");
+        return 1;
+    }
+    if let Err(error) = cleanup_result {
+        eprintln!(
+            "Audit report was written, but its temporary hard link could not be removed: {error}"
+        );
+        return 1;
+    }
+    0
+}
+
 /// Version/feature probe emitted by `--capabilities`. Lets a caller (e.g. ccmsg)
 /// confirm the binary speaks the headless protocol it needs, and which version,
 /// rather than inferring it from a failed call.
@@ -126,6 +206,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "hide-session",
             "archive-session",
             "unarchive-session",
+            "audit-codex-authorship",
             "capabilities",
         ],
     };
@@ -153,6 +234,12 @@ backup payload. This command never discovers or consults current provider roots.
 const BACKUP_LIST_USAGE: &str = "Usage: --list-backup-sessions <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
 List sessions only from one explicit verified backup payload. The payload uses\n\
 ccmsg's provider-neutral logical layout; no live provider root or index is read.";
+
+const CODEX_AUTHORSHIP_AUDIT_USAGE: &str = "Usage: --audit-codex-authorship <absolute-rollout-path> --app-server-response <absolute-json-path> [--format json] [--output <file>]\n\n\
+Compare the normalized Codex authorship projection with a separately captured\n\
+app-server thread/read response. Only a schema-versioned capture bound to the\n\
+exact rollout length and SHA-256 can return a match; bare responses are always\n\
+inconclusive. The report contains structural identities and diagnostics only.";
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -264,6 +351,45 @@ pub fn run_dump_session(args: &[String]) -> i32 {
         }
     };
     emit_json(args, &messages)
+}
+
+/// Handle the opt-in Codex parser/app-server authorship differential audit.
+pub fn run_audit_codex_authorship(args: &[String]) -> i32 {
+    let Some(rollout_path) = extract_flag_value(args, "--audit-codex-authorship") else {
+        eprintln!("{CODEX_AUTHORSHIP_AUDIT_USAGE}");
+        return 2;
+    };
+    let Some(app_server_response_path) = extract_flag_value(args, "--app-server-response") else {
+        eprintln!("{CODEX_AUTHORSHIP_AUDIT_USAGE}");
+        return 2;
+    };
+    if has_explicit_empty_flag(args, "--format") || has_explicit_empty_flag(args, "--output") {
+        eprintln!("{CODEX_AUTHORSHIP_AUDIT_USAGE}");
+        return 2;
+    }
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+
+    let report = match codex_audit::audit_paths(
+        Path::new(&rollout_path),
+        Path::new(&app_server_response_path),
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    let is_match = report.status == CodexAuthorshipAuditStatus::Match;
+    let emit_status = emit_read_only_audit_json(args, &report);
+    if emit_status != 0 {
+        emit_status
+    } else {
+        i32::from(!is_match)
+    }
 }
 
 /// Handle the cursor-aware normalized session refresh command.
@@ -1901,9 +2027,49 @@ mod tests {
                 "hide-session",
                 "archive-session",
                 "unarchive-session",
+                "audit-codex-authorship",
                 "capabilities"
             ])
         );
+    }
+
+    #[test]
+    fn codex_authorship_audit_requires_both_explicit_inputs() {
+        let missing_rollout = args(&["viewer", "--audit-codex-authorship"]);
+        assert_eq!(run_audit_codex_authorship(&missing_rollout), 2);
+
+        let missing_response = args(&[
+            "viewer",
+            "--audit-codex-authorship",
+            "C:\\private\\rollout.jsonl",
+        ]);
+        assert_eq!(run_audit_codex_authorship(&missing_response), 2);
+
+        for empty_flag in ["--format", "--format=", "--output", "--output="] {
+            let invalid = args(&[
+                "viewer",
+                "--audit-codex-authorship",
+                "C:\\private\\rollout.jsonl",
+                "--app-server-response",
+                "C:\\private\\capture.json",
+                empty_flag,
+            ]);
+            assert_eq!(run_audit_codex_authorship(&invalid), 2);
+        }
+    }
+
+    #[test]
+    fn codex_authorship_audit_output_never_replaces_an_existing_file() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("source.jsonl");
+        std::fs::write(&output, b"PRIVATE SOURCE").unwrap();
+        let argv = args(&["viewer", "--output", output.to_str().unwrap()]);
+
+        assert_eq!(
+            emit_read_only_audit_json(&argv, &json!({"status":"match"})),
+            1
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"PRIVATE SOURCE");
     }
 
     #[test]
