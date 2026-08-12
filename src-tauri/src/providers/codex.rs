@@ -36,7 +36,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 6;
+const SNAPSHOT_CURSOR_VERSION: u32 = 7;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -443,6 +443,22 @@ fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &
     }
 }
 
+fn codex_response_is_interleaved_context_instruction(
+    payload: &Value,
+    active_turn_id: &str,
+    pending: &[PendingCodexUserMessage],
+) -> bool {
+    payload.get("type").and_then(Value::as_str) == Some("message")
+        && payload.get("role").and_then(Value::as_str) == Some("developer")
+        && codex_authored_turn_id(payload).as_deref() == Some(active_turn_id)
+        && !pending.is_empty()
+        && pending.iter().all(|candidate| {
+            candidate.authored_turn_id.as_deref() == Some(active_turn_id)
+                && !candidate.precedes_input_boundary
+                && candidate.terminal_evidence == TerminalContextEvidence::AwaitingBoundary
+        })
+}
+
 fn codex_event_is_known_terminal_bookkeeping(payload: &Value, active_turn_id: &str) -> bool {
     match payload.get("type").and_then(Value::as_str) {
         Some("token_count" | "agent_message" | "agent_reasoning") => true,
@@ -525,6 +541,11 @@ fn observe_pending_terminal_record(
             let is_user_message = payload.get("type").and_then(Value::as_str) == Some("message")
                 && payload.get("role").and_then(Value::as_str) == Some("user");
             if is_user_message {
+                return;
+            }
+            if active_turn_id.is_some_and(|turn_id| {
+                codex_response_is_interleaved_context_instruction(payload, turn_id, pending)
+            }) {
                 return;
             }
             let is_same_turn_activity = active_turn_id.is_some_and(|turn_id| {
@@ -7294,6 +7315,151 @@ mod tests {
         assert_eq!(
             message_data_str(users[3], "clientMessageId"),
             Some("client-turn-2-primary")
+        );
+    }
+
+    #[test]
+    fn load_messages_marks_interleaved_agent_context_as_injected() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("interleaved-agent-context.jsonl");
+        let turn_id = "turn-resumed";
+        let lines = [
+            json!({
+                "timestamp": "2026-08-12T19:57:11Z",
+                "type": "session_meta",
+                "payload": { "id": "interleaved-agent-context" }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:11Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": turn_id }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:11Z",
+                "type": "session_meta",
+                "payload": { "id": "interleaved-agent-context" }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "agent-context", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>opaque</INSTRUCTIONS>" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "developer-after-agent-context", "type": "message", "role": "developer",
+                    "content": [{ "type": "input_text", "text": "developer context" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "environment-context", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "<environment_context>opaque</environment_context>" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "developer-after-environment-context", "type": "message", "role": "developer",
+                    "content": [{ "type": "input_text", "text": "more developer context" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "world_state",
+                "payload": { "full": true }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "turn_context",
+                "payload": { "turn_id": turn_id }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "authored", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "Proceed with the fix." }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-12T19:57:12Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message", "client_id": "client-authored",
+                    "message": "Proceed with the fix."
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let messages = parse_rollout_file(&rollout_path).expect("rollout should parse");
+        let users = messages
+            .iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(users[1].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(users[2].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            message_data_str(users[2], "clientMessageId"),
+            Some("client-authored")
+        );
+
+        let mut cross_turn_developer = lines.to_vec();
+        cross_turn_developer[4]["payload"]["internal_chat_message_metadata_passthrough"]
+            ["turn_id"] = Value::String("other-turn".to_string());
+        let cross_turn_path = tmp.path().join("cross-turn-developer-context.jsonl");
+        write_terminal_context_fixture(&cross_turn_path, &cross_turn_developer, false);
+        let cross_turn_users = parse_rollout_file(&cross_turn_path)
+            .expect("cross-turn rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cross_turn_users[0].subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a cross-turn developer record must invalidate the preceding candidate"
+        );
+        assert_eq!(
+            cross_turn_users[1].subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "a broken corridor keeps later candidates fail-open"
+        );
+
+        let mut post_boundary_developer = lines.to_vec();
+        let developer = post_boundary_developer.remove(6);
+        post_boundary_developer.insert(8, developer);
+        let post_boundary_path = tmp.path().join("post-boundary-developer-context.jsonl");
+        write_terminal_context_fixture(&post_boundary_path, &post_boundary_developer, false);
+        let post_boundary_users = parse_rollout_file(&post_boundary_path)
+            .expect("post-boundary rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            post_boundary_users[0].subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "developer records after the input boundary must fail open"
+        );
+        assert_eq!(
+            post_boundary_users[1].subtype.as_deref(),
+            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
+            "developer records after the input boundary must invalidate every pending candidate"
         );
     }
 
