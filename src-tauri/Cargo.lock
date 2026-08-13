@@ -894,6 +894,7 @@ dependencies = [
  "once_cell",
  "pretty_assertions",
  "proptest",
+ "quick-xml",
  "rayon",
  "regex",
  "rstest",
@@ -4448,6 +4449,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]

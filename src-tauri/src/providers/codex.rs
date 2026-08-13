@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use memchr::{memchr_iter, memmem};
 use memmap2::Mmap;
+use quick_xml::de::from_str as from_xml_str;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,10 +34,10 @@ const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.js
 const SESSION_METADATA_CACHE_FILENAME: &str = ".claude-code-history-viewer-session-cache.json";
 const SESSION_METADATA_CACHE_VERSION: u32 = 1;
 const AUTHORED_USER_SUBTYPE: &str = "authored_user";
-const AUTHORSHIP_UNKNOWN_SUBTYPE: &str = "authorship_unknown";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
+const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 8;
+const SNAPSHOT_CURSOR_VERSION: u32 = 9;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -240,12 +241,6 @@ fn diagnose_unresolved_candidate(
     }
 }
 
-#[derive(Debug)]
-struct CodexAuthoredUserIdentity {
-    response_item_id: String,
-    client_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CodexAuthorshipLaneKey {
     Turn(String),
@@ -264,7 +259,7 @@ impl CodexAuthorshipLaneKey {
 #[derive(Debug, Default)]
 struct CodexAuthorshipLane {
     active: bool,
-    authored_user_identities: Vec<CodexAuthoredUserIdentity>,
+    authored_user_count: usize,
     pending_user_messages: Vec<PendingCodexUserMessage>,
 }
 
@@ -445,14 +440,112 @@ fn merge_codex_message_provenance(
     }
 }
 
-fn classify_pending_user_event(
-    messages: &mut [ClaudeMessage],
+struct CanonicalCodexUserMessage {
+    id: Option<String>,
+    client_id: Option<String>,
+    turn_id: Option<String>,
+    content: Option<Value>,
+    response_text: Option<String>,
+}
+
+struct CanonicalCodexUserProjectionContext<'a> {
+    session_id: &'a str,
+    line_timestamp: &'a str,
+    counter: &'a mut u64,
+    fallback_turn_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "hook_prompt")]
+struct CodexHookPromptXml {
+    #[serde(rename = "@hook_run_id")]
+    hook_run_id: String,
+    #[serde(rename = "$text")]
+    text: String,
+}
+
+fn codex_hook_prompt_fragments(payload: &Value) -> Option<Vec<CodexHookPromptXml>> {
+    let content = payload.get("content")?.as_array()?;
+    if content.is_empty() {
+        return None;
+    }
+    content
+        .iter()
+        .map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("input_text") {
+                return None;
+            }
+            let text = item.get("text").and_then(Value::as_str)?.trim();
+            let fragment = from_xml_str::<CodexHookPromptXml>(text).ok()?;
+            (!fragment.hook_run_id.trim().is_empty()).then_some(fragment)
+        })
+        .collect()
+}
+
+fn legacy_user_event_content(event_payload: &Value) -> Option<Value> {
+    let message = event_payload.get("message").and_then(Value::as_str)?;
+    let mut content = vec![serde_json::json!({ "type": "text", "text": message })];
+
+    for field in ["images", "local_images"] {
+        for image in event_payload
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|image| !image.is_empty())
+        {
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "url", "url": image }
+            }));
+        }
+    }
+
+    Some(Value::Array(content))
+}
+
+fn canonical_codex_user_message(event_payload: &Value) -> Option<CanonicalCodexUserMessage> {
+    match event_payload.get("type").and_then(Value::as_str)? {
+        "user_message" => {
+            let message = event_payload.get("message").and_then(Value::as_str)?;
+            Some(CanonicalCodexUserMessage {
+                id: None,
+                client_id: non_empty_string(event_payload.get("client_id")).map(str::to_string),
+                turn_id: None,
+                content: legacy_user_event_content(event_payload),
+                response_text: Some(message.to_string()),
+            })
+        }
+        "item_completed" => {
+            let item = event_payload.get("item")?;
+            if item.get("type").and_then(Value::as_str) != Some("UserMessage") {
+                return None;
+            }
+            Some(CanonicalCodexUserMessage {
+                id: non_empty_string(item.get("id")).map(str::to_string),
+                client_id: non_empty_string(item.get("client_id")).map(str::to_string),
+                turn_id: non_empty_string(event_payload.get("turn_id")).map(str::to_string),
+                content: convert_codex_content_array(item.get("content"), None),
+                response_text: codex_user_response_text(item),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn project_canonical_user_event(
+    messages: &mut Vec<ClaudeMessage>,
     tracker: &mut CodexAuthorshipTracker,
     event_payload: &Value,
+    context: &mut CanonicalCodexUserProjectionContext<'_>,
     diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
     source_line: usize,
 ) {
-    let Some(event_text) = event_payload.get("message").and_then(Value::as_str) else {
+    let Some(canonical) = canonical_codex_user_message(event_payload) else {
+        if event_payload.get("type").and_then(Value::as_str) != Some("user_message") {
+            return;
+        }
         tracker.invalidate_all(
             diagnostics,
             "missing-user-message-text",
@@ -464,18 +557,27 @@ fn classify_pending_user_event(
         }
         return;
     };
-    let Some(lane_key) = tracker.most_recent_pending_key() else {
-        return;
+
+    let pending_lane_key = if let Some(turn_id) = canonical.turn_id.as_ref() {
+        let key = CodexAuthorshipLaneKey::Turn(turn_id.clone());
+        tracker
+            .lanes
+            .get(&key)
+            .is_some_and(|lane| !lane.pending_user_messages.is_empty())
+            .then_some(key)
+    } else {
+        tracker.most_recent_pending_key()
     };
-    let matched_text = tracker
-        .lanes
-        .get(&lane_key)
+    let matched_text = pending_lane_key
+        .as_ref()
+        .and_then(|lane_key| tracker.lanes.get(lane_key))
         .and_then(|lane| lane.pending_user_messages.last())
         .and_then(|candidate| candidate.response_text.as_deref());
-    if matched_text != Some(event_text) {
-        // The event is turnless. Once it fails to match the physically latest
-        // candidate, every pending lane is potentially implicated; retaining an
-        // older lane could let a later event falsely rehabilitate it.
+    let exact_match = canonical
+        .response_text
+        .as_deref()
+        .is_some_and(|canonical_text| matched_text == Some(canonical_text));
+    if pending_lane_key.is_some() && !exact_match {
         tracker.invalidate_all(
             diagnostics,
             "pair-text-mismatch",
@@ -485,94 +587,82 @@ fn classify_pending_user_event(
         for lane in tracker.lanes.values_mut() {
             lane.pending_user_messages.clear();
         }
-        return;
     }
-    let has_active_turns = tracker.has_active_turns();
-    let lane = tracker
-        .lanes
-        .get_mut(&lane_key)
-        .expect("the most recent pending lane must still exist");
-    let Some(matched) = lane.pending_user_messages.last() else {
-        return;
+
+    let lane_key = pending_lane_key
+        .clone()
+        .or_else(|| {
+            canonical
+                .turn_id
+                .as_ref()
+                .map(|turn_id| CodexAuthorshipLaneKey::Turn(turn_id.clone()))
+        })
+        .or_else(|| {
+            context
+                .fallback_turn_id
+                .map(|turn_id| CodexAuthorshipLaneKey::Turn(turn_id.to_string()))
+        })
+        .or_else(|| {
+            tracker
+                .sole_active_turn_id()
+                .map(|turn_id| CodexAuthorshipLaneKey::Turn(turn_id.to_string()))
+        })
+        .unwrap_or(CodexAuthorshipLaneKey::Unscoped);
+    let confirmed_turn_id = canonical
+        .turn_id
+        .as_deref()
+        .or_else(|| lane_key.turn_id())
+        .map(str::to_string);
+    let matched_index = exact_match
+        .then(|| {
+            tracker
+                .lanes
+                .get(&lane_key)
+                .and_then(|lane| lane.pending_user_messages.last())
+                .map(|candidate| candidate.message_index)
+        })
+        .flatten();
+    let lane = tracker.lanes.entry(lane_key).or_default();
+    let subtype = if lane.authored_user_count > 0 && (lane.active || canonical.turn_id.is_some()) {
+        STEER_SUBTYPE
+    } else {
+        AUTHORED_USER_SUBTYPE
     };
 
-    let matched_index = matched.message_index;
-    let matched_turn_id = matched.authored_turn_id.clone();
-    if has_active_turns && matched_turn_id.is_some() && !lane.active {
-        invalidate_pending_authorship(
-            &mut lane.pending_user_messages,
-            diagnostics,
-            "cross-turn-pairing",
-            source_line,
-            matched_turn_id.as_deref(),
-        );
-        lane.pending_user_messages.clear();
-        return;
-    }
-    let client_id = non_empty_string(event_payload.get("client_id")).map(str::to_string);
-    let response_item_id = messages[matched_index].uuid.clone();
-    if lane.authored_user_identities.iter().any(|identity| {
-        identity.response_item_id == response_item_id
-            || client_id
-                .as_deref()
-                .is_some_and(|client_id| identity.client_id.as_deref() == Some(client_id))
-    }) {
-        invalidate_pending_authorship(
-            &mut lane.pending_user_messages,
-            diagnostics,
-            "duplicate-authored-identity",
-            source_line,
-            client_id.as_deref(),
-        );
-        lane.pending_user_messages.clear();
-        return;
-    }
-
-    let matched_turn_is_consistent =
-        matched_turn_id.is_some() && (!has_active_turns || lane.active);
-    let unmatched_len = lane.pending_user_messages.len().saturating_sub(1);
-    for unmatched in lane.pending_user_messages.drain(..unmatched_len) {
-        let unmatched_turn_is_consistent =
-            unmatched.authored_turn_id.is_some() && unmatched.authored_turn_id == matched_turn_id;
-        if matched_turn_is_consistent
-            && unmatched_turn_is_consistent
-            && unmatched.precedes_input_boundary
-            && unmatched.terminal_evidence != TerminalContextEvidence::Invalid
-        {
-            messages[unmatched.message_index].subtype = Some(INJECTED_CONTEXT_SUBTYPE.to_string());
-        } else {
-            let kind = if unmatched.authored_turn_id.is_none() {
-                "missing-candidate-turn-id"
-            } else if !unmatched_turn_is_consistent {
-                "cross-turn-pairing"
-            } else if !unmatched.precedes_input_boundary {
-                "missing-input-boundary"
-            } else {
-                "terminal-sequence-invalidated"
-            };
-            diagnose_unresolved_candidate(&unmatched, diagnostics, kind, source_line);
+    if let Some(message_index) = matched_index {
+        messages[message_index].subtype = Some(subtype.to_string());
+        if let Some(id) = canonical.id.as_ref() {
+            messages[message_index].uuid.clone_from(id);
         }
+        merge_codex_message_provenance(
+            &mut messages[message_index],
+            confirmed_turn_id.as_deref(),
+            canonical.client_id.as_deref(),
+        );
+    } else {
+        *context.counter += 1;
+        let mut message = build_codex_message(
+            canonical
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("codex-event-{}", context.counter)),
+            context.session_id,
+            context.line_timestamp.to_string(),
+            "user",
+            Some("user"),
+            canonical.content,
+            None,
+        );
+        message.subtype = Some(subtype.to_string());
+        merge_codex_message_provenance(
+            &mut message,
+            confirmed_turn_id.as_deref(),
+            canonical.client_id.as_deref(),
+        );
+        messages.push(message);
     }
-    messages[matched_index].subtype = Some(
-        if lane.active && !lane.authored_user_identities.is_empty() {
-            STEER_SUBTYPE
-        } else {
-            AUTHORED_USER_SUBTYPE
-        }
-        .to_string(),
-    );
-    let confirmed_turn_id = matched_turn_id.as_deref().or_else(|| lane_key.turn_id());
-    merge_codex_message_provenance(
-        &mut messages[matched_index],
-        confirmed_turn_id,
-        client_id.as_deref(),
-    );
     lane.pending_user_messages.clear();
-    lane.authored_user_identities
-        .push(CodexAuthoredUserIdentity {
-            response_item_id,
-            client_id,
-        });
+    lane.authored_user_count += 1;
 }
 
 fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &str) -> bool {
@@ -892,7 +982,7 @@ fn observe_pending_terminal_record(
 fn classify_pending_terminal_context(
     messages: &mut [ClaudeMessage],
     pending: &[PendingCodexUserMessage],
-    authored_user_identities_in_turn: &[CodexAuthoredUserIdentity],
+    authored_user_count: usize,
     active_turn_id: &str,
     terminal_payload: &Value,
     diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
@@ -900,8 +990,8 @@ fn classify_pending_terminal_context(
 ) {
     // A context refresh injected while a task is already running has no companion
     // user_message event. Resolve it only when the surrounding provider sequence is
-    // complete and unambiguous; every incomplete or reordered shape stays unknown.
-    if authored_user_identities_in_turn.is_empty()
+    // complete and unambiguous; every incomplete or reordered shape remains raw-only.
+    if authored_user_count == 0
         || terminal_payload.get("turn_id").and_then(Value::as_str) != Some(active_turn_id)
     {
         for candidate in pending {
@@ -2113,6 +2203,9 @@ fn parse_rollout_slice(
                     let is_user_message = payload.get("type").and_then(Value::as_str)
                         == Some("message")
                         && payload.get("role").and_then(Value::as_str) == Some("user");
+                    let hook_prompt_fragments = is_user_message
+                        .then(|| codex_hook_prompt_fragments(payload))
+                        .flatten();
                     if let Some(msg) = convert_codex_item(
                         payload,
                         &state.session_id,
@@ -2142,20 +2235,56 @@ fn parse_rollout_slice(
                         messages.push(msg);
                         if is_user_message {
                             let message_index = messages.len() - 1;
-                            // Preserve unresolved rows while exposing their ambiguity. A later
-                            // matching authored event retroactively resolves this replaceable
-                            // suffix as authored input or provider-injected context.
-                            messages[message_index].subtype =
-                                Some(AUTHORSHIP_UNKNOWN_SUBTYPE.to_string());
-                            authorship_tracker.push_candidate(PendingCodexUserMessage {
-                                message_index,
-                                message_id: messages[message_index].uuid.clone(),
-                                source_line,
-                                response_text: codex_user_response_text(payload),
-                                authored_turn_id: explicit_provider_turn_id,
-                                precedes_input_boundary: false,
-                                terminal_evidence: TerminalContextEvidence::AwaitingBoundary,
-                            });
+                            if let Some(fragments) = hook_prompt_fragments {
+                                messages[message_index].subtype =
+                                    Some(HOOK_PROMPT_SUBTYPE.to_string());
+                                messages[message_index].content = Some(Value::Array(
+                                    fragments
+                                        .iter()
+                                        .map(|fragment| {
+                                            serde_json::json!({
+                                                "type": "text",
+                                                "text": fragment.text
+                                            })
+                                        })
+                                        .collect(),
+                                ));
+                                let data = messages[message_index]
+                                    .data
+                                    .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+                                if let Some(data) = data.as_object_mut() {
+                                    data.insert(
+                                        "hookPromptFragments".to_string(),
+                                        Value::Array(
+                                            fragments
+                                                .into_iter()
+                                                .map(|fragment| {
+                                                    serde_json::json!({
+                                                        "text": fragment.text,
+                                                        "hookRunId": fragment.hook_run_id
+                                                    })
+                                                })
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                            } else {
+                                // Ordinary user-role response items are model-input records,
+                                // not canonical visible history. A matching canonical user
+                                // event may reuse the row to preserve richer content and
+                                // artifacts.
+                                messages[message_index].subtype =
+                                    Some(INJECTED_CONTEXT_SUBTYPE.to_string());
+                                authorship_tracker.push_candidate(PendingCodexUserMessage {
+                                    message_index,
+                                    message_id: messages[message_index].uuid.clone(),
+                                    source_line,
+                                    response_text: codex_user_response_text(payload),
+                                    authored_turn_id: explicit_provider_turn_id,
+                                    precedes_input_boundary: false,
+                                    terminal_evidence: TerminalContextEvidence::AwaitingBoundary,
+                                });
+                            }
                         }
                     }
                 }
@@ -2167,16 +2296,26 @@ fn parse_rollout_slice(
                         continue;
                     }
 
-                    // Skip events that duplicate response_item messages.
-                    // Codex logs user/assistant text in both response_item (type=message)
-                    // and event_msg (type=user_message / agent_message). Keep the
-                    // response_item version for content, but use the authored-user event to
-                    // distinguish same-turn steering from injected user-role context.
-                    if event_type == "user_message" {
-                        classify_pending_user_event(
+                    // Canonical user events define visible history. Reuse an exact raw
+                    // response-item match when available, otherwise synthesize the visible
+                    // message directly from the canonical event.
+                    let is_completed_user_item = event_type == "item_completed"
+                        && payload
+                            .get("item")
+                            .and_then(|item| item.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("UserMessage");
+                    if event_type == "user_message" || is_completed_user_item {
+                        project_canonical_user_event(
                             &mut messages,
                             &mut authorship_tracker,
                             payload,
+                            &mut CanonicalCodexUserProjectionContext {
+                                session_id: &state.session_id,
+                                line_timestamp: &line_timestamp,
+                                counter: &mut state.msg_counter,
+                                fallback_turn_id: active_turn_id.as_deref(),
+                            },
                             &mut diagnostics,
                             source_line,
                         );
@@ -2353,7 +2492,7 @@ fn parse_rollout_slice(
                                     classify_pending_terminal_context(
                                         &mut messages,
                                         &lane.pending_user_messages,
-                                        &lane.authored_user_identities,
+                                        lane.authored_user_count,
                                         completed_turn_id,
                                         payload,
                                         &mut diagnostics,
@@ -4344,8 +4483,13 @@ fn convert_codex_content_array(
                         "text": text
                     }))
                 }
-                "input_image" => {
-                    let image_url = item.get("image_url").and_then(Value::as_str).unwrap_or("");
+                "input_image" | "image" | "local_image" => {
+                    let image_url = item
+                        .get("image_url")
+                        .or_else(|| item.get("url"))
+                        .or_else(|| item.get("path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     if image_url.is_empty() {
                         return None;
                     }
@@ -6958,6 +7102,327 @@ mod tests {
     }
 
     #[test]
+    fn load_messages_projects_legacy_user_event_without_response_item() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("event-only-user-message.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "event-only-user-message" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-1",
+                    "message": "canonical prompt"
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            message_data_str(&users[0], "providerTurnId"),
+            Some("turn-1")
+        );
+        assert_eq!(
+            message_data_str(&users[0], "clientMessageId"),
+            Some("client-1")
+        );
+        assert_eq!(
+            users[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str),
+            Some("canonical prompt")
+        );
+    }
+
+    #[test]
+    fn load_messages_keeps_unmatched_response_hidden_and_projects_canonical_event() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("mismatched-canonical-user-message.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "mismatched-canonical-user-message" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "raw-context",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "provider context" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "client-1",
+                    "message": "canonical prompt"
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].uuid, "raw-context");
+        assert_eq!(users[0].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(users[1].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            message_data_str(&users[1], "clientMessageId"),
+            Some("client-1")
+        );
+    }
+
+    #[test]
+    fn load_messages_projects_paginated_completed_user_item() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("paginated-user-message.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "paginated-user-message" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "paginated-user-message",
+                    "turn_id": "turn-1",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "canonical-user-1",
+                        "client_id": "client-1",
+                        "content": [{ "type": "text", "text": "canonical paginated prompt" }]
+                    }
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].uuid, "canonical-user-1");
+        assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            message_data_str(&users[0], "providerTurnId"),
+            Some("turn-1")
+        );
+        assert_eq!(
+            message_data_str(&users[0], "clientMessageId"),
+            Some("client-1")
+        );
+    }
+
+    #[test]
+    fn load_messages_preserves_paginated_user_images() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("paginated-user-images.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "paginated-user-images" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "turn_id": "turn-1",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "canonical-user-1",
+                        "content": [
+                            { "type": "image", "image_url": "data:image/png;base64,remote" },
+                            { "type": "local_image", "path": "C:\\screenshots\\local.png" }
+                        ]
+                    }
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            users[0].content,
+            Some(json!([
+                {
+                    "type": "image",
+                    "source": { "type": "url", "url": "data:image/png;base64,remote" }
+                },
+                {
+                    "type": "image",
+                    "source": { "type": "url", "url": "C:\\screenshots\\local.png" }
+                }
+            ]))
+        );
+    }
+
+    #[test]
+    fn load_messages_projects_only_exact_hook_prompt_response_items() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("hook-prompt.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "hook-prompt" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "hook-1",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "<hook_prompt hook_run_id=\"run-1\">Retry &amp; test.</hook_prompt>" },
+                        { "type": "input_text", "text": "<hook_prompt hook_run_id=\"run-2\">Then finish.</hook_prompt>" }
+                    ]
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "lookalike",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "prefix <hook_prompt hook_run_id=\"run-3\">not exact</hook_prompt>" }]
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].subtype.as_deref(), Some(HOOK_PROMPT_SUBTYPE));
+        assert_eq!(users[1].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(
+            users[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["Retry & test.", "Then finish."])
+        );
+        assert_eq!(
+            users[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.get("hookPromptFragments"))
+                .and_then(Value::as_array)
+                .and_then(|fragments| fragments.first())
+                .and_then(|fragment| fragment.get("hookRunId"))
+                .and_then(Value::as_str),
+            Some("run-1")
+        );
+    }
+
+    #[test]
+    fn paginated_user_items_in_one_turn_mark_later_input_as_steer() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("paginated-steer.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "paginated-steer" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "turn_id": "turn-1",
+                    "item": { "type": "UserMessage", "id": "user-1", "content": [{ "type": "text", "text": "first" }] }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "turn_id": "turn-1",
+                    "item": { "type": "UserMessage", "id": "user-2", "content": [{ "type": "text", "text": "second" }] }
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(users[1].subtype.as_deref(), Some(STEER_SUBTYPE));
+    }
+
+    #[test]
     fn convert_thread_rolled_back_to_system_boundary() {
         let mut counter = 0u64;
         let msg = convert_codex_event(
@@ -7727,13 +8192,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             cross_turn_users[0].subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a cross-turn developer record must invalidate the preceding candidate"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a cross-turn developer record remains raw-only model input"
         );
         assert_eq!(
             cross_turn_users[1].subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a broken corridor keeps later candidates fail-open"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a broken corridor cannot expose later raw candidates"
         );
 
         let mut post_boundary_developer = lines.to_vec();
@@ -7748,13 +8213,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             post_boundary_users[0].subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "developer records after the input boundary must fail open"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "developer records after the input boundary remain raw-only"
         );
         assert_eq!(
             post_boundary_users[1].subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "developer records after the input boundary must invalidate every pending candidate"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "developer records after the input boundary cannot expose pending candidates"
         );
     }
 
@@ -8233,7 +8698,7 @@ mod tests {
             .expect("candidate should be retained");
         assert_eq!(
             malformed_candidate.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+            Some(INJECTED_CONTEXT_SUBTYPE)
         );
 
         let pre_task_path = tmp.path().join("unscoped-before-task-start.jsonl");
@@ -8270,7 +8735,7 @@ mod tests {
             .expect("unscoped candidate should be retained");
         assert_eq!(
             unscoped_candidate.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+            Some(INJECTED_CONTEXT_SUBTYPE)
         );
     }
 
@@ -8479,8 +8944,8 @@ mod tests {
 
         assert_eq!(
             context.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a boundary from another physical turn must fail open"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a boundary from another physical turn cannot expose raw model input"
         );
         assert_eq!(authored.subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
         assert_eq!(message_data_str(authored, "providerTurnId"), Some("turn-1"));
@@ -8511,8 +8976,8 @@ mod tests {
             .expect("context candidate should remain projected");
         assert_eq!(
             stale_boundary_context.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a later cross-turn boundary must invalidate an earlier valid boundary"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a later cross-turn boundary cannot expose an earlier raw candidate"
         );
 
         let missing_candidate_turn_path = tmp.path().join("missing-candidate-turn.jsonl");
@@ -8535,13 +9000,13 @@ mod tests {
             .expect("context candidate should remain projected");
         assert_eq!(
             missing_candidate_turn_context.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a candidate without a physical turn cannot borrow a later boundary turn"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a candidate without a physical turn remains raw-only"
         );
     }
 
     #[test]
-    fn duplicate_client_id_cannot_create_a_steer() {
+    fn duplicate_canonical_client_id_does_not_hide_a_visible_steer() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("duplicate-client-id.jsonl");
         let lines = [
@@ -8611,17 +9076,17 @@ mod tests {
         let duplicate = messages
             .iter()
             .find(|message| message.uuid == "duplicate")
-            .expect("duplicate input should fail open visibly");
+            .expect("duplicate canonical input should remain projected");
         assert_eq!(primary.subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
         assert_eq!(
             message_data_str(primary, "clientMessageId"),
             Some("duplicate-client")
         );
+        assert_eq!(duplicate.subtype.as_deref(), Some(STEER_SUBTYPE));
         assert_eq!(
-            duplicate.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+            message_data_str(duplicate, "clientMessageId"),
+            Some("duplicate-client")
         );
-        assert_eq!(message_data_str(duplicate, "clientMessageId"), None);
     }
 
     #[test]
@@ -8696,8 +9161,8 @@ mod tests {
 
         assert_eq!(
             users[0].subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "a cross-turn row with a missing event must fail open"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "a cross-turn row with a missing canonical event remains raw-only"
         );
         assert_eq!(users[1].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
         assert_eq!(
@@ -9220,8 +9685,8 @@ mod tests {
                 .expect("candidate should remain visible");
             assert_eq!(
                 unresolved.subtype.as_deref(),
-                Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-                "{name} must fail open"
+                Some(INJECTED_CONTEXT_SUBTYPE),
+                "{name} must not expose raw model input"
             );
         }
     }
@@ -9271,7 +9736,7 @@ mod tests {
             .expect("context refresh should be visible before completion");
         assert_eq!(
             unresolved.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE)
+            Some(INJECTED_CONTEXT_SUBTYPE)
         );
 
         append_rollout_lines(
@@ -9355,8 +9820,8 @@ mod tests {
             .expect("unresolved context should remain visible");
         assert_eq!(
             unresolved.subtype.as_deref(),
-            Some(AUTHORSHIP_UNKNOWN_SUBTYPE),
-            "EOF without an authored pairing must fail open explicitly"
+            Some(INJECTED_CONTEXT_SUBTYPE),
+            "EOF without a canonical event must keep raw model input hidden"
         );
 
         append_rollout_lines(

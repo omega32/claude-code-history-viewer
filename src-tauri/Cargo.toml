@@ -54,6 +54,7 @@ urlencoding = "2.1"
 tempfile = "3.24.0"
 trash = "5.2"
 regex = "1.11"
+quick-xml = { version = "0.37", features = ["serialize"] }
 lazy_static = "1.5"
 once_cell = "1.19"
 rusqlite = { version = "0.32", features = ["bundled"] }
