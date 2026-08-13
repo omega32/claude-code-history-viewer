@@ -84,7 +84,9 @@ struct SessionMetadataCache {
 // count as authored conversation or participate in title fallbacks.
 // Bumped 15 -> 16: Claude's generated `ai-title` now precedes the legacy
 // `summary` and conversational preview fallbacks.
-const CACHE_VERSION: u32 = 16;
+// Bumped 16 -> 17: provider-generated interruption records no longer count as
+// authored conversation or participate in title fallbacks.
+const CACHE_VERSION: u32 = 17;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -459,12 +461,25 @@ fn extract_session_metadata_internal(
                         message.content.as_ref(),
                     )
                 });
+                let is_interruption = entry.message.as_ref().is_some_and(|message| {
+                    is_claude_interruption(
+                        &entry.message_type,
+                        message.role.as_deref(),
+                        message.content.as_ref(),
+                    )
+                });
                 let is_conversational = (entry.message_type == "user"
                     && command_subtype != Some("local_command")
                     && !is_task_notification_origin(entry.origin.as_ref()))
+                    && !is_interruption
                     || entry.message_type == "assistant"
                     || (entry.message_type == "attachment"
                         && queued_command_prompt(entry.attachment.as_ref()).is_some());
+                if is_interruption {
+                    if let Some(ref ts) = entry.timestamp {
+                        last_timestamp = Some(ts.clone());
+                    }
+                }
                 if !is_conversational {
                     continue;
                 }
@@ -546,6 +561,7 @@ fn extract_session_metadata_internal(
                 // For longer sessions, the actual last user message may be beyond this limit.
                 if entry.message_type == "user"
                     && !is_task_notification_origin(entry.origin.as_ref())
+                    && !is_interruption
                 {
                     if let Some(ref msg) = entry.message {
                         if let Some(ref content) = msg.content {
@@ -639,12 +655,25 @@ fn extract_session_metadata_internal(
                     message.content.as_ref(),
                 )
             });
+            let is_interruption = classifier.message.as_ref().is_some_and(|message| {
+                is_claude_interruption(
+                    &classifier.message_type,
+                    message.role.as_deref(),
+                    message.content.as_ref(),
+                )
+            });
             let is_conversational = (classifier.message_type == "user"
                 && command_subtype != Some("local_command")
                 && !is_task_notification_origin(classifier.origin.as_ref()))
+                && !is_interruption
                 || classifier.message_type == "assistant"
                 || (classifier.message_type == "attachment"
                     && queued_command_prompt(classifier.attachment.as_ref()).is_some());
+            if is_interruption {
+                if let Some(ref ts) = classifier.timestamp {
+                    last_timestamp = Some(ts.clone());
+                }
+            }
             if !is_conversational {
                 continue;
             }
@@ -1791,6 +1820,13 @@ fn parse_line_to_message(
     };
 
     let is_task_notification = is_task_notification_origin(log_entry.origin.as_ref());
+    let is_interruption = log_entry.message.as_ref().is_some_and(|message| {
+        is_claude_interruption(
+            &log_entry.message_type,
+            Some(message.role.as_str()),
+            Some(&message.content),
+        )
+    });
 
     Some(ClaudeMessage {
         uuid,
@@ -1817,7 +1853,11 @@ fn parse_line_to_message(
         message_id: message_id.or(log_entry.message_id),
         snapshot: log_entry.snapshot,
         is_snapshot_update: log_entry.is_snapshot_update,
-        data: log_entry.data,
+        data: if is_interruption {
+            Some(serde_json::json!({ "reason": "interrupted" }))
+        } else {
+            log_entry.data
+        },
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
@@ -1825,7 +1865,9 @@ fn parse_line_to_message(
         // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
         // so consumers can tell it apart from an authored user turn. Content and
         // type stay as-is — this only tags "what this record is".
-        subtype: if is_task_notification {
+        subtype: if is_interruption {
+            Some("interruption".to_string())
+        } else if is_task_notification {
             Some("task_notification".to_string())
         } else if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
@@ -1875,6 +1917,34 @@ fn is_task_notification_origin(origin: Option<&serde_json::Value>) -> bool {
         .and_then(|value| value.get("kind"))
         .and_then(serde_json::Value::as_str)
         == Some("task-notification")
+}
+
+/// Claude Code persists user cancellation as one of two exact synthetic
+/// user-role messages. There is no stronger provider field in the JSONL, so
+/// keep this deliberately narrow: only the complete scalar/text-block payload
+/// is classified, while quoted or extended authored text remains untouched.
+fn is_claude_interruption(
+    message_type: &str,
+    role: Option<&str>,
+    content: Option<&serde_json::Value>,
+) -> bool {
+    if message_type != "user" || role != Some("user") {
+        return false;
+    }
+    let text = match content {
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(serde_json::Value::Array(blocks)) if blocks.len() == 1 => blocks[0]
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| *kind == "text")
+            .and_then(|_| blocks[0].get("text"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    matches!(
+        text,
+        Some("[Request interrupted by user]" | "[Request interrupted by user for tool use]")
+    )
 }
 
 /// Preserve the display name of a file the user explicitly attached to a
@@ -2115,6 +2185,13 @@ fn parse_line_simd(
     }
 
     let is_task_notification = is_task_notification_origin(log_entry.origin.as_ref());
+    let is_interruption = log_entry.message.as_ref().is_some_and(|message| {
+        is_claude_interruption(
+            &log_entry.message_type,
+            Some(message.role.as_str()),
+            Some(&message.content),
+        )
+    });
     let command_subtype = log_entry.message.as_ref().and_then(|message| {
         local_command_subtype(
             &log_entry.message_type,
@@ -2175,7 +2252,11 @@ fn parse_line_simd(
         message_id: message_id.or(log_entry.message_id),
         snapshot: log_entry.snapshot,
         is_snapshot_update: log_entry.is_snapshot_update,
-        data: prompt_attachment_data.or(log_entry.data),
+        data: if is_interruption {
+            Some(serde_json::json!({ "reason": "interrupted" }))
+        } else {
+            prompt_attachment_data.or(log_entry.data)
+        },
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
@@ -2183,7 +2264,9 @@ fn parse_line_simd(
         // `isCompactSummary`; stamp a provenance subtype (like `queued_command`)
         // so consumers can tell it apart from an authored user turn. Content and
         // type stay as-is — this only tags "what this record is".
-        subtype: if is_task_notification {
+        subtype: if is_interruption {
+            Some("interruption".to_string())
+        } else if is_task_notification {
             Some("task_notification".to_string())
         } else if log_entry.is_compact_summary.unwrap_or(false) {
             Some("compact_summary".to_string())
@@ -3897,6 +3980,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_interruption_is_not_counted_or_used_as_title_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"uuid":"u1","sessionId":"session-1","timestamp":"2026-08-13T10:00:00Z","type":"user","message":{"role":"user","content":"Run the checks."}}"#,
+            "\n",
+            r#"{"uuid":"a1","parentUuid":"u1","sessionId":"session-1","timestamp":"2026-08-13T10:00:01Z","type":"assistant","message":{"role":"assistant","content":"Starting."}}"#,
+            "\n",
+            r#"{"uuid":"i1","parentUuid":"a1","sessionId":"session-1","timestamp":"2026-08-13T10:00:02Z","type":"user","message":{"role":"user","content":"[Request interrupted by user]"}}"#,
+            "\n"
+        );
+        std::fs::write(temp_dir.path().join("test.jsonl"), content).unwrap();
+
+        let result = load_project_sessions(temp_dir.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message_count, 2);
+        assert_eq!(result[0].summary.as_deref(), Some("Run the checks."));
+        assert_eq!(result[0].last_message_time, "2026-08-13T10:00:02Z");
+    }
+
+    #[tokio::test]
     async fn test_session_summary_fallback_incremental_preserves_values() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -4718,6 +4824,50 @@ mod tests {
         let mut pbytes = plain.as_bytes().to_vec();
         let pmsg = parse_line_simd(0, &mut pbytes, false).expect("plain user should parse");
         assert_eq!(pmsg.subtype, None);
+    }
+
+    #[test]
+    fn claude_interruption_record_gets_provider_neutral_subtype() {
+        for content in [
+            serde_json::json!("[Request interrupted by user]"),
+            serde_json::json!([{"type":"text","text":"[Request interrupted by user for tool use]"}]),
+        ] {
+            let line = serde_json::json!({
+                "type": "user",
+                "uuid": "interrupt-1",
+                "parentUuid": "assistant-1",
+                "sessionId": "s1",
+                "timestamp": "2026-08-13T10:00:00Z",
+                "message": { "role": "user", "content": content }
+            })
+            .to_string();
+            let mut bytes = line.as_bytes().to_vec();
+            let msg = parse_line_simd(0, &mut bytes, false)
+                .expect("Claude interruption record should parse");
+            assert_eq!(msg.message_type, "user");
+            assert_eq!(msg.subtype.as_deref(), Some("interruption"));
+            assert_eq!(
+                msg.data
+                    .as_ref()
+                    .and_then(|data| data.get("reason"))
+                    .and_then(serde_json::Value::as_str),
+                Some("interrupted")
+            );
+
+            let fallback = parse_line_to_message(0, &line, false)
+                .expect("fallback parser should classify the interruption");
+            assert_eq!(fallback.subtype.as_deref(), Some("interruption"));
+        }
+
+        let quoted = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-08-13T10:01:00Z","message":{"role":"user","content":"Quoted: [Request interrupted by user]"}}"#;
+        let mut bytes = quoted.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("quoted marker should parse");
+        assert_eq!(msg.subtype, None);
+
+        let multi = r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"2026-08-13T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"},{"type":"text","text":"keep this authored continuation"}]}}"#;
+        let mut bytes = multi.as_bytes().to_vec();
+        let msg = parse_line_simd(0, &mut bytes, false).expect("multi-block prompt should parse");
+        assert_eq!(msg.subtype, None);
     }
 
     #[test]

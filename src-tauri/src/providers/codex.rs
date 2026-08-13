@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 9;
+const SNAPSHOT_CURSOR_VERSION: u32 = 10;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -884,7 +884,7 @@ fn observe_pending_terminal_record(
             if matches!(event_type, "user_message" | "task_started") {
                 return;
             }
-            if event_type == "task_complete" {
+            if matches!(event_type, "task_complete" | "turn_aborted") {
                 let completion_turn_id = payload
                     .and_then(|payload| payload.get("turn_id"))
                     .and_then(Value::as_str);
@@ -2478,7 +2478,7 @@ fn parse_rollout_slice(
                         messages.push(msg);
                     }
 
-                    if event_type == "task_complete" {
+                    if matches!(event_type, "task_complete" | "turn_aborted") {
                         if let Some(completed_turn_id) = payload
                             .get("turn_id")
                             .and_then(Value::as_str)
@@ -2503,31 +2503,33 @@ fn parse_rollout_slice(
                             let completed_message_start =
                                 active_turn_message_starts.remove(completed_turn_id);
                             active_turn_order.retain(|turn_id| turn_id != completed_turn_id);
-                            if let Some(completed_message_start) = completed_message_start {
-                                if let Some(last_msg) = messages[completed_message_start..]
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|message| {
-                                        message.message_type == "assistant"
-                                            && message
-                                                .data
-                                                .as_ref()
-                                                .and_then(|data| data.get("providerTurnId"))
-                                                .and_then(Value::as_str)
-                                                .map_or(
-                                                    completion_allows_turnless_fallback,
-                                                    |turn_id| turn_id == completed_turn_id,
-                                                )
-                                    })
-                                {
-                                    let inference = last_msg
-                                        .inference
-                                        .get_or_insert_with(|| state.current_inference.clone());
-                                    inference.duration_ms =
-                                        payload.get("duration_ms").and_then(Value::as_u64);
-                                    inference.time_to_first_token_ms = payload
-                                        .get("time_to_first_token_ms")
-                                        .and_then(Value::as_u64);
+                            if event_type == "task_complete" {
+                                if let Some(completed_message_start) = completed_message_start {
+                                    if let Some(last_msg) = messages[completed_message_start..]
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|message| {
+                                            message.message_type == "assistant"
+                                                && message
+                                                    .data
+                                                    .as_ref()
+                                                    .and_then(|data| data.get("providerTurnId"))
+                                                    .and_then(Value::as_str)
+                                                    .map_or(
+                                                        completion_allows_turnless_fallback,
+                                                        |turn_id| turn_id == completed_turn_id,
+                                                    )
+                                        })
+                                    {
+                                        let inference = last_msg
+                                            .inference
+                                            .get_or_insert_with(|| state.current_inference.clone());
+                                        inference.duration_ms =
+                                            payload.get("duration_ms").and_then(Value::as_u64);
+                                        inference.time_to_first_token_ms = payload
+                                            .get("time_to_first_token_ms")
+                                            .and_then(Value::as_u64);
+                                    }
                                 }
                             }
                             if active_turn_id.as_deref() == Some(completed_turn_id) {
@@ -4072,7 +4074,7 @@ fn convert_codex_event(
             let turn_id = payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
             let content = serde_json::json!([{
                 "type": "text",
-                "text": format!("[Turn Aborted] reason: {reason}, turn: {turn_id}")
+                "text": "[interrupted]"
             }]);
             let mut msg = build_codex_message(
                 format!("codex-abort-{counter}"),
@@ -4083,8 +4085,30 @@ fn convert_codex_event(
                 Some(content),
                 None,
             );
-            msg.subtype = Some("turn_aborted".to_string());
+            msg.subtype = Some("interruption".to_string());
             msg.level = Some("warning".to_string());
+            msg.duration_ms = payload.get("duration_ms").and_then(Value::as_u64);
+            let mut data = serde_json::Map::new();
+            if !turn_id.is_empty() {
+                data.insert(
+                    "providerTurnId".to_string(),
+                    Value::String(turn_id.to_string()),
+                );
+            }
+            data.insert("reason".to_string(), Value::String(reason.to_string()));
+            if let Some(started_at) = payload.get("started_at").and_then(Value::as_u64) {
+                data.insert("startedAt".to_string(), Value::Number(started_at.into()));
+            }
+            if let Some(completed_at) = payload.get("completed_at").and_then(Value::as_u64) {
+                data.insert(
+                    "completedAt".to_string(),
+                    Value::Number(completed_at.into()),
+                );
+            }
+            if let Some(duration_ms) = msg.duration_ms {
+                data.insert("durationMs".to_string(), Value::Number(duration_ms.into()));
+            }
+            msg.data = Some(Value::Object(data));
             Some(msg)
         }
         // Unsupported/duplicated Codex events are intentionally ignored.
@@ -7448,6 +7472,43 @@ mod tests {
     }
 
     #[test]
+    fn convert_turn_aborted_to_provider_neutral_interruption() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "turn_aborted",
+                "turn_id": "turn-a",
+                "reason": "interrupted",
+                "started_at": 1_786_646_968,
+                "completed_at": 1_786_647_014,
+                "duration_ms": 46_359
+            }),
+            "session-1",
+            "2026-08-13T18:50:14Z",
+            &mut counter,
+        )
+        .expect("abort event should be retained");
+
+        assert_eq!(msg.message_type, "system");
+        assert_eq!(msg.subtype.as_deref(), Some("interruption"));
+        assert_eq!(msg.duration_ms, Some(46_359));
+        assert_eq!(
+            msg.content,
+            Some(json!([{ "type": "text", "text": "[interrupted]" }]))
+        );
+        assert_eq!(
+            msg.data,
+            Some(json!({
+                "providerTurnId": "turn-a",
+                "reason": "interrupted",
+                "startedAt": 1_786_646_968,
+                "completedAt": 1_786_647_014,
+                "durationMs": 46_359
+            }))
+        );
+    }
+
+    #[test]
     fn convert_compacted_line_to_system_message() {
         let mut counter = 0u64;
         let msg = convert_codex_compacted(
@@ -8379,6 +8440,106 @@ mod tests {
             message_data_str(&users[4], "clientMessageId"),
             Some("client-a-steer")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_checkpoints_after_abort_and_does_not_taint_the_next_task() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-abort-checkpoint.jsonl");
+        let initial_lines = [
+            json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "abort-checkpoint" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:00.1Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-a" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:00.2Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "prompt-a", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "prompt A" }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": "turn-a" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:00.3Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "prompt A" }
+            }),
+            json!({
+                "timestamp": "2026-08-13T10:00:00.4Z",
+                "type": "event_msg",
+                "payload": { "type": "turn_aborted", "turn_id": "turn-a", "reason": "interrupted" }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &initial_lines, false);
+        let path_text = rollout_path.to_string_lossy();
+        let (initial_messages, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+        assert!(initial_messages
+            .iter()
+            .any(|message| message.subtype.as_deref() == Some("interruption")));
+
+        append_rollout_lines(
+            &rollout_path,
+            &[
+                json!({
+                    "timestamp": "2026-08-13T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-b" }
+                }),
+                json!({
+                    "timestamp": "2026-08-13T10:00:01.1Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "assistant-b", "type": "message", "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "answer B" }]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-13T10:00:01.2Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-b", "duration_ms": 222 }
+                }),
+            ],
+        );
+
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("abort delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                assert_eq!(replace_from, initial_messages.len());
+                assert_eq!(
+                    messages
+                        .iter()
+                        .find(|message| message.uuid == "assistant-b")
+                        .and_then(|message| message.inference.as_ref())
+                        .and_then(|inference| inference.duration_ms),
+                    Some(222),
+                    "an aborted prior task must not make the next task overlap-ambiguous"
+                );
+            }
+            _ => panic!("an abort should close its lane and checkpoint the accepted prefix"),
+        }
     }
 
     #[test]
