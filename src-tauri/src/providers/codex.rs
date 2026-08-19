@@ -8,7 +8,7 @@ use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
     search_json_value_case_insensitive,
 };
-use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+use base64::prelude::{Engine as _, BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use memchr::{memchr_iter, memmem};
@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 10;
+const SNAPSHOT_CURSOR_VERSION: u32 = 11;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -437,6 +437,17 @@ fn merge_codex_message_provenance(
     if let Some(client_message_id) = client_message_id {
         data.entry("clientMessageId")
             .or_insert_with(|| Value::String(client_message_id.to_string()));
+    }
+}
+
+fn clear_inferred_codex_turn_provenance(message: &mut ClaudeMessage) {
+    let Some(data) = message.data.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    data.remove("providerTurnId");
+    data.remove("imageArtifacts");
+    if data.is_empty() {
+        message.data = None;
     }
 }
 
@@ -2105,6 +2116,7 @@ fn parse_rollout_slice(
     let mut active_turn_message_starts = HashMap::<String, usize>::new();
     let mut active_turn_order = Vec::<String>::new();
     let mut overlap_ambiguous_turns = HashSet::<String>::new();
+    let mut inferred_provider_turn_messages = HashSet::<usize>::new();
     let mut authorship_tracker = CodexAuthorshipTracker::default();
     let mut pending_compacted_notification = false;
 
@@ -2215,11 +2227,15 @@ fn parse_rollout_slice(
                     ) {
                         let mut msg = msg;
                         let explicit_provider_turn_id = codex_authored_turn_id(payload);
-                        merge_codex_message_provenance(
-                            &mut msg,
-                            explicit_provider_turn_id.as_deref(),
-                            None,
-                        );
+                        let exact_provider_turn_id =
+                            explicit_provider_turn_id.as_deref().or_else(|| {
+                                (active_turn_order.len() == 1
+                                    && !overlap_ambiguous_turns.contains(&active_turn_order[0]))
+                                .then(|| active_turn_order[0].as_str())
+                            });
+                        let provider_turn_id_was_inferred =
+                            explicit_provider_turn_id.is_none() && exact_provider_turn_id.is_some();
+                        merge_codex_message_provenance(&mut msg, exact_provider_turn_id, None);
                         if msg.message_type == "assistant" {
                             msg.inference = (!state.current_inference.is_empty())
                                 .then(|| state.current_inference.clone());
@@ -2233,6 +2249,9 @@ fn parse_rollout_slice(
                             return Err(());
                         }
                         messages.push(msg);
+                        if provider_turn_id_was_inferred {
+                            inferred_provider_turn_messages.insert(messages.len() - 1);
+                        }
                         if is_user_message {
                             let message_index = messages.len() - 1;
                             if let Some(fragments) = hook_prompt_fragments {
@@ -2344,6 +2363,25 @@ fn parse_rollout_slice(
                                 .cloned()
                                 .collect::<Vec<_>>();
                             if !overlapping_turns.is_empty() {
+                                for message_index in inferred_provider_turn_messages.iter().copied()
+                                {
+                                    let Some(message) = messages.get_mut(message_index) else {
+                                        continue;
+                                    };
+                                    let belongs_to_overlapping_turn = message
+                                        .data
+                                        .as_ref()
+                                        .and_then(|data| data.get("providerTurnId"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|provider_turn_id| {
+                                            overlapping_turns
+                                                .iter()
+                                                .any(|turn_id| turn_id == provider_turn_id)
+                                        });
+                                    if belongs_to_overlapping_turn {
+                                        clear_inferred_codex_turn_provenance(message);
+                                    }
+                                }
                                 overlap_ambiguous_turns.insert(turn_id.to_string());
                                 overlap_ambiguous_turns.extend(overlapping_turns);
                             }
@@ -4421,12 +4459,23 @@ fn try_merge_tool_result_into_previous(
         if prev.message_type != "assistant" {
             continue;
         }
-        if let Some(tool_name) = matching_tool_use_name(prev, &tool_use_id) {
+        if let Some(tool_use) = matching_tool_use(prev, &tool_use_id).cloned() {
+            let tool_name = tool_use
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if tool_name == "apply_patch" && failed_apply_patch_result(&tool_result_block) {
                 if let Some(result) = tool_result_block.as_object_mut() {
                     result.insert("is_error".to_string(), Value::Bool(true));
                 }
             }
+            let image_artifacts = codex_tool_result_image_artifacts(
+                prev,
+                &tool_use_id,
+                &tool_use,
+                &tool_result_block,
+            );
+            append_codex_image_artifacts(prev, image_artifacts);
             append_content_block(prev, tool_result_block);
             return true;
         }
@@ -4448,15 +4497,190 @@ fn extract_tool_result_block(msg: &ClaudeMessage) -> Option<(String, Value)> {
     Some((tool_use_id, first.clone()))
 }
 
-fn matching_tool_use_name<'a>(msg: &'a ClaudeMessage, tool_use_id: &str) -> Option<&'a str> {
+fn matching_tool_use<'a>(msg: &'a ClaudeMessage, tool_use_id: &str) -> Option<&'a Value> {
     let arr = msg.content.as_ref().and_then(Value::as_array)?;
-    arr.iter()
-        .find(|item| {
-            item.get("type").and_then(Value::as_str) == Some("tool_use")
-                && item.get("id").and_then(Value::as_str) == Some(tool_use_id)
-        })
-        .and_then(|item| item.get("name"))
+    arr.iter().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_use")
+            && item.get("id").and_then(Value::as_str) == Some(tool_use_id)
+    })
+}
+
+fn codex_tool_result_image_artifacts(
+    message: &ClaudeMessage,
+    tool_use_id: &str,
+    tool_use: &Value,
+    tool_result: &Value,
+) -> Vec<Value> {
+    let Some(provider_turn_id) = message
+        .data
+        .as_ref()
+        .and_then(|data| data.get("providerTurnId"))
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        // Tool records in overlapping tasks can lack an authoritative owner.
+        // Retain their original structural payload, but do not expose an image
+        // artifact that a consumer could attribute to the wrong turn.
+        return Vec::new();
+    };
+    let correlation = codex_view_image_locator(tool_use);
+    let Some(content) = tool_result.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    content
+        .iter()
+        .enumerate()
+        .filter_map(|(content_index, block)| {
+            let block_type = block.get("type").and_then(Value::as_str)?;
+            if !matches!(block_type, "input_image" | "image" | "local_image") {
+                return None;
+            }
+            let source = block
+                .get("image_url")
+                .or_else(|| block.get("url"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    block
+                        .get("source")
+                        .and_then(|source| source.get("url"))
+                        .and_then(Value::as_str)
+                })?;
+            let (media_type, bytes) = decode_image_data_url(source)?;
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            let mut artifact = serde_json::json!({
+                "version": 1,
+                "artifactId": format!("codex:{tool_use_id}:{content_index}:{sha256}"),
+                "providerTurnId": provider_turn_id,
+                "sourceMessageUuid": message.uuid,
+                "toolCallId": tool_use_id,
+                "toolResultContentIndex": content_index,
+                "sourceKind": "tool_result_image",
+                "mediaType": media_type,
+                "byteLength": bytes.len(),
+                "sha256": sha256
+            });
+            if let Some(locator) = correlation.as_ref() {
+                artifact.as_object_mut()?.insert(
+                    "correlation".to_string(),
+                    serde_json::json!({ "kind": "local_path", "value": locator }),
+                );
+            }
+            Some(artifact)
+        })
+        .collect()
+}
+
+fn append_codex_image_artifacts(message: &mut ClaudeMessage, artifacts: Vec<Value>) {
+    if artifacts.is_empty() {
+        return;
+    }
+    let data = message
+        .data
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(data) = data.as_object_mut() else {
+        return;
+    };
+    let target = data
+        .entry("imageArtifacts")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(target) = target.as_array_mut() else {
+        return;
+    };
+    for artifact in artifacts {
+        let id = artifact.get("artifactId").and_then(Value::as_str);
+        if id.is_some_and(|id| {
+            target
+                .iter()
+                .any(|existing| existing.get("artifactId").and_then(Value::as_str) == Some(id))
+        }) {
+            continue;
+        }
+        target.push(artifact);
+    }
+}
+
+fn decode_image_data_url(source: &str) -> Option<(&str, Vec<u8>)> {
+    let (metadata, encoded) = source.strip_prefix("data:")?.split_once(',')?;
+    let mut parts = metadata.split(';');
+    let declared_media_type = parts.next()?.to_ascii_lowercase();
+    if !declared_media_type.starts_with("image/") || !parts.any(|part| part == "base64") {
+        return None;
+    }
+    let bytes = BASE64_STANDARD.decode(encoded).ok()?;
+    let media_type = detected_image_media_type(&bytes)?;
+    let declared_matches = declared_media_type == media_type
+        || (declared_media_type == "image/jpg" && media_type == "image/jpeg");
+    declared_matches.then_some((media_type, bytes))
+}
+
+fn detected_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+fn codex_view_image_locator(tool_use: &Value) -> Option<String> {
+    let name = tool_use.get("name").and_then(Value::as_str)?;
+    let input = tool_use.get("input")?;
+    if name == "view_image" {
+        return input
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    if name != "exec" {
+        return None;
+    }
+    let source = input.get("input").and_then(Value::as_str)?;
+    const CALL: &str = "tools.view_image";
+    let mut calls = source.match_indices(CALL);
+    let (call_start, matched) = calls.next()?;
+    if calls.next().is_some() {
+        return None;
+    }
+    let call = &source[call_start + matched.len()..];
+    let object_start = call.find('{')?;
+    let object = &call[object_start + 1..];
+    let (key_start, key_len) = object
+        .find("\"path\"")
+        .map(|index| (index, "\"path\"".len()))
+        .or_else(|| object.find("path").map(|index| (index, "path".len())))?;
+    let after_key = object[key_start + key_len..].trim_start();
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    let literal_end = json_string_literal_end(after_colon)?;
+    serde_json::from_str::<String>(&after_colon[..literal_end])
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn json_string_literal_end(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            return Some(index + 1);
+        }
+    }
+    None
 }
 
 fn failed_apply_patch_result(block: &Value) -> bool {
@@ -6841,6 +7065,280 @@ mod tests {
     }
 
     #[test]
+    fn merge_indexes_authoritative_view_image_payload_without_copying_it() {
+        let path = r"C:\Users\Example\AppData\Local\Temp\result.png";
+        let source = "data:image/png;base64,iVBORw0KGgo=";
+        let mut messages = vec![build_codex_message(
+            "assistant-image".to_string(),
+            "session-1",
+            "2026-08-17T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call-image",
+                "name": "exec",
+                "input": {
+                    "input": format!(
+                        "const r = await tools.view_image({{path:{}}}); image(r.image_url);",
+                        serde_json::to_string(path).unwrap()
+                    )
+                }
+            }])),
+            None,
+        )];
+        merge_codex_message_provenance(&mut messages[0], Some("turn-33"), None);
+        let result_msg = build_codex_message(
+            "user-image".to_string(),
+            "session-1",
+            "2026-08-17T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call-image",
+                "content": [
+                    { "type": "input_text", "text": "Image Size: 10x10." },
+                    { "type": "input_image", "image_url": source }
+                ]
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let artifacts = messages[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("imageArtifacts"))
+            .and_then(Value::as_array)
+            .expect("image artifact index should be present");
+        assert_eq!(artifacts.len(), 1);
+        let artifact = &artifacts[0];
+        assert_eq!(artifact["version"], 1);
+        assert_eq!(artifact["providerTurnId"], "turn-33");
+        assert_eq!(artifact["sourceMessageUuid"], "assistant-image");
+        assert_eq!(artifact["toolCallId"], "call-image");
+        assert_eq!(artifact["toolResultContentIndex"], 1);
+        assert_eq!(artifact["mediaType"], "image/png");
+        assert_eq!(artifact["byteLength"], 8);
+        assert_eq!(
+            artifact["sha256"],
+            format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\n"))
+        );
+        assert_eq!(artifact["correlation"]["kind"], "local_path");
+        assert_eq!(artifact["correlation"]["value"], path);
+        assert!(artifact.get("source").is_none());
+        assert!(artifact.get("image_url").is_none());
+
+        let merged = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("merged content should remain available");
+        assert_eq!(merged[1]["content"][1]["image_url"], source);
+    }
+
+    #[test]
+    fn image_artifact_requires_exact_provider_turn_ownership() {
+        let mut messages = vec![build_codex_message(
+            "assistant-image".to_string(),
+            "session-1",
+            "2026-08-17T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call-image",
+                "name": "view_image",
+                "input": { "path": "C:\\Temp\\result.png" }
+            }])),
+            None,
+        )];
+        let result_msg = build_codex_message(
+            "user-image".to_string(),
+            "session-1",
+            "2026-08-17T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call-image",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,iVBORw0KGgo="
+                }]
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        assert!(messages[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("imageArtifacts"))
+            .is_none());
+        assert_eq!(
+            messages[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn view_image_locator_rejects_ambiguous_or_non_literal_exec_calls() {
+        assert_eq!(
+            codex_view_image_locator(&json!({
+                "name": "view_image",
+                "input": { "path": "C:\\Temp\\direct.png" }
+            })),
+            Some(r"C:\Temp\direct.png".to_string())
+        );
+        assert!(codex_view_image_locator(&json!({
+            "name": "exec",
+            "input": { "input": "tools.view_image({path:first}); tools.view_image({path:\"second.png\"});" }
+        }))
+        .is_none());
+        assert!(codex_view_image_locator(&json!({
+            "name": "exec",
+            "input": { "input": "tools.view_image({path:someVariable});" }
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn image_data_url_requires_matching_supported_image_bytes() {
+        assert_eq!(
+            decode_image_data_url("data:image/png;base64,iVBORw0KGgo=")
+                .map(|(media_type, bytes)| (media_type, bytes.len())),
+            Some(("image/png", 8))
+        );
+        assert!(decode_image_data_url("data:image/jpeg;base64,iVBORw0KGgo=").is_none());
+        assert!(decode_image_data_url("data:image/png;base64,aW1hZ2UtYnl0ZXM=").is_none());
+        assert!(decode_image_data_url("data:text/plain;base64,aW1hZ2U=").is_none());
+    }
+
+    #[test]
+    fn rollout_indexes_view_image_artifact_under_the_single_active_turn() {
+        let temp = TempDir::new().expect("temp directory should be created");
+        let path = write_rollout_lines(
+            temp.path(),
+            "rollout-2026-08-17T12-00-00-00000000-0000-0000-0000-000000000033.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-08-17T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "00000000-0000-0000-0000-000000000033" }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-33" }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Inspect it." }],
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-33" }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-image",
+                        "input": "const r = await tools.view_image({path:\"C:\\\\Temp\\\\result.png\"}); image(r.image_url);"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-image",
+                        "output": [
+                            { "type": "input_text", "text": "Image Size: 10x10." },
+                            { "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=" }
+                        ]
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "![Result](</C:/Temp/result.png>)"
+                        }],
+                        "internal_chat_message_metadata_passthrough": { "turn_id": "turn-33" }
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-17T12:00:06Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-33" }
+                }),
+            ],
+        );
+
+        let messages = parse_rollout_file(&path).expect("rollout should parse");
+        let tool_message = messages
+            .iter()
+            .find(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("imageArtifacts"))
+                    .is_some()
+            })
+            .expect("tool message should carry the image artifact index");
+        assert_eq!(
+            tool_message
+                .data
+                .as_ref()
+                .and_then(|data| data.get("providerTurnId")),
+            Some(&Value::String("turn-33".to_string()))
+        );
+        let artifact = &tool_message.data.as_ref().unwrap()["imageArtifacts"][0];
+        assert_eq!(artifact["correlation"]["value"], r"C:\Temp\result.png");
+        assert_eq!(artifact["byteLength"], 8);
+        assert!(messages.iter().any(|message| {
+            message.message_type == "assistant"
+                && message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("providerTurnId"))
+                    .and_then(Value::as_str)
+                    == Some("turn-33")
+                && message
+                    .content
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|block| {
+                            block.get("text").and_then(Value::as_str)
+                                == Some("![Result](</C:/Temp/result.png>)")
+                        })
+                    })
+        }));
+    }
+
+    #[test]
     fn merge_marks_failed_apply_patch_result_as_error() {
         let mut messages = vec![build_codex_message(
             "assistant-1".to_string(),
@@ -8775,6 +9273,12 @@ mod tests {
             .iter()
             .find(|message| message.uuid == "assistant-b")
             .expect("assistant B should be retained");
+        assert_eq!(
+            message_data_str(assistant_a, "providerTurnId"),
+            None,
+            "later overlap must revoke inferred ownership from earlier records"
+        );
+        assert_eq!(message_data_str(assistant_b, "providerTurnId"), None);
         assert_eq!(
             assistant_a
                 .inference

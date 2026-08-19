@@ -187,6 +187,8 @@ struct Capabilities {
     version: &'static str,
     /// Headless commands this build supports (flag names without the `--`).
     commands: Vec<&'static str>,
+    /// Additive normalized-data contracts consumers may use when present.
+    features: Vec<&'static str>,
 }
 
 /// Handle the `--capabilities` CLI flag. Prints the headless protocol version and
@@ -209,6 +211,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "audit-codex-authorship",
             "capabilities",
         ],
+        features: vec!["image-artifacts-v1"],
     };
     emit_json(args, &caps)
 }
@@ -2014,6 +2017,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(value["api_version"], HEADLESS_API_VERSION);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["features"], json!(["image-artifacts-v1"]));
         assert_eq!(
             value["commands"],
             json!([
