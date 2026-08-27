@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 11;
+const SNAPSHOT_CURSOR_VERSION: u32 = 12;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -922,7 +922,11 @@ fn observe_pending_terminal_record(
             }
             if matches!(
                 event_type,
-                "token_count" | "agent_message" | "agent_reasoning"
+                "token_count"
+                    | "agent_message"
+                    | "agent_reasoning"
+                    | "image_generation_start"
+                    | "image_generation_end"
             ) {
                 return;
             }
@@ -2403,7 +2407,29 @@ fn parse_rollout_slice(
                         }
                     }
 
-                    if event_type == "token_count" {
+                    if event_type == "image_generation_end" {
+                        let explicit_provider_turn_id = non_empty_string(payload.get("turn_id"));
+                        let exact_provider_turn_id =
+                            explicit_provider_turn_id.map(str::to_string).or_else(|| {
+                                (active_turn_order.len() == 1
+                                    && !overlap_ambiguous_turns.contains(&active_turn_order[0]))
+                                .then(|| active_turn_order[0].clone())
+                            });
+                        if let Some(provider_turn_id) = exact_provider_turn_id {
+                            if let Some(msg) = convert_codex_image_generation_event(
+                                payload,
+                                &state.session_id,
+                                &line_timestamp,
+                                &mut state.msg_counter,
+                                &provider_turn_id,
+                            ) {
+                                messages.push(msg);
+                                if explicit_provider_turn_id.is_none() {
+                                    inferred_provider_turn_messages.insert(messages.len() - 1);
+                                }
+                            }
+                        }
+                    } else if event_type == "token_count" {
                         let usage_totals = extract_token_totals(payload);
                         let (usage, cumulative) = match usage_totals {
                             Some(usage) => (usage, true),
@@ -4154,6 +4180,61 @@ fn convert_codex_event(
     }
 }
 
+fn convert_codex_image_generation_event(
+    payload: &Value,
+    session_id: &str,
+    line_timestamp: &str,
+    counter: &mut u64,
+    provider_turn_id: &str,
+) -> Option<ClaudeMessage> {
+    if payload.get("status").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let call_id = non_empty_string(payload.get("call_id"))?;
+    let encoded = non_empty_string(payload.get("result"))?;
+    let bytes = BASE64_STANDARD.decode(encoded).ok()?;
+    let media_type = detected_image_media_type(&bytes)?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    *counter += 1;
+    let mut message = build_codex_message(
+        format!("codex-image-generation-{counter}"),
+        session_id,
+        line_timestamp.to_string(),
+        "progress",
+        None,
+        Some(serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": encoded
+            }
+        }])),
+        None,
+    );
+    message.subtype = Some("provider_rendered_image".to_string());
+    merge_codex_message_provenance(&mut message, Some(provider_turn_id), None);
+    let source_message_uuid = message.uuid.clone();
+    append_codex_image_artifacts(
+        &mut message,
+        vec![serde_json::json!({
+            "version": 1,
+            "artifactId": format!("codex:{call_id}:canvas:0:{sha256}"),
+            "providerTurnId": provider_turn_id,
+            "sourceMessageUuid": source_message_uuid,
+            "toolCallId": call_id,
+            "sourceContentIndex": 0,
+            "sourceKind": "provider_rendered_image",
+            "presentationKind": "canvas",
+            "mediaType": media_type,
+            "byteLength": bytes.len(),
+            "sha256": sha256
+        })],
+    );
+    Some(message)
+}
+
 fn convert_codex_compacted(
     payload: &Value,
     session_id: &str,
@@ -4523,12 +4604,10 @@ fn codex_tool_result_image_artifacts(
         // artifact that a consumer could attribute to the wrong turn.
         return Vec::new();
     };
-    let correlation = codex_view_image_locator(tool_use);
     let Some(content) = tool_result.get("content").and_then(Value::as_array) else {
         return Vec::new();
     };
-
-    content
+    let image_blocks = content
         .iter()
         .enumerate()
         .filter_map(|(content_index, block)| {
@@ -4536,6 +4615,15 @@ fn codex_tool_result_image_artifacts(
             if !matches!(block_type, "input_image" | "image" | "local_image") {
                 return None;
             }
+            Some((content_index, block))
+        })
+        .collect::<Vec<_>>();
+    let correlations = codex_view_image_locators(tool_use, image_blocks.len());
+
+    image_blocks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(image_index, (content_index, block))| {
             let source = block
                 .get("image_url")
                 .or_else(|| block.get("url"))
@@ -4560,7 +4648,7 @@ fn codex_tool_result_image_artifacts(
                 "byteLength": bytes.len(),
                 "sha256": sha256
             });
-            if let Some(locator) = correlation.as_ref() {
+            if let Some(locator) = correlations.get(image_index).and_then(Option::as_ref) {
                 artifact.as_object_mut()?.insert(
                     "correlation".to_string(),
                     serde_json::json!({ "kind": "local_path", "value": locator }),
@@ -4630,20 +4718,55 @@ fn detected_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn codex_view_image_locator(tool_use: &Value) -> Option<String> {
-    let name = tool_use.get("name").and_then(Value::as_str)?;
-    let input = tool_use.get("input")?;
+    codex_view_image_locators(tool_use, 1)
+        .into_iter()
+        .next()
+        .flatten()
+}
+
+fn codex_view_image_locators(tool_use: &Value, image_count: usize) -> Vec<Option<String>> {
+    let unmatched = || vec![None; image_count];
+    if image_count == 0 {
+        return Vec::new();
+    }
+    let Some(name) = tool_use.get("name").and_then(Value::as_str) else {
+        return unmatched();
+    };
+    let Some(input) = tool_use.get("input") else {
+        return unmatched();
+    };
     if name == "view_image" {
-        return input
+        if image_count != 1 {
+            return unmatched();
+        }
+        return vec![input
             .get("path")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .map(str::to_string);
+            .map(str::to_string)];
     }
     if name != "exec" {
-        return None;
+        return unmatched();
     }
-    let source = input.get("input").and_then(Value::as_str)?;
+    let Some(source) = input.get("input").and_then(Value::as_str) else {
+        return unmatched();
+    };
+    if let Some(locators) = codex_batched_view_image_locators(source) {
+        return if locators.len() == image_count {
+            locators.into_iter().map(Some).collect()
+        } else {
+            unmatched()
+        };
+    }
+    if image_count != 1 {
+        return unmatched();
+    }
+    vec![codex_single_exec_view_image_locator(source)]
+}
+
+fn codex_single_exec_view_image_locator(source: &str) -> Option<String> {
     const CALL: &str = "tools.view_image";
     let mut calls = source.match_indices(CALL);
     let (call_start, matched) = calls.next()?;
@@ -4663,6 +4786,187 @@ fn codex_view_image_locator(tool_use: &Value) -> Option<String> {
     serde_json::from_str::<String>(&after_colon[..literal_end])
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+fn codex_batched_view_image_locators(source: &str) -> Option<Vec<String>> {
+    const PREFIX: &str = "const [";
+    const PROMISE: &str = "] = await Promise.all([";
+    let source = source.trim();
+    let bindings = source.strip_prefix(PREFIX)?;
+    let promise_index = bindings.find(PROMISE)?;
+    let names = bindings[..promise_index]
+        .split(',')
+        .map(str::trim)
+        .map(|name| is_javascript_identifier(name).then_some(name))
+        .collect::<Option<Vec<_>>>()?;
+    if names.len() < 2 {
+        return None;
+    }
+
+    let array_and_tail = &bindings[promise_index + PROMISE.len()..];
+    let array_end = matching_square_bracket(array_and_tail)?;
+    let calls = split_top_level_commas(&array_and_tail[..array_end])?;
+    if calls.len() != names.len() {
+        return None;
+    }
+    let paths = calls
+        .iter()
+        .map(|call| {
+            let call = call.trim();
+            let invocation = call.strip_prefix("tools.view_image")?.trim_start();
+            if !invocation.starts_with('(') || !invocation.ends_with(')') {
+                return None;
+            }
+            codex_view_image_path_from_call(invocation)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut tail = array_and_tail[array_end + 1..].trim_start();
+    tail = tail.strip_prefix(");")?.trim_start();
+    let mut emitted = Vec::new();
+    while !tail.is_empty() {
+        let after_image = tail.strip_prefix("image")?.trim_start();
+        let after_open = after_image.strip_prefix('(')?;
+        let close = after_open.find(')')?;
+        let expression = after_open[..close].trim();
+        let name = expression.strip_suffix(".image_url")?.trim();
+        if !is_javascript_identifier(name) {
+            return None;
+        }
+        emitted.push(name);
+        tail = after_open[close + 1..]
+            .trim_start()
+            .strip_prefix(';')?
+            .trim_start();
+    }
+    if emitted.len() != names.len() {
+        return None;
+    }
+
+    let mut locators = Vec::with_capacity(emitted.len());
+    let mut seen = std::collections::HashSet::new();
+    for emitted_name in emitted {
+        if !seen.insert(emitted_name) {
+            return None;
+        }
+        let binding_index = names.iter().position(|name| *name == emitted_name)?;
+        locators.push(paths[binding_index].clone());
+    }
+    (seen.len() == names.len()).then_some(locators)
+}
+
+fn codex_view_image_path_from_call(call: &str) -> Option<String> {
+    let invocation = call.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let object = invocation.strip_prefix('{')?.strip_suffix('}')?;
+    let mut path = None;
+    for property in split_top_level_commas(object)? {
+        let property = property.trim();
+        let after_key = if let Some(value) = property.strip_prefix("\"path\"") {
+            value
+        } else if let Some(value) = property.strip_prefix("path") {
+            value
+        } else {
+            continue;
+        };
+        let Some(after_colon) = after_key.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let value = after_colon.trim_start();
+        let literal_end = json_string_literal_end(value)?;
+        if !value[literal_end..].trim().is_empty() {
+            return None;
+        }
+        let value = serde_json::from_str::<String>(&value[..literal_end])
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        if path.replace(value).is_some() {
+            return None;
+        }
+    }
+    path
+}
+
+fn is_javascript_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+fn matching_square_bracket(value: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut round = 0usize;
+    let mut curly = 0usize;
+    let mut square = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => round += 1,
+            ')' => round = round.checked_sub(1)?,
+            '{' => curly += 1,
+            '}' => curly = curly.checked_sub(1)?,
+            '[' => square += 1,
+            ']' => square = square.checked_sub(1)?,
+            ',' if round == 0 && curly == 0 && square == 0 => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted || round != 0 || curly != 0 || square != 0 {
+        return None;
+    }
+    parts.push(&value[start..]);
+    parts
+        .iter()
+        .all(|part| !part.trim().is_empty())
+        .then_some(parts)
 }
 
 fn json_string_literal_end(value: &str) -> Option<usize> {
@@ -7212,6 +7516,255 @@ mod tests {
             "input": { "input": "tools.view_image({path:someVariable});" }
         }))
         .is_none());
+    }
+
+    #[test]
+    fn batched_view_image_locator_requires_a_complete_literal_binding_and_emission_bijection() {
+        let reordered = r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(second.image_url); image(first.image_url);"#;
+        assert_eq!(
+            codex_batched_view_image_locators(reordered),
+            Some(vec!["second.png".to_string(), "first.png".to_string()])
+        );
+
+        for rejected in [
+            r#"const [first, second] = await Promise.all([tools.view_image({path:firstPath}), tools.view_image({path:"second.png"})]); image(first.image_url); image(second.image_url);"#,
+            r#"const [first, second] = await Promise.all([tools.view_image({path:"first" + suffix}), tools.view_image({path:"second.png"})]); image(first.image_url); image(second.image_url);"#,
+            r#"const [first, second] = await Promise.all([tools.view_image({meta:{path:"wrong.png"}}), tools.view_image({path:"second.png"})]); image(first.image_url); image(second.image_url);"#,
+            r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url);"#,
+            r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url); image(first.image_url);"#,
+            r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url); image(second.image_url); text("extra");"#,
+        ] {
+            assert!(codex_batched_view_image_locators(rejected).is_none());
+        }
+    }
+
+    #[test]
+    fn merge_correlates_structurally_provable_batched_view_images_per_output_block() {
+        let first_path = r"C:\Temp\comparison-full-size.png";
+        let second_path = r"C:\Temp\comparison-16px.png";
+        let first_source = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nfirst")
+        );
+        let second_source = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nsecond")
+        );
+        let source = format!(
+            "const [full, small] = await Promise.all([\n  tools.view_image({{path:{}, detail:\"original\"}}),\n  tools.view_image({{path:{}, detail:\"original\"}})\n]);\nimage(full.image_url);\nimage(small.image_url);",
+            serde_json::to_string(first_path).unwrap(),
+            serde_json::to_string(second_path).unwrap()
+        );
+        let mut messages = vec![build_codex_message(
+            "assistant-batch".to_string(),
+            "session-1",
+            "2026-08-27T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call-batch",
+                "name": "exec",
+                "input": { "input": source }
+            }])),
+            None,
+        )];
+        merge_codex_message_provenance(&mut messages[0], Some("turn-8"), None);
+        let result_msg = build_codex_message(
+            "user-batch".to_string(),
+            "session-1",
+            "2026-08-27T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call-batch",
+                "content": [
+                    { "type": "input_text", "text": "Two images." },
+                    { "type": "input_image", "image_url": first_source },
+                    { "type": "input_image", "image_url": second_source }
+                ]
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let artifacts = messages[0].data.as_ref().unwrap()["imageArtifacts"]
+            .as_array()
+            .expect("batched artifacts should be indexed");
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0]["toolResultContentIndex"], 1);
+        assert_eq!(artifacts[0]["correlation"]["value"], first_path);
+        assert_eq!(artifacts[1]["toolResultContentIndex"], 2);
+        assert_eq!(artifacts[1]["correlation"]["value"], second_path);
+    }
+
+    #[test]
+    fn rollout_indexes_completed_image_generation_events_as_presented_canvas_artifacts() {
+        let temp = TempDir::new().expect("temp directory should be created");
+        let first = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\ncanvas-first");
+        let second = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\ncanvas-second");
+        let ignored = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nfailed");
+        let path = write_rollout_lines(
+            temp.path(),
+            "rollout-2026-08-27T12-00-00-00000000-0000-0000-0000-000000000008.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-08-27T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "00000000-0000-0000-0000-000000000008" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-8" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "exec-canvas-first",
+                        "status": "completed",
+                        "result": first,
+                        "saved_path": "C:\\Users\\Example\\.codex\\generated_images\\session\\exec-canvas-first.png"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "exec-canvas-failed",
+                        "status": "failed",
+                        "result": ignored,
+                        "saved_path": "C:\\Users\\Example\\.codex\\generated_images\\session\\exec-canvas-failed.png"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:04Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "exec-canvas-second",
+                        "status": "completed",
+                        "result": second,
+                        "saved_path": "C:\\Users\\Example\\.codex\\generated_images\\session\\exec-canvas-second.png"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:05Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-8" }
+                }),
+            ],
+        );
+
+        let messages = parse_rollout_file(&path).expect("rollout should parse");
+        let canvas_messages = messages
+            .iter()
+            .filter(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("imageArtifacts"))
+                    .is_some_and(|artifacts| {
+                        artifacts.as_array().is_some_and(|artifacts| {
+                            artifacts.iter().any(|artifact| {
+                                artifact.get("sourceKind").and_then(Value::as_str)
+                                    == Some("provider_rendered_image")
+                            })
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(canvas_messages.len(), 2);
+        for (index, message) in canvas_messages.iter().enumerate() {
+            assert_eq!(
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("providerTurnId"))
+                    .and_then(Value::as_str),
+                Some("turn-8")
+            );
+            let artifact = &message.data.as_ref().unwrap()["imageArtifacts"][0];
+            assert_eq!(artifact["version"], 1);
+            assert_eq!(artifact["sourceMessageUuid"], message.uuid);
+            assert_eq!(artifact["sourceContentIndex"], 0);
+            assert_eq!(artifact["sourceKind"], "provider_rendered_image");
+            assert_eq!(artifact["presentationKind"], "canvas");
+            assert_eq!(
+                artifact["toolCallId"],
+                if index == 0 {
+                    "exec-canvas-first"
+                } else {
+                    "exec-canvas-second"
+                }
+            );
+            assert_eq!(message.message_type, "progress");
+            assert_eq!(message.content.as_ref().unwrap()[0]["type"], "image");
+        }
+    }
+
+    #[test]
+    fn rollout_omits_canvas_artifacts_when_task_ownership_overlaps() {
+        let temp = TempDir::new().expect("temp directory should be created");
+        let result = BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nambiguous");
+        let path = write_rollout_lines(
+            temp.path(),
+            "rollout-2026-08-27T12-00-00-00000000-0000-0000-0000-000000000009.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-08-27T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "00000000-0000-0000-0000-000000000009" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-a" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-b" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "exec-canvas-ambiguous",
+                        "status": "completed",
+                        "result": result,
+                        "saved_path": "C:\\Users\\Example\\.codex\\generated_images\\session\\exec-canvas-ambiguous.png"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-b" }
+                }),
+                json!({
+                    "timestamp": "2026-08-27T12:00:05Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-a" }
+                }),
+            ],
+        );
+
+        let messages = parse_rollout_file(&path).expect("rollout should parse");
+        assert!(messages.iter().all(|message| {
+            message
+                .data
+                .as_ref()
+                .and_then(|data| data.get("imageArtifacts"))
+                .is_none()
+        }));
     }
 
     #[test]
