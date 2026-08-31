@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 13;
+const SNAPSHOT_CURSOR_VERSION: u32 = 14;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -86,6 +86,12 @@ impl CodexParserState {
 struct PendingForkRollback {
     message_index: usize,
     replacement_task_started: bool,
+}
+
+#[derive(Debug)]
+struct PendingForkBranch {
+    message_index: usize,
+    turn_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2139,6 +2145,7 @@ fn parse_rollout_slice(
     let mut authorship_tracker = CodexAuthorshipTracker::default();
     let mut pending_compacted_notification = false;
     let mut pending_fork_rollback: Option<PendingForkRollback> = None;
+    let mut pending_fork_branch: Option<PendingForkBranch> = None;
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
         if start < usize::try_from(checkpoint.byte_offset).map_err(|_| ())? {
@@ -2203,8 +2210,9 @@ fn parse_rollout_slice(
         match line_type {
             // The first session_meta owns the rollout identity. Later metas are
             // replayed history, except that the first return to the child id
-            // closes the raw `codex fork` transition and can classify its
-            // immediately preceding rollback without re-tagging messages.
+            // closes the raw `codex fork` transition. A positive rollback is
+            // classified in place; without one, the existing first child task
+            // gains a zero-exclusion boundary annotation.
             "session_meta" => {
                 if let Some(payload) = val.get("payload") {
                     let meta_session_id = non_empty_string(payload.get("id"));
@@ -2217,7 +2225,9 @@ fn parse_rollout_slice(
                     {
                         match meta_session_id {
                             Some(id) if id == state.session_id && state.fork_replay_seen => {
-                                if let Some(candidate) = pending_fork_rollback.take() {
+                                let rollback_candidate = pending_fork_rollback.take();
+                                let has_rollback_candidate = rollback_candidate.is_some();
+                                if let Some(candidate) = rollback_candidate {
                                     if candidate.replacement_task_started {
                                         let data = messages[candidate.message_index]
                                             .data
@@ -2232,6 +2242,26 @@ fn parse_rollout_slice(
                                         }
                                     }
                                 }
+                                if !has_rollback_candidate {
+                                    if let Some(candidate) = pending_fork_branch.take() {
+                                        let data = messages[candidate.message_index]
+                                            .data
+                                            .get_or_insert_with(|| {
+                                                Value::Object(serde_json::Map::new())
+                                            });
+                                        if let Some(data) = data.as_object_mut() {
+                                            data.insert(
+                                                "forkBoundary".to_string(),
+                                                serde_json::json!({
+                                                    "origin": "fork",
+                                                    "parentSessionId": state.forked_from_session_id.as_deref(),
+                                                    "excludedTurns": 0,
+                                                    "firstBranchTurnId": candidate.turn_id,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
                                 state.fork_transition_seen = true;
                             }
                             Some(id)
@@ -2240,9 +2270,11 @@ fn parse_rollout_slice(
                             {
                                 state.fork_replay_seen = true;
                                 pending_fork_rollback = None;
+                                pending_fork_branch = None;
                             }
                             Some(id) if state.fork_replay_seen && id != state.session_id => {
                                 pending_fork_rollback = None;
+                                pending_fork_branch = None;
                             }
                             _ => {}
                         }
@@ -2592,6 +2624,18 @@ fn parse_rollout_slice(
                                 .then(|| state.current_inference.clone());
                         }
                         messages.push(msg);
+                        if event_type == "task_started"
+                            && state.forked_from_session_id.is_some()
+                            && state.fork_replay_seen
+                            && !state.fork_transition_seen
+                        {
+                            if let Some(turn_id) = non_empty_string(payload.get("turn_id")) {
+                                pending_fork_branch = Some(PendingForkBranch {
+                                    message_index: messages.len() - 1,
+                                    turn_id: turn_id.to_string(),
+                                });
+                            }
+                        }
                         if event_type == "thread_rolled_back"
                             && state.forked_from_session_id.is_some()
                             && state.fork_replay_seen
@@ -2612,6 +2656,7 @@ fn parse_rollout_slice(
                         }
                     } else if matches!(event_type, "task_complete" | "turn_aborted") {
                         pending_fork_rollback = None;
+                        pending_fork_branch = None;
                     }
 
                     if matches!(event_type, "task_complete" | "turn_aborted") {
@@ -2677,7 +2722,10 @@ fn parse_rollout_slice(
                                     .unwrap_or(messages.len());
                             }
                         }
-                        if authorship_tracker.is_quiescent() && pending_fork_rollback.is_none() {
+                        if authorship_tracker.is_quiescent()
+                            && pending_fork_rollback.is_none()
+                            && pending_fork_branch.is_none()
+                        {
                             let next_offset = ranges
                                 .get(range_index + 1)
                                 .map_or(bytes.len(), |&(next_start, _)| next_start);
@@ -5228,6 +5276,13 @@ mod tests {
             .and_then(Value::as_str)
     }
 
+    fn message_fork_boundary(message: &ClaudeMessage) -> Option<&Value> {
+        message
+            .data
+            .as_ref()
+            .and_then(|data| data.get("forkBoundary"))
+    }
+
     #[test]
     fn imported_provider_classifies_known_storage_roots() {
         assert_eq!(
@@ -6509,6 +6564,116 @@ mod tests {
                 .find(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
                 .and_then(|message| message_data_str(message, "rollbackOrigin")),
             Some("fork")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replays_an_unconfirmed_zero_exclusion_fork_until_child_metadata_arrives() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-30T10-00-00-snapshot-tip-fork.jsonl",
+            &[
+                forked_session_meta_line_with(
+                    "2026-08-30T10:00:00Z",
+                    "snapshot-tip-fork",
+                    "C:/repo",
+                    json!("snapshot-parent"),
+                ),
+                session_meta_line_with("2026-08-29T10:00:00Z", "snapshot-parent", "C:/repo"),
+                json!({
+                    "timestamp": "2026-08-29T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "parent-final" }
+                }),
+                json!({
+                    "timestamp": "2026-08-29T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "parent-final" }
+                }),
+            ],
+        );
+        let path_text = path.to_string_lossy();
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+
+        append_rollout_lines(
+            &path,
+            &[json!({
+                "timestamp": "2026-08-30T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "fork-first" }
+            })],
+        );
+        let cursor = match load_session_snapshot(&path_text, Some(&cursor))
+            .expect("unconfirmed zero-exclusion fork delta")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+                cursor
+            }
+            _ => panic!("the unconfirmed child task should remain replayable"),
+        };
+        assert!(!cached
+            .iter()
+            .any(|message| message_fork_boundary(message).is_some()));
+
+        append_rollout_lines(
+            &path,
+            &[
+                session_meta_line_with("2026-08-30T10:00:02Z", "snapshot-tip-fork", "C:/repo"),
+                json!({
+                    "timestamp": "2026-08-30T10:00:03Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "fork-first" }
+                }),
+            ],
+        );
+        match load_session_snapshot(&path_text, Some(&cursor))
+            .expect("confirmed zero-exclusion fork delta")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("the confirmed boundary should replace the unclassified suffix"),
+        }
+
+        assert_snapshot_matches_fresh(&cached, &path);
+        let boundary = cached
+            .iter()
+            .find_map(|message| message_fork_boundary(message))
+            .expect("confirmed task annotation should be retained");
+        assert_eq!(boundary.get("origin").and_then(Value::as_str), Some("fork"));
+        assert_eq!(
+            boundary.get("parentSessionId").and_then(Value::as_str),
+            Some("snapshot-parent")
+        );
+        assert_eq!(
+            boundary.get("firstBranchTurnId").and_then(Value::as_str),
+            Some("fork-first")
         );
     }
 
@@ -12417,20 +12582,133 @@ mod tests {
             .join("\n");
         fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
 
-        let rollbacks = parse_rollout_file(&rollout_path)
-            .expect("parse_rollout_file should succeed")
-            .into_iter()
+        let messages =
+            parse_rollout_file(&rollout_path).expect("parse_rollout_file should succeed");
+        let rollbacks = messages
+            .iter()
             .filter(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
             .collect::<Vec<_>>();
 
+        assert!(messages
+            .iter()
+            .all(|message| message_fork_boundary(message).is_none()));
         assert_eq!(rollbacks.len(), 4);
-        assert_eq!(message_data_str(&rollbacks[0], "rollbackOrigin"), None);
-        assert_eq!(message_data_str(&rollbacks[1], "rollbackOrigin"), None);
+        assert_eq!(message_data_str(rollbacks[0], "rollbackOrigin"), None);
+        assert_eq!(message_data_str(rollbacks[1], "rollbackOrigin"), None);
         assert_eq!(
-            message_data_str(&rollbacks[2], "rollbackOrigin"),
+            message_data_str(rollbacks[2], "rollbackOrigin"),
             Some("fork")
         );
-        assert_eq!(message_data_str(&rollbacks[3], "rollbackOrigin"), None);
+        assert_eq!(
+            rollbacks[2].data,
+            Some(json!({ "numTurns": 3, "rollbackOrigin": "fork" }))
+        );
+        assert_eq!(message_data_str(rollbacks[3], "rollbackOrigin"), None);
+    }
+
+    #[test]
+    fn parse_rollout_file_annotates_only_one_confirmed_zero_exclusion_fork_boundary() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-08-30-tip-fork.jsonl");
+        let lines = [
+            forked_session_meta_line_with(
+                "2026-08-30T10:00:00Z",
+                "sess-tip-fork",
+                "/tmp/proj",
+                json!("sess-parent"),
+            ),
+            session_meta_line_with("2026-08-29T10:00:00Z", "sess-parent", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-29T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "parent-final" }
+            }),
+            json!({
+                "timestamp": "2026-08-29T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "parent-final" }
+            }),
+            json!({
+                "timestamp": "2026-08-30T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "fork-first" }
+            }),
+            session_meta_line_with("2026-08-30T10:00:02Z", "sess-tip-fork", "/tmp/proj"),
+            session_meta_line_with("2026-08-30T10:00:03Z", "sess-tip-fork", "/tmp/proj"),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+
+        let messages =
+            parse_rollout_file(&rollout_path).expect("parse_rollout_file should succeed");
+        let boundaries = messages
+            .iter()
+            .filter_map(message_fork_boundary)
+            .collect::<Vec<_>>();
+
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(
+            boundaries[0].get("origin").and_then(Value::as_str),
+            Some("fork")
+        );
+        assert_eq!(
+            boundaries[0].get("parentSessionId").and_then(Value::as_str),
+            Some("sess-parent")
+        );
+        assert_eq!(
+            boundaries[0]
+                .get("firstBranchTurnId")
+                .and_then(Value::as_str),
+            Some("fork-first")
+        );
+        assert_eq!(
+            boundaries[0].get("excludedTurns").and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_rollout_file_does_not_infer_a_zero_exclusion_boundary_after_terminal_activity() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp
+            .path()
+            .join("rollout-2026-08-30-incomplete-tip-fork.jsonl");
+        let lines = [
+            forked_session_meta_line_with(
+                "2026-08-30T10:00:00Z",
+                "sess-tip-fork",
+                "/tmp/proj",
+                json!("sess-parent"),
+            ),
+            session_meta_line_with("2026-08-29T10:00:00Z", "sess-parent", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-30T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "incomplete-child" }
+            }),
+            json!({
+                "timestamp": "2026-08-30T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "turn_aborted", "turn_id": "incomplete-child" }
+            }),
+            session_meta_line_with("2026-08-30T10:00:03Z", "sess-tip-fork", "/tmp/proj"),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+
+        let messages =
+            parse_rollout_file(&rollout_path).expect("parse_rollout_file should succeed");
+        assert!(!messages
+            .iter()
+            .any(|message| message_fork_boundary(message).is_some()));
     }
 
     #[test]
