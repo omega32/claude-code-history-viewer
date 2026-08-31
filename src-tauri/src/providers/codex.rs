@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 12;
+const SNAPSHOT_CURSOR_VERSION: u32 = 13;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -45,6 +45,12 @@ const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 struct CodexParserState {
     session_id: String,
     meta_seen: bool,
+    #[serde(default)]
+    forked_from_session_id: Option<String>,
+    #[serde(default)]
+    fork_replay_seen: bool,
+    #[serde(default)]
+    fork_transition_seen: bool,
     current_inference: InferenceMetadata,
     prev_input_tokens: u32,
     prev_output_tokens: u32,
@@ -61,6 +67,9 @@ impl CodexParserState {
         Self {
             session_id: session_id_from_rollout_filename(path).unwrap_or_default(),
             meta_seen: false,
+            forked_from_session_id: None,
+            fork_replay_seen: false,
+            fork_transition_seen: false,
             current_inference: InferenceMetadata::default(),
             prev_input_tokens: 0,
             prev_output_tokens: 0,
@@ -71,6 +80,12 @@ impl CodexParserState {
             msg_counter: 0,
         }
     }
+}
+
+#[derive(Debug)]
+struct PendingForkRollback {
+    message_index: usize,
+    replacement_task_started: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2111,7 +2126,7 @@ fn parse_rollout_slice(
     mut checkpoint: CodexParserCheckpoint,
     resumed: bool,
 ) -> Result<CodexParseOutcome, ()> {
-    let mut messages = Vec::new();
+    let mut messages: Vec<ClaudeMessage> = Vec::new();
     let mut diagnostics = Vec::new();
     let slice_base_replace_from = checkpoint.replace_from;
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
@@ -2123,6 +2138,7 @@ fn parse_rollout_slice(
     let mut inferred_provider_turn_messages = HashSet::<usize>::new();
     let mut authorship_tracker = CodexAuthorshipTracker::default();
     let mut pending_compacted_notification = false;
+    let mut pending_fork_rollback: Option<PendingForkRollback> = None;
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
         if start < usize::try_from(checkpoint.byte_offset).map_err(|_| ())? {
@@ -2185,16 +2201,52 @@ fn parse_rollout_slice(
         }
 
         match line_type {
-            // First session_meta only — later ones are history replayed by
-            // `codex fork` and must not re-tag messages with the source's id.
-            "session_meta" if !state.meta_seen => {
-                state.meta_seen = true;
+            // The first session_meta owns the rollout identity. Later metas are
+            // replayed history, except that the first return to the child id
+            // closes the raw `codex fork` transition and can classify its
+            // immediately preceding rollback without re-tagging messages.
+            "session_meta" => {
                 if let Some(payload) = val.get("payload") {
-                    state.session_id = payload
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let meta_session_id = non_empty_string(payload.get("id"));
+                    if !state.meta_seen {
+                        state.meta_seen = true;
+                        state.session_id = meta_session_id.unwrap_or("unknown").to_string();
+                        state.forked_from_session_id =
+                            non_empty_string(payload.get("forked_from_id")).map(str::to_string);
+                    } else if state.forked_from_session_id.is_some() && !state.fork_transition_seen
+                    {
+                        match meta_session_id {
+                            Some(id) if id == state.session_id && state.fork_replay_seen => {
+                                if let Some(candidate) = pending_fork_rollback.take() {
+                                    if candidate.replacement_task_started {
+                                        let data = messages[candidate.message_index]
+                                            .data
+                                            .get_or_insert_with(|| {
+                                                Value::Object(serde_json::Map::new())
+                                            });
+                                        if let Some(data) = data.as_object_mut() {
+                                            data.insert(
+                                                "rollbackOrigin".to_string(),
+                                                Value::String("fork".to_string()),
+                                            );
+                                        }
+                                    }
+                                }
+                                state.fork_transition_seen = true;
+                            }
+                            Some(id)
+                                if !state.fork_replay_seen
+                                    && state.forked_from_session_id.as_deref() == Some(id) =>
+                            {
+                                state.fork_replay_seen = true;
+                                pending_fork_rollback = None;
+                            }
+                            Some(id) if state.fork_replay_seen && id != state.session_id => {
+                                pending_fork_rollback = None;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             "turn_context" => {
@@ -2540,6 +2592,26 @@ fn parse_rollout_slice(
                                 .then(|| state.current_inference.clone());
                         }
                         messages.push(msg);
+                        if event_type == "thread_rolled_back"
+                            && state.forked_from_session_id.is_some()
+                            && state.fork_replay_seen
+                            && !state.fork_transition_seen
+                        {
+                            pending_fork_rollback = Some(PendingForkRollback {
+                                message_index: messages.len() - 1,
+                                replacement_task_started: false,
+                            });
+                        }
+                    }
+
+                    if event_type == "task_started"
+                        && non_empty_string(payload.get("turn_id")).is_some()
+                    {
+                        if let Some(candidate) = pending_fork_rollback.as_mut() {
+                            candidate.replacement_task_started = true;
+                        }
+                    } else if matches!(event_type, "task_complete" | "turn_aborted") {
+                        pending_fork_rollback = None;
                     }
 
                     if matches!(event_type, "task_complete" | "turn_aborted") {
@@ -2605,7 +2677,7 @@ fn parse_rollout_slice(
                                     .unwrap_or(messages.len());
                             }
                         }
-                        if authorship_tracker.is_quiescent() {
+                        if authorship_tracker.is_quiescent() && pending_fork_rollback.is_none() {
                             let next_offset = ranges
                                 .get(range_index + 1)
                                 .map_or(bytes.len(), |&(next_start, _)| next_start);
@@ -6325,6 +6397,119 @@ mod tests {
         assert!(cached
             .iter()
             .any(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE)));
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replays_an_unconfirmed_fork_rollback_until_child_metadata_arrives() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-29T10-00-00-snapshot-fork.jsonl",
+            &[
+                forked_session_meta_line_with(
+                    "2026-08-29T10:00:00Z",
+                    "snapshot-fork",
+                    "C:/repo",
+                    json!("snapshot-parent"),
+                ),
+                session_meta_line_with("2026-08-28T10:00:00Z", "snapshot-parent", "C:/repo"),
+                json!({
+                    "timestamp": "2026-08-28T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "parent-final" }
+                }),
+                json!({
+                    "timestamp": "2026-08-28T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "parent-final" }
+                }),
+            ],
+        );
+        let path_text = path.to_string_lossy();
+        let (mut cached, cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial snapshot should carry a cursor"),
+            };
+
+        append_rollout_lines(
+            &path,
+            &[
+                json!({
+                    "timestamp": "2026-08-29T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 2 }
+                }),
+                json!({
+                    "timestamp": "2026-08-29T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "fork-first" }
+                }),
+            ],
+        );
+        let cursor = match load_session_snapshot(&path_text, Some(&cursor))
+            .expect("unconfirmed fork delta")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+                cursor
+            }
+            _ => panic!("the unconfirmed rollback should remain replayable"),
+        };
+        assert_eq!(
+            cached
+                .iter()
+                .find(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
+                .and_then(|message| message_data_str(message, "rollbackOrigin")),
+            None
+        );
+
+        append_rollout_lines(
+            &path,
+            &[
+                session_meta_line_with("2026-08-29T10:00:03Z", "snapshot-fork", "C:/repo"),
+                json!({
+                    "timestamp": "2026-08-29T10:00:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "fork-first" }
+                }),
+            ],
+        );
+        match load_session_snapshot(&path_text, Some(&cursor)).expect("confirmed fork delta") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("the confirmed rollback should replace the unclassified suffix"),
+        }
+
+        assert_snapshot_matches_fresh(&cached, &path);
+        assert_eq!(
+            cached
+                .iter()
+                .find(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
+                .and_then(|message| message_data_str(message, "rollbackOrigin")),
+            Some("fork")
+        );
     }
 
     #[test]
@@ -12171,6 +12356,121 @@ mod tests {
                 .map(|m| m.session_id.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn parse_rollout_file_marks_only_the_rollback_that_creates_a_fork() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-08-29.jsonl");
+        let lines = [
+            forked_session_meta_line_with(
+                "2026-08-29T10:00:00Z",
+                "sess-fork-new",
+                "/tmp/proj",
+                json!("sess-orig"),
+            ),
+            session_meta_line_with("2026-08-27T10:00:00Z", "foreign-session", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-27T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 4 }
+            }),
+            json!({
+                "timestamp": "2026-08-27T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "foreign-replacement" }
+            }),
+            session_meta_line_with("2026-08-27T10:00:03Z", "sess-fork-new", "/tmp/proj"),
+            session_meta_line_with("2026-08-28T10:00:00Z", "sess-orig", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-28T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+            }),
+            json!({
+                "timestamp": "2026-08-28T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "parent-replacement" }
+            }),
+            session_meta_line_with("2026-08-28T10:00:03Z", "sess-orig", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-29T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 3 }
+            }),
+            json!({
+                "timestamp": "2026-08-29T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "fork-first-turn" }
+            }),
+            session_meta_line_with("2026-08-29T10:00:03Z", "sess-fork-new", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-29T10:00:04Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 2 }
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+
+        let rollbacks = parse_rollout_file(&rollout_path)
+            .expect("parse_rollout_file should succeed")
+            .into_iter()
+            .filter(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rollbacks.len(), 4);
+        assert_eq!(message_data_str(&rollbacks[0], "rollbackOrigin"), None);
+        assert_eq!(message_data_str(&rollbacks[1], "rollbackOrigin"), None);
+        assert_eq!(
+            message_data_str(&rollbacks[2], "rollbackOrigin"),
+            Some("fork")
+        );
+        assert_eq!(message_data_str(&rollbacks[3], "rollbackOrigin"), None);
+    }
+
+    #[test]
+    fn parse_rollout_file_requires_a_valid_replacement_task_to_classify_a_fork_rollback() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-08-29-invalid-task.jsonl");
+        let lines = [
+            forked_session_meta_line_with(
+                "2026-08-29T10:00:00Z",
+                "sess-fork-new",
+                "/tmp/proj",
+                json!("sess-orig"),
+            ),
+            session_meta_line_with("2026-08-28T10:00:00Z", "sess-orig", "/tmp/proj"),
+            json!({
+                "timestamp": "2026-08-29T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 2 }
+            }),
+            json!({
+                "timestamp": "2026-08-29T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "" }
+            }),
+            session_meta_line_with("2026-08-29T10:00:03Z", "sess-fork-new", "/tmp/proj"),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+
+        let rollback = parse_rollout_file(&rollout_path)
+            .expect("parse_rollout_file should succeed")
+            .into_iter()
+            .find(|message| message.subtype.as_deref() == Some("thread_rolled_back"))
+            .expect("rollback should be retained");
+
+        assert_eq!(message_data_str(&rollback, "rollbackOrigin"), None);
     }
 
     fn turn_context_line(timestamp: &str, cwd: &str) -> Value {
