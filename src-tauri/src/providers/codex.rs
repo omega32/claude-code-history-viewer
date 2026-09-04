@@ -32,7 +32,7 @@ const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const SESSION_METADATA_CACHE_FILENAME: &str = ".claude-code-history-viewer-session-cache.json";
-const SESSION_METADATA_CACHE_VERSION: u32 = 1;
+const SESSION_METADATA_CACHE_VERSION: u32 = 2;
 const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
@@ -128,6 +128,35 @@ struct NativeTitle {
 struct SqliteTitle {
     title: String,
     preview: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexHistoryBase {
+    thread_id: String,
+    end_ordinal_exclusive: u64,
+    end_byte_offset: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CodexRolloutHeader {
+    session_id: String,
+    forked_from_id: Option<String>,
+    history_mode: Option<String>,
+    history_base: Option<CodexHistoryBase>,
+    first_ordinal: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RolloutFileIdentity {
+    thread_id: String,
+    rollout_id: String,
+    ordering_key: String,
+}
+
+#[derive(Debug)]
+struct SqliteRolloutSelection {
+    rollout_path: PathBuf,
+    history_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,16 +1204,6 @@ fn imported_provider_from_path(source_path: &str) -> Option<String> {
     }
 }
 
-fn get_existing_session_dirs() -> Result<Vec<PathBuf>, String> {
-    let sessions_dir = get_sessions_dir()?;
-    let archived_sessions_dir = get_archived_sessions_dir()?;
-
-    Ok([sessions_dir, archived_sessions_dir]
-        .into_iter()
-        .filter(|path| path.exists() && path.is_dir())
-        .collect())
-}
-
 fn metadata_cache_path(base_path: &Path) -> PathBuf {
     base_path.join(SESSION_METADATA_CACHE_FILENAME)
 }
@@ -1399,6 +1418,58 @@ fn read_rollout_bytes(path: &Path) -> Result<RolloutBytes, String> {
     Ok(RolloutBytes::Mapped(mmap))
 }
 
+fn parse_rollout_header(bytes: &[u8]) -> Result<Option<CodexRolloutHeader>, String> {
+    let mut header = None;
+    for_each_jsonl_line(bytes, |line| {
+        let mut buf = line.to_vec();
+        let Ok(value) = simd_json::from_slice::<Value>(&mut buf) else {
+            return true;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return true;
+        }
+        let Some(payload) = value.get("payload") else {
+            header = Some(Err("Codex session_meta has no payload".to_string()));
+            return false;
+        };
+        let history_base = match payload.get("history_base") {
+            Some(Value::Null) | None => None,
+            Some(value) => match serde_json::from_value::<CodexHistoryBase>(value.clone()) {
+                Ok(base) => Some(base),
+                Err(error) => {
+                    header = Some(Err(format!("Invalid Codex history_base: {error}")));
+                    return false;
+                }
+            },
+        };
+        header = Some(Ok(CodexRolloutHeader {
+            session_id: payload
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            forked_from_id: payload
+                .get("forked_from_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(String::from),
+            history_mode: payload
+                .get("history_mode")
+                .and_then(Value::as_str)
+                .map(String::from),
+            history_base,
+            first_ordinal: value.get("ordinal").and_then(Value::as_u64),
+        }));
+        false
+    });
+    header.transpose()
+}
+
+fn read_rollout_header(path: &Path) -> Result<Option<CodexRolloutHeader>, String> {
+    parse_rollout_header(&read_rollout_bytes(path)?)
+}
+
 /// Return true when `session_path` is a Codex rollout JSONL inside the active
 /// or archived session roots.
 pub fn is_session_path(session_path: &str) -> bool {
@@ -1447,6 +1518,12 @@ fn validate_session_path(session_path: &Path, raw_session_path: &str) -> Result<
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct SessionInfo {
     pub(crate) session_id: String,
+    #[serde(default)]
+    rollout_id: Option<String>,
+    #[serde(default)]
+    history_mode: Option<String>,
+    #[serde(default)]
+    history_base: Option<CodexHistoryBase>,
     pub(crate) cwd: Option<String>,
     /// Provider-qualified source from the rollout's first `session_meta`.
     /// User-facing surfaces are `codex-cli` / `codex-vscode`; structured
@@ -1581,9 +1658,9 @@ pub fn scan_projects_from_path(base_path: &str) -> Result<Vec<ClaudeProject>, St
     let sessions_dir = base.join("sessions");
     let archived_sessions_dir = base.join("archived_sessions");
 
-    let session_dirs: Vec<PathBuf> = [sessions_dir, archived_sessions_dir]
+    let session_dirs: Vec<(PathBuf, bool)> = [(sessions_dir, false), (archived_sessions_dir, true)]
         .into_iter()
-        .filter(|path| {
+        .filter(|(path, _)| {
             std::fs::symlink_metadata(path)
                 .map(|m| m.file_type().is_dir())
                 .unwrap_or(false)
@@ -1594,10 +1671,8 @@ pub fn scan_projects_from_path(base_path: &str) -> Result<Vec<ClaudeProject>, St
         return Ok(vec![]);
     }
 
-    // Group sessions by cwd
-    let mut project_map: HashMap<String, Vec<ProjectScanInfo>> = HashMap::new();
-
-    for session_dir in session_dirs {
+    let mut candidates = Vec::new();
+    for (session_dir, is_archived) in session_dirs {
         for entry in WalkDir::new(session_dir)
             .min_depth(1)
             .into_iter()
@@ -1605,13 +1680,21 @@ pub fn scan_projects_from_path(base_path: &str) -> Result<Vec<ClaudeProject>, St
             .filter(|e| e.file_type().is_file())
             .filter(|e| is_discoverable_rollout(e.path()))
         {
-            let rollout_path = entry.path();
-
-            if let Ok(info) = extract_project_scan_info(rollout_path) {
-                let cwd = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
-                project_map.entry(cwd).or_default().push(info);
+            if let Ok(info) = extract_session_info(entry.path()) {
+                candidates.push((info, is_archived));
             }
         }
+    }
+
+    // Group selected logical sessions by cwd.
+    let mut project_map: HashMap<String, Vec<ProjectScanInfo>> = HashMap::new();
+    for (info, _) in select_current_session_infos(base, candidates) {
+        let cwd = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+        project_map.entry(cwd).or_default().push(ProjectScanInfo {
+            cwd: info.cwd,
+            message_count: info.message_count,
+            last_modified: info.last_modified,
+        });
     }
 
     let mut projects: Vec<ClaudeProject> = project_map
@@ -1709,6 +1792,7 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
         (base_path.join("archived_sessions"), true),
     ];
     let mut groups: HashMap<String, CodexProjectListingGroup> = HashMap::new();
+    let mut candidates = Vec::new();
 
     for (root, is_archived) in roots {
         let is_directory = fs::symlink_metadata(&root)
@@ -1730,28 +1814,31 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
             else {
                 continue;
             };
-            let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
-            let project_last_modified = file_modified_rfc3339(rollout_path);
-            let session = session_from_info(info, &project_path, &title_index);
-            let group =
-                groups
-                    .entry(project_path.clone())
-                    .or_insert_with(|| CodexProjectListingGroup {
-                        last_modified: project_last_modified.clone(),
-                        sessions: Vec::new(),
-                    });
-            if project_last_modified > group.last_modified {
-                group.last_modified = project_last_modified;
-            }
-            group.sessions.push(CodexSessionListing {
-                session,
-                project_path,
-                is_archived,
-            });
+            candidates.push((info, is_archived));
         }
     }
 
     save_session_metadata_cache(&base_path, &next_cache);
+    for (info, is_archived) in select_current_session_infos(&base_path, candidates) {
+        let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+        let project_last_modified = file_modified_rfc3339(Path::new(&info.file_path));
+        let session = session_from_info(info, &project_path, &title_index);
+        let group =
+            groups
+                .entry(project_path.clone())
+                .or_insert_with(|| CodexProjectListingGroup {
+                    last_modified: project_last_modified.clone(),
+                    sessions: Vec::new(),
+                });
+        if project_last_modified > group.last_modified {
+            group.last_modified = project_last_modified;
+        }
+        group.sessions.push(CodexSessionListing {
+            session,
+            project_path,
+            is_archived,
+        });
+    }
     let mut groups: Vec<CodexProjectListingGroup> = groups.into_values().collect();
     groups.sort_by(|left, right| right.last_modified.cmp(&left.last_modified));
     let mut sessions = Vec::new();
@@ -1885,6 +1972,11 @@ pub(crate) fn load_session_metadata_by_path(
             }
         }
     }
+    if info.history_mode.as_deref() == Some("paginated")
+        && !is_current_paginated_rollout(&base_path, &info)
+    {
+        return Ok(None);
+    }
     let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
     let title_index = load_native_title_index(&base_path_string);
     let session = session_from_info(info, &project_path, &title_index);
@@ -1916,47 +2008,15 @@ pub fn load_sessions(
     project_path: &str,
     _exclude_sidechain: bool,
 ) -> Result<Vec<ClaudeSession>, String> {
-    let session_dirs = get_existing_session_dirs()?;
-    let title_index = get_base_path()
-        .map(|base_path| load_native_title_index(&base_path))
-        .unwrap_or_default();
-
-    if session_dirs.is_empty() {
-        return Ok(vec![]);
-    }
-
     // Extract cwd from virtual path "codex://{cwd}"
     let target_cwd = project_path
         .strip_prefix("codex://")
         .unwrap_or(project_path);
-
-    let mut sessions = Vec::new();
-
-    for session_dir in session_dirs {
-        for entry in WalkDir::new(session_dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| is_discoverable_rollout(e.path()))
-        {
-            let rollout_path = entry.path();
-
-            match extract_session_cwd(rollout_path) {
-                Ok(Some(session_cwd)) if session_cwd != target_cwd => continue,
-                Ok(_) | Err(_) => {}
-            }
-
-            if let Ok(info) = extract_session_info(rollout_path) {
-                let session_cwd = info.cwd.as_deref().unwrap_or("unknown");
-                if session_cwd != target_cwd {
-                    continue;
-                }
-                sessions.push(session_from_info(info, target_cwd, &title_index));
-            }
-        }
-    }
-
+    let mut sessions: Vec<ClaudeSession> = load_all_sessions()?
+        .into_iter()
+        .filter(|listed| listed.project_path == target_cwd)
+        .map(|listed| listed.session)
+        .collect();
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     Ok(sessions)
 }
@@ -2006,6 +2066,200 @@ pub(crate) fn load_offline_messages(rollout_path: &Path) -> Result<Vec<ClaudeMes
     parse_rollout_file(rollout_path)
 }
 
+fn find_rollout_path_by_id(base_path: &Path, rollout_id: &str) -> Result<PathBuf, String> {
+    let mut matches = Vec::new();
+    for root in [
+        base_path.join("sessions"),
+        base_path.join("archived_sessions"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| is_discoverable_rollout(entry.path()))
+        {
+            if rollout_file_identity(entry.path())
+                .is_some_and(|identity| identity.rollout_id == rollout_id)
+            {
+                matches.push(entry.into_path());
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(format!(
+            "Codex history_base rollout {rollout_id} was not found"
+        )),
+        1 => validate_session_path(&matches[0], &matches[0].to_string_lossy()),
+        count => Err(format!(
+            "Codex history_base rollout {rollout_id} is ambiguous across {count} carriers"
+        )),
+    }
+}
+
+fn validate_history_cutoff(
+    rollout_id: &str,
+    bytes: &[u8],
+    base: &CodexHistoryBase,
+) -> Result<usize, String> {
+    if base.thread_id != rollout_id {
+        return Err(format!(
+            "Codex history_base expected rollout {}, found {rollout_id}",
+            base.thread_id
+        ));
+    }
+    let cutoff = usize::try_from(base.end_byte_offset)
+        .map_err(|_| "Codex history_base byte cutoff does not fit this platform".to_string())?;
+    if cutoff > bytes.len() {
+        return Err(format!(
+            "Codex history_base byte cutoff {cutoff} exceeds rollout {rollout_id} length {}",
+            bytes.len()
+        ));
+    }
+    if cutoff < bytes.len() && cutoff > 0 && bytes.get(cutoff - 1) != Some(&b'\n') {
+        return Err(format!(
+            "Codex history_base byte cutoff {cutoff} splits a rollout record"
+        ));
+    }
+    if cutoff == 0 {
+        if base.end_ordinal_exclusive != 0 {
+            return Err(
+                "Codex history_base has a nonzero ordinal at an empty byte cutoff".to_string(),
+            );
+        }
+        return Ok(cutoff);
+    }
+    let ranges = find_line_ranges(&bytes[..cutoff]);
+    let last_ordinal = ranges.iter().rev().find_map(|&(start, end)| {
+        let mut line = bytes[start..end].to_vec();
+        simd_json::from_slice::<Value>(&mut line)
+            .ok()?
+            .get("ordinal")?
+            .as_u64()
+    });
+    if last_ordinal.and_then(|ordinal| ordinal.checked_add(1)) != Some(base.end_ordinal_exclusive) {
+        return Err(format!(
+            "Codex history_base ordinal {} does not match the bounded rollout prefix",
+            base.end_ordinal_exclusive
+        ));
+    }
+    Ok(cutoff)
+}
+
+fn append_rollout_lineage(
+    base_path: &Path,
+    rollout_path: &Path,
+    bounded_by: Option<&CodexHistoryBase>,
+    seen: &mut HashSet<String>,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    const MAX_LINEAGE_DEPTH: usize = 128;
+    let identity = rollout_file_identity(rollout_path).ok_or_else(|| {
+        format!(
+            "Codex paginated rollout has no canonical physical id: {}",
+            rollout_path.display()
+        )
+    })?;
+    if seen.len() >= MAX_LINEAGE_DEPTH {
+        return Err("Codex history_base lineage exceeds the supported depth".to_string());
+    }
+    if !seen.insert(identity.rollout_id.clone()) {
+        return Err(format!(
+            "Codex history_base lineage contains a cycle at {}",
+            identity.rollout_id
+        ));
+    }
+
+    let bytes = read_rollout_bytes(rollout_path)?;
+    let header = parse_rollout_header(&bytes)?.ok_or_else(|| {
+        format!(
+            "Codex paginated rollout has no session_meta: {}",
+            rollout_path.display()
+        )
+    })?;
+    if !header.session_id.is_empty() && header.session_id != identity.thread_id {
+        return Err(format!(
+            "Codex rollout filename thread {} disagrees with session_meta {}",
+            identity.thread_id, header.session_id
+        ));
+    }
+    if header.history_mode.as_deref() != Some("paginated") {
+        return Err("Codex history_base lineage contains a non-paginated rollout".to_string());
+    }
+    if let Some(history_base) = header.history_base.as_ref() {
+        if header.first_ordinal != Some(history_base.end_ordinal_exclusive) {
+            return Err(format!(
+                "Codex continuation starts at {:?}, expected ordinal {}",
+                header.first_ordinal, history_base.end_ordinal_exclusive
+            ));
+        }
+        let ancestor = find_rollout_path_by_id(base_path, &history_base.thread_id)?;
+        append_rollout_lineage(base_path, &ancestor, Some(history_base), seen, output)?;
+    }
+    let cutoff = match bounded_by {
+        Some(base) => validate_history_cutoff(&identity.rollout_id, &bytes, base)?,
+        None => bytes.len(),
+    };
+    output.extend_from_slice(&bytes[..cutoff]);
+    Ok(())
+}
+
+fn logical_rollout_bytes(
+    base_path: &Path,
+    selected_path: &Path,
+) -> Result<(Vec<u8>, CodexRolloutHeader), String> {
+    let selected_bytes = read_rollout_bytes(selected_path)?;
+    let selected_header = parse_rollout_header(&selected_bytes)?.ok_or_else(|| {
+        format!(
+            "Codex paginated rollout has no session_meta: {}",
+            selected_path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    append_rollout_lineage(
+        base_path,
+        selected_path,
+        None,
+        &mut HashSet::new(),
+        &mut bytes,
+    )?;
+    Ok((bytes, selected_header))
+}
+
+fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    let current_bytes = read_rollout_bytes(canonical_path)?;
+    let Some(header) = parse_rollout_header(&current_bytes)? else {
+        return parse_rollout_file(canonical_path);
+    };
+    if header.history_base.is_none() {
+        return parse_rollout_file(canonical_path);
+    }
+    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
+    let (bytes, header) = logical_rollout_bytes(&base_path, canonical_path)?;
+    let ranges = find_line_ranges(&bytes);
+    let mut state = CodexParserState::initial(canonical_path);
+    state.meta_seen = true;
+    state.session_id = if header.session_id.is_empty() {
+        session_id_from_rollout_filename(canonical_path).unwrap_or_default()
+    } else {
+        header.session_id
+    };
+    state.forked_from_session_id = header.forked_from_id;
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        state: state.clone(),
+    };
+    parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
+        .map(|outcome| outcome.messages)
+        .map_err(|()| {
+            "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
+        })
+}
+
 /// Load all messages from a Codex rollout file
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     let path = Path::new(session_path);
@@ -2013,7 +2267,7 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
         return Err(format!("Session file not found: {session_path}"));
     }
     let canonical_path = validate_session_path(path, session_path)?;
-    parse_rollout_file(&canonical_path)
+    parse_live_rollout(&canonical_path)
 }
 
 /// Parse an already-validated Codex rollout JSONL file into messages. Pure of
@@ -2849,6 +3103,14 @@ fn complete_snapshot_from_path(
     reason: impl Into<String>,
 ) -> Result<SessionSnapshotLoad, String> {
     let reason = reason.into();
+    if read_rollout_header(canonical_path)?.is_some_and(|header| header.history_base.is_some()) {
+        return Ok(SessionSnapshotLoad::Full {
+            reason,
+            messages: finalize_loaded_messages(parse_live_rollout(canonical_path)?),
+            cursor: None,
+            cursor_replace_from: None,
+        });
+    }
     if !is_plain_rollout(canonical_path) {
         return Ok(SessionSnapshotLoad::Full {
             reason,
@@ -2924,6 +3186,9 @@ pub(crate) fn load_session_snapshot(
         return Err(format!("Session file not found: {session_path}"));
     }
     let canonical_path = validate_session_path(path, session_path)?;
+    if read_rollout_header(&canonical_path)?.is_some_and(|header| header.history_base.is_some()) {
+        return complete_snapshot_from_path(&canonical_path, "paginated-lineage");
+    }
 
     let Some(encoded_cursor) = encoded_cursor else {
         return complete_snapshot_from_path(&canonical_path, "initial");
@@ -3024,35 +3289,17 @@ pub(crate) fn load_session_snapshot(
 
 /// Search Codex sessions for a query string
 pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
-    let session_dirs = get_existing_session_dirs()?;
-
-    if session_dirs.is_empty() {
-        return Ok(vec![]);
-    }
-
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-
-    for session_dir in session_dirs {
-        for entry in WalkDir::new(session_dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| is_discoverable_rollout(e.path()))
-        {
-            let rollout_path = entry.path();
-
-            if let Ok(messages) = load_messages(&rollout_path.to_string_lossy()) {
-                for msg in messages {
-                    if results.len() >= limit {
-                        return Ok(results);
-                    }
-
-                    if let Some(content) = &msg.content {
-                        if search_json_value_case_insensitive(content, &query_lower) {
-                            results.push(msg);
-                        }
+    for listing in load_all_sessions()? {
+        if let Ok(messages) = load_messages(&listing.session.file_path) {
+            for msg in messages {
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+                if let Some(content) = &msg.content {
+                    if search_json_value_case_insensitive(content, &query_lower) {
+                        results.push(msg);
                     }
                 }
             }
@@ -3168,7 +3415,6 @@ pub fn delete_session_title(session_path: &str) -> Result<(), String> {
     if info.session_id.is_empty() {
         return Ok(());
     }
-
     let conn = open_state_db_read_write(&base_path)?;
     conn.execute(
         "DELETE FROM threads WHERE id = ?1",
@@ -3283,22 +3529,44 @@ fn parse_turn_context_cwd(line: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
-/// Session id derived from the rollout filename
-/// (`rollout-<timestamp>-<uuid>.jsonl` → `<uuid>`); `None` when the stem
-/// doesn't end in a UUID.
-pub(crate) fn session_id_from_rollout_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    // For "rollout-….jsonl.zst", file_stem still ends with ".jsonl".
-    let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
-    if stem.len() < 36 {
+fn is_uuid_text(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// Stable logical-thread and immutable-rollout identities encoded by Codex.
+///
+/// Ordinary names end in `<thread-id>`. Paginated replacements keep that id
+/// before an underscore and append a distinct `<rollout-id>`. The timestamped
+/// filename remains the deterministic filesystem fallback when SQLite is absent.
+fn rollout_file_identity(path: &Path) -> Option<RolloutFileIdentity> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let rollout_id = stem.get(stem.len().checked_sub(36)?..)?;
+    if !is_uuid_text(rollout_id) {
         return None;
     }
-    let tail = &stem[stem.len() - 36..];
-    let is_uuid = tail.bytes().enumerate().all(|(i, b)| match i {
-        8 | 13 | 18 | 23 => b == b'-',
-        _ => b.is_ascii_hexdigit(),
-    });
-    is_uuid.then(|| tail.to_string())
+    let thread_id = stem
+        .get(..stem.len() - 36)
+        .and_then(|prefix| prefix.strip_suffix('_'))
+        .and_then(|prefix| prefix.get(prefix.len().checked_sub(36)?..))
+        .filter(|candidate| is_uuid_text(candidate))
+        .unwrap_or(rollout_id);
+    Some(RolloutFileIdentity {
+        thread_id: thread_id.to_string(),
+        rollout_id: rollout_id.to_string(),
+        ordering_key: stem.to_string(),
+    })
+}
+
+/// Logical session id derived from an ordinary or compound rollout filename.
+pub(crate) fn session_id_from_rollout_filename(path: &Path) -> Option<String> {
+    rollout_file_identity(path).map(|identity| identity.thread_id)
 }
 
 fn file_modified_rfc3339(path: &Path) -> String {
@@ -3382,6 +3650,164 @@ fn open_state_db_read_write(base_path: &str) -> Result<Connection, String> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("Failed to open Codex state database: {e}"))
+}
+
+fn load_sqlite_rollout_selections(base_path: &Path) -> HashMap<String, SqliteRolloutSelection> {
+    let Some(conn) = open_state_db(&base_path.to_string_lossy()) else {
+        return HashMap::new();
+    };
+    let with_history_mode = conn
+        .prepare("SELECT id, rollout_path, history_mode FROM threads")
+        .and_then(|mut statement| {
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2).ok(),
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        });
+    let rows = with_history_mode.or_else(|_| {
+        let mut statement = conn.prepare("SELECT id, rollout_path FROM threads")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, None))
+            })?
+            .collect::<Result<Vec<_>, _>>();
+        rows
+    });
+    rows.unwrap_or_default()
+        .into_iter()
+        .filter(|(id, path, _)| !id.trim().is_empty() && !path.trim().is_empty())
+        .map(|(id, path, history_mode)| {
+            (
+                id,
+                SqliteRolloutSelection {
+                    rollout_path: PathBuf::from(path),
+                    history_mode,
+                },
+            )
+        })
+        .collect()
+}
+
+fn rollout_paths_match(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn rollout_ordering_key(info: &SessionInfo) -> (String, String) {
+    let identity = rollout_file_identity(Path::new(&info.file_path));
+    (
+        identity
+            .as_ref()
+            .map(|identity| identity.ordering_key.clone())
+            .unwrap_or_else(|| info.last_modified.clone()),
+        identity
+            .map(|identity| identity.rollout_id)
+            .unwrap_or_default(),
+    )
+}
+
+fn select_current_session_infos(
+    base_path: &Path,
+    candidates: Vec<(SessionInfo, bool)>,
+) -> Vec<(SessionInfo, bool)> {
+    let selections = load_sqlite_rollout_selections(base_path);
+    let mut legacy = Vec::new();
+    let mut paginated = HashMap::<String, Vec<(SessionInfo, bool)>>::new();
+    for candidate in candidates {
+        if candidate.0.history_mode.as_deref() == Some("paginated")
+            && candidate.0.rollout_id.is_some()
+            && !candidate.0.session_id.is_empty()
+        {
+            paginated
+                .entry(candidate.0.session_id.clone())
+                .or_default()
+                .push(candidate);
+        } else {
+            legacy.push(candidate);
+        }
+    }
+
+    for (thread_id, mut pages) in paginated {
+        if let Some(selection) = selections.get(&thread_id) {
+            if let Some(index) = pages.iter().position(|(info, _)| {
+                rollout_paths_match(Path::new(&info.file_path), &selection.rollout_path)
+            }) {
+                legacy.push(pages.swap_remove(index));
+                continue;
+            }
+            if selection.history_mode.as_deref() == Some("paginated") {
+                continue;
+            }
+        }
+        if let Some(selected) = pages
+            .into_iter()
+            .max_by_key(|(info, _)| rollout_ordering_key(info))
+        {
+            legacy.push(selected);
+        }
+    }
+    legacy
+}
+
+fn is_current_paginated_rollout(base_path: &Path, info: &SessionInfo) -> bool {
+    let candidate_path = Path::new(&info.file_path);
+    let selections = load_sqlite_rollout_selections(base_path);
+    if let Some(selection) = selections.get(&info.session_id) {
+        if selection.rollout_path.is_file()
+            && read_rollout_header(&selection.rollout_path)
+                .ok()
+                .flatten()
+                .is_some_and(|header| header.session_id == info.session_id)
+        {
+            return rollout_paths_match(candidate_path, &selection.rollout_path);
+        }
+        if selection.history_mode.as_deref() == Some("paginated") {
+            return false;
+        }
+    }
+
+    let mut newest = None::<(String, String, PathBuf)>;
+    for root in [
+        base_path.join("sessions"),
+        base_path.join("archived_sessions"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| is_discoverable_rollout(entry.path()))
+        {
+            let Some(identity) = rollout_file_identity(entry.path()) else {
+                continue;
+            };
+            if identity.thread_id != info.session_id {
+                continue;
+            }
+            let current = (
+                identity.ordering_key,
+                identity.rollout_id,
+                entry.into_path(),
+            );
+            if newest.as_ref().map_or(true, |previous| {
+                current.0 > previous.0 || (current.0 == previous.0 && current.1 > previous.1)
+            }) {
+                newest = Some(current);
+            }
+        }
+    }
+    newest.is_some_and(|(_, _, selected)| rollout_paths_match(candidate_path, &selected))
 }
 
 fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
@@ -3512,7 +3938,10 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
     let ranges = find_line_ranges(&mmap);
 
     let mut session_id = String::new();
+    let rollout_id = rollout_file_identity(rollout_path).map(|identity| identity.rollout_id);
     let mut meta_seen = false;
+    let mut history_mode = None;
+    let mut history_base = None;
     let mut cwd = None;
     let mut source = None;
     let mut forked_from_id = None;
@@ -3563,6 +3992,17 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
                         .map(str::trim)
                         .filter(|id| !id.is_empty())
                         .map(String::from);
+                    history_mode = payload
+                        .get("history_mode")
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    history_base = match payload.get("history_base") {
+                        Some(Value::Null) | None => None,
+                        Some(value) => Some(
+                            serde_json::from_value(value.clone())
+                                .map_err(|error| format!("Invalid Codex history_base: {error}"))?,
+                        ),
+                    };
                 }
             }
             "turn_context" => {
@@ -3665,6 +4105,9 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
 
     Ok(SessionInfo {
         session_id,
+        rollout_id,
+        history_mode,
+        history_base,
         cwd,
         entrypoint: codex_entrypoint(source.as_ref()),
         forked_from_id,
@@ -12895,5 +13338,295 @@ mod tests {
             session_id_from_rollout_filename(Path::new("rollout-short.jsonl")),
             None
         );
+        assert_eq!(
+            session_id_from_rollout_filename(Path::new(
+                "rollout-2026-09-03T18-21-41-01a068c8-6dc2-74b3-ae8e-03cce95d1249_01a0695d-0d27-7c53-bab1-ba2c3cef75d6.jsonl"
+            )),
+            Some("01a068c8-6dc2-74b3-ae8e-03cce95d1249".to_string())
+        );
+        assert_eq!(
+            session_id_from_rollout_filename(Path::new(
+                "rollout-2026-09-03T18-21-41-01a068c8-6dc2-74b3-ae8e-03cce95d1249_01a0695d-0d27-7c53-bab1-ba2c3cef75d6.jsonl.zst"
+            )),
+            Some("01a068c8-6dc2-74b3-ae8e-03cce95d1249".to_string())
+        );
+    }
+
+    fn assistant_message_line(timestamp: &str, ordinal: u64, text: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "ordinal": ordinal,
+            "type": "response_item",
+            "payload": {
+                "id": format!("item-{ordinal}"),
+                "type": "message",
+                "role": "assistant",
+                "created_at": timestamp,
+                "content": [{ "type": "output_text", "text": text }]
+            }
+        })
+    }
+
+    fn create_paginated_state_db(codex_home: &Path, thread_id: &str, rollout_path: &Path) {
+        let conn = Connection::open(codex_home.join(STATE_DB_FILENAME))
+            .expect("Codex state db should be created");
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                history_mode TEXT NOT NULL,
+                title TEXT NOT NULL,
+                preview TEXT NOT NULL,
+                first_user_message TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("threads table should be created");
+        conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, history_mode, title, preview, first_user_message
+             ) VALUES (?1, ?2, 'paginated', ?3, ?3, ?3)",
+            rusqlite::params![
+                thread_id,
+                rollout_path.to_string_lossy(),
+                "Paginated thread"
+            ],
+        )
+        .expect("paginated thread row should be inserted");
+    }
+
+    fn write_paginated_rollout_pair(
+        codex_home: &Path,
+        malformed_cutoff: bool,
+    ) -> (String, PathBuf, PathBuf) {
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("03");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let thread_id = "01a068c8-6dc2-74b3-ae8e-03cce95d1249".to_string();
+        let child_rollout_id = "01a0695d-0d27-7c53-bab1-ba2c3cef75d6";
+        let base_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-03T15-39-21-{thread_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-03T19:39:21Z",
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated"
+                    }
+                }),
+                assistant_message_line("2026-09-03T19:40:00Z", 1, "retained ancestor"),
+            ],
+        );
+        let cutoff = fs::metadata(&base_path)
+            .expect("base rollout metadata")
+            .len()
+            + u64::from(malformed_cutoff);
+        append_rollout_lines(
+            &base_path,
+            &[assistant_message_line(
+                "2026-09-03T19:41:00Z",
+                2,
+                "excluded ancestor suffix",
+            )],
+        );
+        let current_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-03T18-21-41-{thread_id}_{child_rollout_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-03T22:21:41Z",
+                    "ordinal": 2,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": thread_id,
+                            "end_ordinal_exclusive": 2,
+                            "end_byte_offset": cutoff
+                        }
+                    }
+                }),
+                assistant_message_line("2026-09-03T22:22:00Z", 3, "current page"),
+            ],
+        );
+        (thread_id, base_path, current_path)
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_thread_lists_once_and_loads_its_bounded_rollout_lineage() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (thread_id, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        create_paginated_state_db(&codex_home, &thread_id, &current_path);
+
+        let sessions = load_all_sessions().expect("paginated listing should succeed");
+        assert_eq!(sessions.len(), 1, "one logical thread must have one row");
+        assert_eq!(sessions[0].session.actual_session_id, thread_id);
+        assert!(rollout_paths_match(
+            Path::new(&sessions[0].session.file_path),
+            &current_path
+        ));
+        let projects = scan_projects_from_path(&codex_home.to_string_lossy())
+            .expect("paginated project scan should succeed");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(load_sessions("codex://C:/Repo", false).unwrap().len(), 1);
+        assert!(load_session_metadata_by_path(&base_path.to_string_lossy())
+            .expect("superseded metadata lookup should succeed")
+            .is_none());
+        assert!(
+            load_session_metadata_by_path(&current_path.to_string_lossy())
+                .expect("selected metadata lookup should succeed")
+                .is_some()
+        );
+
+        let messages =
+            load_messages(&current_path.to_string_lossy()).expect("paginated lineage should load");
+        let rendered = serde_json::to_string(&messages).expect("messages should serialize");
+        assert!(rendered.contains("retained ancestor"));
+        assert!(rendered.contains("current page"));
+        assert!(!rendered.contains("excluded ancestor suffix"));
+        assert!(messages
+            .iter()
+            .all(|message| message.session_id == thread_id));
+        assert!(search("excluded ancestor suffix", 10).unwrap().is_empty());
+        assert_eq!(search("retained ancestor", 10).unwrap().len(), 1);
+        match load_session_snapshot(&current_path.to_string_lossy(), None)
+            .expect("paginated snapshot should load")
+        {
+            SessionSnapshotLoad::Full {
+                reason,
+                messages,
+                cursor,
+                ..
+            } => {
+                assert_eq!(reason, "paginated-lineage");
+                assert!(cursor.is_none());
+                let rendered = serde_json::to_string(&messages).unwrap();
+                assert!(rendered.contains("retained ancestor"));
+                assert!(rendered.contains("current page"));
+            }
+            _ => panic!("paginated lineage should use a cursorless complete snapshot"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_sqlite_selection_does_not_resurrect_an_older_carrier_when_missing() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (thread_id, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        let missing_selected_path = current_path.with_file_name(format!(
+            "rollout-2026-09-03T19-00-00-{thread_id}_01a069ff-0000-7000-8000-000000000000.jsonl"
+        ));
+        create_paginated_state_db(&codex_home, &thread_id, &missing_selected_path);
+
+        assert!(load_all_sessions()
+            .expect("missing selected rollout should fail closed")
+            .is_empty());
+        assert!(load_session_metadata_by_path(&base_path.to_string_lossy())
+            .expect("older carrier lookup should succeed")
+            .is_none());
+        assert!(
+            load_session_metadata_by_path(&current_path.to_string_lossy())
+                .expect("newer stale carrier lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_fork_replays_a_different_logical_parent_under_the_child_identity() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("03");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let parent_id = "01a068c8-6dc2-74b3-ae8e-03cce95d1201";
+        let child_id = "01a068c8-6dc2-74b3-ae8e-03cce95d1202";
+        let child_rollout_id = "01a068c8-6dc2-74b3-ae8e-03cce95d1203";
+        let parent_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-03T15-00-00-{parent_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-03T19:00:00Z",
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": parent_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated"
+                    }
+                }),
+                assistant_message_line("2026-09-03T19:01:00Z", 1, "parent history"),
+            ],
+        );
+        let parent_cutoff = fs::metadata(&parent_path)
+            .expect("parent rollout metadata")
+            .len();
+        let child_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-03T16-00-00-{child_id}_{child_rollout_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-03T20:00:00Z",
+                    "ordinal": 2,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "cwd": "C:/Repo",
+                        "forked_from_id": parent_id,
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": parent_id,
+                            "end_ordinal_exclusive": 2,
+                            "end_byte_offset": parent_cutoff
+                        }
+                    }
+                }),
+                assistant_message_line("2026-09-03T20:01:00Z", 3, "child history"),
+            ],
+        );
+        create_paginated_state_db(&codex_home, child_id, &child_path);
+
+        let messages = load_messages(&child_path.to_string_lossy())
+            .expect("cross-thread fork lineage should load");
+        let rendered = serde_json::to_string(&messages).expect("messages should serialize");
+        assert!(rendered.contains("parent history"));
+        assert!(rendered.contains("child history"));
+        assert!(messages
+            .iter()
+            .all(|message| message.session_id == child_id));
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_thread_rejects_a_cutoff_that_splits_its_base_rollout() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_thread_id, _base_path, current_path) =
+            write_paginated_rollout_pair(&codex_home, true);
+
+        let error = load_messages(&current_path.to_string_lossy())
+            .expect_err("misaligned history cutoff must fail closed");
+        assert!(error.contains("history_base"), "unexpected error: {error}");
     }
 }
