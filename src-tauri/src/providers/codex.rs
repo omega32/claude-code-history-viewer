@@ -32,7 +32,7 @@ const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const SESSION_METADATA_CACHE_FILENAME: &str = ".claude-code-history-viewer-session-cache.json";
-const SESSION_METADATA_CACHE_VERSION: u32 = 2;
+const SESSION_METADATA_CACHE_VERSION: u32 = 3;
 const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
@@ -1625,6 +1625,10 @@ fn codex_subagent_provenance(
         .as_object()?
         .get("thread_spawn")?
         .as_object()?;
+    let parent_session_id = thread_spawn.get("parent_thread_id")?.as_str()?.trim();
+    if parent_session_id.is_empty() {
+        return None;
+    }
     let agent_path = thread_spawn.get("agent_path")?.as_str()?.trim();
     if agent_path.is_empty() {
         return None;
@@ -1638,6 +1642,7 @@ fn codex_subagent_provenance(
 
     Some(SubagentProvenance {
         spawned_at: spawned_at.to_string(),
+        parent_session_id: Some(parent_session_id.to_string()),
         agent_path: agent_path.to_string(),
         agent_nickname,
     })
@@ -12715,14 +12720,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_info_stamps_structured_subagent_source() {
+    fn extract_session_info_stamps_structured_subagent_source_without_history_fork() {
         let info = run_extract_session_info_on_lines(vec![json!({
             "timestamp": "2026-05-13T08:00:00Z",
             "type": "session_meta",
             "payload": {
                 "id": "sess-subagent",
                 "cwd": "/tmp/proj",
-                "forked_from_id": "sess-parent",
                 "source": {
                     "subagent": {
                         "thread_spawn": {
@@ -12737,11 +12741,12 @@ mod tests {
         })]);
 
         assert_eq!(info.entrypoint.as_deref(), Some("codex-subagent"));
-        assert_eq!(info.forked_from_id.as_deref(), Some("sess-parent"));
+        assert_eq!(info.forked_from_id, None);
         let provenance = info
             .subagent_provenance
             .expect("valid thread_spawn metadata should expose provenance");
         assert_eq!(provenance.spawned_at, "2026-05-13T08:00:00Z");
+        assert_eq!(provenance.parent_session_id.as_deref(), Some("sess-parent"));
         assert_eq!(provenance.agent_path, "/root/research");
         assert_eq!(provenance.agent_nickname.as_deref(), Some("Parfit"));
         assert_eq!(codex_entrypoint(Some(&json!({ "subagent": {} }))), None);
@@ -12752,12 +12757,25 @@ mod tests {
     fn extract_session_info_omits_malformed_subagent_provenance() {
         let invalid_meta = [
             json!({
+                "timestamp": "2026-05-13T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "missing-parent",
+                    "cwd": "/tmp/proj",
+                    "source": { "subagent": { "thread_spawn": {
+                        "agent_path": "/root/research",
+                        "agent_nickname": "Parfit"
+                    } } }
+                }
+            }),
+            json!({
                 "timestamp": "",
                 "type": "session_meta",
                 "payload": {
                     "id": "missing-time",
                     "cwd": "/tmp/proj",
                     "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "sess-parent",
                         "agent_path": "/root/research",
                         "agent_nickname": "Parfit"
                     } } }
@@ -12770,6 +12788,7 @@ mod tests {
                     "id": "missing-path",
                     "cwd": "/tmp/proj",
                     "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "sess-parent",
                         "agent_nickname": "Parfit"
                     } } }
                 }
@@ -12797,6 +12816,7 @@ mod tests {
                 "id": "malformed-nickname",
                 "cwd": "/tmp/proj",
                 "source": { "subagent": { "thread_spawn": {
+                    "parent_thread_id": "sess-parent",
                     "agent_path": "/root/research",
                     "agent_nickname": 42
                 } } }
@@ -12819,6 +12839,7 @@ mod tests {
                     "id": "sess-child",
                     "cwd": "/tmp/proj",
                     "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "sess-parent",
                         "agent_path": "/root/implement",
                         "agent_nickname": "Singer"
                     } } }
@@ -12831,6 +12852,7 @@ mod tests {
                     "id": "sess-parent",
                     "cwd": "/tmp/older",
                     "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "sess-grandparent",
                         "agent_path": "/root/replayed",
                         "agent_nickname": "Wrong"
                     } } }
@@ -12840,6 +12862,7 @@ mod tests {
 
         let provenance = info.subagent_provenance.unwrap();
         assert_eq!(provenance.spawned_at, "2026-05-13T08:00:00Z");
+        assert_eq!(provenance.parent_session_id.as_deref(), Some("sess-parent"));
         assert_eq!(provenance.agent_path, "/root/implement");
         assert_eq!(provenance.agent_nickname.as_deref(), Some("Singer"));
     }

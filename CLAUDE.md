@@ -33,6 +33,10 @@ The headless `image-artifacts-v1` capability preserves two presentation proofs w
 
 Codex fork provenance is classified during the existing rollout parse. After the first child `session_meta` establishes a valid `forked_from_id`, replayed non-child metadata opens the inherited-history phase. A positive `thread_rolled_back` followed by a replacement `task_started` and then the first return to the child session id gains additive `data.rollbackOrigin:"fork"`. When the same confirmed return follows a valid child `task_started` without any rollback candidate, that existing normalized progress record instead gains structured `data.forkBoundary:{origin:"fork",parentSessionId,excludedTurns:0,firstBranchTurnId}`; this preserves a zero-exclusion fork without adding a message or misreporting a rollback. Replayed historical candidates are cleared by intervening non-child metadata or terminal task activity, and any later same-session transition remains unclassified. An unconfirmed incremental suffix is deliberately checkpointed from before its candidate so later child metadata replays and repairs it. A fork left untouched at the parent tip remains session-identified but has no authoritative turn boundary because EOF is not a completion signal. Snapshot cursor version 14 invalidates retained normalized prefixes that cannot carry this classification.
 
+### Codex subagent spawn provenance
+
+Codex `source.subagent.thread_spawn.parent_thread_id` is the authoritative spawned-child edge and is independent of `session_meta.payload.forked_from_id`, which proves copied or referenced history. The Codex provider normalizes the source to `entrypoint:"codex-subagent"` and emits the spawn parent as `subagent_provenance.parent_session_id`; a valid child may therefore have subagent provenance while `forked_from_id` remains absent. Do not synthesize fork provenance from the spawn graph or require a fork before exposing a subagent. Metadata cache version 3 invalidates rows that predate the spawn-parent field.
+
 ## Development Commands
 
 This project uses `just` (a command runner). Install with `brew install just` or `cargo install just`.

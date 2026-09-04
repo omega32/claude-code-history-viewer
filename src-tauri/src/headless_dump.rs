@@ -2669,7 +2669,6 @@ mod tests {
                 "payload": {
                     "id": "child-thread",
                     "cwd": "/redacted/project",
-                    "forked_from_id": "parent-thread",
                     "source": { "subagent": { "thread_spawn": {
                         "parent_thread_id": "parent-thread",
                         "agent_path": "/root/base_provenance",
@@ -2710,11 +2709,12 @@ mod tests {
         assert_eq!(run_list_sessions(&argv), 0);
         let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["forked_from_id"], "parent-thread");
+        assert!(rows[0].get("forked_from_id").is_none());
         assert_eq!(
             rows[0]["subagent_provenance"],
             json!({
                 "spawned_at": "2026-08-07T04:54:54.433Z",
+                "parent_session_id": "parent-thread",
                 "agent_path": "/root/base_provenance",
                 "agent_nickname": "Singer"
             })

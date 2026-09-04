@@ -64,6 +64,8 @@ export interface ClaudeProject {
 export interface SubagentProvenance {
   /** Top-level timestamp of the child's first Codex session_meta record. */
   spawned_at: string;
+  /** Immediate parent in the provider-authenticated agent spawn graph. */
+  parent_session_id?: string;
   /** Stable path assigned by the spawning agent tree. */
   agent_path: string;
   /** Human-readable Codex agent nickname, when supplied. */
@@ -99,7 +101,7 @@ export interface ClaudeSession {
   entrypoint?: string;
   /** Parent session id for a provider-reported fork (currently Codex). */
   forked_from_id?: string;
-  /** Structurally authenticated child-agent identity and fork boundary. */
+  /** Structurally authenticated child-agent identity and spawn boundary. */
   subagent_provenance?: SubagentProvenance;
 }
 

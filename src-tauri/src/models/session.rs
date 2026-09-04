@@ -82,8 +82,8 @@ pub struct ClaudeSession {
     /// Provider-authenticated provenance for a spawned sub-agent session.
     ///
     /// Codex derives this only from the rollout's first
-    /// `session_meta.payload.source.subagent.thread_spawn` object. The direct
-    /// parent remains available separately as `forked_from_id`.
+    /// `session_meta.payload.source.subagent.thread_spawn` object. Its spawn
+    /// parent is independent of the optional history-fork parent above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_provenance: Option<SubagentProvenance>,
 }
@@ -92,6 +92,11 @@ pub struct ClaudeSession {
 pub struct SubagentProvenance {
     /// Top-level timestamp of the child's first `session_meta` record.
     pub spawned_at: String,
+    /// Immediate parent in the provider-authenticated agent spawn graph.
+    ///
+    /// Optional for backward-compatible deserialization; current Codex rows populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     /// Stable path assigned by the spawning agent tree (for example `/root/research`).
     pub agent_path: String,
     /// Human-readable agent nickname, when the provider supplied a non-empty value.
