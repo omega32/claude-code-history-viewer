@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 14;
+const SNAPSHOT_CURSOR_VERSION: u32 = 15;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -189,6 +189,7 @@ struct PendingCodexUserMessage {
     message_id: String,
     source_line: usize,
     response_text: Option<String>,
+    single_text_carrier: bool,
     authored_turn_id: Option<String>,
     precedes_input_boundary: bool,
     terminal_evidence: TerminalContextEvidence,
@@ -507,6 +508,20 @@ struct CanonicalCodexUserMessage {
     turn_id: Option<String>,
     content: Option<Value>,
     response_text: Option<String>,
+    single_text_carrier: bool,
+}
+
+fn codex_single_text_carrier(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(blocks)) if blocks.len() == 1 => {
+            matches!(
+                blocks[0].get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            ) && blocks[0].get("text").is_some_and(Value::is_string)
+        }
+        _ => false,
+    }
 }
 
 struct CanonicalCodexUserProjectionContext<'a> {
@@ -514,6 +529,135 @@ struct CanonicalCodexUserProjectionContext<'a> {
     line_timestamp: &'a str,
     counter: &'a mut u64,
     fallback_turn_id: Option<&'a str>,
+    question_calls: &'a HashMap<String, Option<CodexQuestionCall>>,
+}
+
+struct CodexQuestionCall {
+    source_line: usize,
+    questions: Vec<String>,
+}
+
+/// Only a complete scalar or single text carrier can become question metadata.
+/// The raw content remains authoritative and is never replaced by this projection.
+fn codex_question_reply_body(content: Option<&Value>) -> Option<&str> {
+    let content = content?;
+    let text = match content {
+        Value::String(text) => text.as_str(),
+        Value::Array(blocks) if blocks.len() == 1 => {
+            let block = &blocks[0];
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            block.get("text")?.as_str()?
+        }
+        _ => return None,
+    };
+    text.strip_prefix("<send_user_message_question_reply>")?
+        .strip_suffix("</send_user_message_question_reply>")
+}
+
+fn record_codex_question_call(
+    calls: &mut HashMap<String, Option<CodexQuestionCall>>,
+    payload: &Value,
+    source_line: usize,
+) {
+    if !matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) {
+        return;
+    }
+    let Some(call_id) = non_empty_string(payload.get("call_id")) else {
+        return;
+    };
+    if let Some(previous) = calls.get_mut(call_id) {
+        // Even byte-identical duplicate calls leave the reference ambiguous.
+        *previous = None;
+        return;
+    }
+    let questions = (|| {
+        if payload.get("type").and_then(Value::as_str) != Some("function_call")
+            || payload.get("name").and_then(Value::as_str) != Some("request_user_input_async")
+        {
+            return None;
+        }
+        let arguments: Value = serde_json::from_str(payload.get("arguments")?.as_str()?).ok()?;
+        let questions = arguments.get("questions")?.as_array()?;
+        if questions.is_empty() {
+            return None;
+        }
+        questions
+            .iter()
+            .map(|question| {
+                let title = non_empty_string(question.get("title"))?;
+                if let Some(options) = question.get("options") {
+                    if !options.as_array()?.iter().all(Value::is_string) {
+                        return None;
+                    }
+                }
+                Some(title.to_string())
+            })
+            .collect::<Option<Vec<_>>>()
+    })();
+    calls.insert(
+        call_id.to_string(),
+        questions.map(|questions| CodexQuestionCall {
+            source_line,
+            questions,
+        }),
+    );
+}
+
+fn merge_codex_question_reply(
+    message: &mut ClaudeMessage,
+    calls: &HashMap<String, Option<CodexQuestionCall>>,
+    source_line: usize,
+) {
+    let Some(body) = codex_question_reply_body(message.content.as_ref()) else {
+        return;
+    };
+    let projection = (|| {
+        let rows: Value = serde_json::from_str(body).ok()?;
+        let rows = rows.as_array()?;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut replies = Vec::with_capacity(rows.len());
+        for row in rows {
+            let row = row.as_object()?;
+            if row.len() != 3 {
+                return None;
+            }
+            let identity: Value =
+                serde_json::from_str(row.get("questionItemId")?.as_str()?).ok()?;
+            let identity = identity.as_array()?;
+            if identity.len() != 3 || identity[0].as_str()? != "request_user_input_async" {
+                return None;
+            }
+            let call_id = identity[1].as_str()?;
+            let index = usize::try_from(identity[2].as_u64()?).ok()?;
+            let question = row.get("question")?.as_str()?;
+            let answer = row.get("answer")?.as_str()?;
+            let call = calls.get(call_id)?.as_ref()?;
+            if !seen.insert((call_id.to_string(), index))
+                || call.source_line >= source_line
+                || call.questions.get(index)? != question
+            {
+                return None;
+            }
+            replies.push(serde_json::json!({"toolCallId":call_id,"questionIndex":index,"question":question,"answer":answer}));
+        }
+        Some(serde_json::json!({"toolName":"request_user_input_async","replies":replies}))
+    })();
+    if let Some(projection) = projection {
+        let data = message
+            .data
+            .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(data) = data.as_object_mut() {
+            data.insert("questionReply".to_string(), projection);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,6 +720,11 @@ fn canonical_codex_user_message(event_payload: &Value) -> Option<CanonicalCodexU
                 turn_id: None,
                 content: legacy_user_event_content(event_payload),
                 response_text: Some(message.to_string()),
+                single_text_carrier: ["images", "local_images"].iter().all(|field| {
+                    event_payload
+                        .get(field)
+                        .map_or(true, |images| images.as_array().is_some_and(Vec::is_empty))
+                }),
             })
         }
         "item_completed" => {
@@ -589,6 +738,7 @@ fn canonical_codex_user_message(event_payload: &Value) -> Option<CanonicalCodexU
                 turn_id: non_empty_string(event_payload.get("turn_id")).map(str::to_string),
                 content: convert_codex_content_array(item.get("content"), None),
                 response_text: codex_user_response_text(item),
+                single_text_carrier: codex_single_text_carrier(item.get("content")),
             })
         }
         _ => None,
@@ -683,6 +833,16 @@ fn project_canonical_user_event(
                 .map(|candidate| candidate.message_index)
         })
         .flatten();
+    let question_reply_carrier = canonical.single_text_carrier
+        && (matched_index.is_none()
+            || tracker
+                .lanes
+                .get(&lane_key)
+                .and_then(|lane| lane.pending_user_messages.last())
+                .is_some_and(|candidate| candidate.single_text_carrier));
+    let reply_source_line = matched_index
+        .and_then(|_| tracker.lanes.get(&lane_key)?.pending_user_messages.last())
+        .map_or(source_line, |candidate| candidate.source_line);
     let lane = tracker.lanes.entry(lane_key).or_default();
     let subtype = if lane.authored_user_count > 0 && (lane.active || canonical.turn_id.is_some()) {
         STEER_SUBTYPE
@@ -700,6 +860,13 @@ fn project_canonical_user_event(
             confirmed_turn_id.as_deref(),
             canonical.client_id.as_deref(),
         );
+        if question_reply_carrier {
+            merge_codex_question_reply(
+                &mut messages[message_index],
+                context.question_calls,
+                reply_source_line,
+            );
+        }
     } else {
         *context.counter += 1;
         let mut message = build_codex_message(
@@ -720,6 +887,9 @@ fn project_canonical_user_event(
             confirmed_turn_id.as_deref(),
             canonical.client_id.as_deref(),
         );
+        if question_reply_carrier {
+            merge_codex_question_reply(&mut message, context.question_calls, reply_source_line);
+        }
         messages.push(message);
     }
     lane.pending_user_messages.clear();
@@ -2402,6 +2572,7 @@ fn parse_rollout_slice(
     let mut overlap_ambiguous_turns = HashSet::<String>::new();
     let mut inferred_provider_turn_messages = HashSet::<usize>::new();
     let mut authorship_tracker = CodexAuthorshipTracker::default();
+    let mut question_calls = HashMap::new();
     let mut pending_compacted_notification = false;
     let mut pending_fork_rollback: Option<PendingForkRollback> = None;
     let mut pending_fork_branch: Option<PendingForkBranch> = None;
@@ -2559,6 +2730,7 @@ fn parse_rollout_slice(
             }
             "response_item" => {
                 if let Some(payload) = val.get("payload") {
+                    record_codex_question_call(&mut question_calls, payload, source_line);
                     let is_user_message = payload.get("type").and_then(Value::as_str)
                         == Some("message")
                         && payload.get("role").and_then(Value::as_str) == Some("user");
@@ -2646,6 +2818,9 @@ fn parse_rollout_slice(
                                     message_id: messages[message_index].uuid.clone(),
                                     source_line,
                                     response_text: codex_user_response_text(payload),
+                                    single_text_carrier: codex_single_text_carrier(
+                                        payload.get("content"),
+                                    ),
                                     authored_turn_id: explicit_provider_turn_id,
                                     precedes_input_boundary: false,
                                     terminal_evidence: TerminalContextEvidence::AwaitingBoundary,
@@ -2672,6 +2847,15 @@ fn parse_rollout_slice(
                             .and_then(Value::as_str)
                             == Some("UserMessage");
                     if event_type == "user_message" || is_completed_user_item {
+                        if resumed
+                            && canonical_codex_user_message(payload).is_some_and(|canonical| {
+                                codex_question_reply_body(canonical.content.as_ref()).is_some()
+                            })
+                        {
+                            // The originating call may predate the checkpoint. Revalidate
+                            // the full source instead of growing cursors with call history.
+                            return Err(());
+                        }
                         project_canonical_user_event(
                             &mut messages,
                             &mut authorship_tracker,
@@ -2681,6 +2865,7 @@ fn parse_rollout_slice(
                                 line_timestamp: &line_timestamp,
                                 counter: &mut state.msg_counter,
                                 fallback_turn_id: active_turn_id.as_deref(),
+                                question_calls: &question_calls,
                             },
                             &mut diagnostics,
                             source_line,
@@ -6463,6 +6648,195 @@ mod tests {
                 }
             }),
         ]
+    }
+
+    fn async_question_call() -> Value {
+        json!({"timestamp":"2026-07-29T10:00:05Z","type":"response_item","payload":{
+            "type":"function_call","name":"request_user_input_async","call_id":"question-1",
+            "arguments":json!({"questions":[{"title":"Which receiver?"},{"title":"Which format?","options":["JSON","Text"]}]}).to_string()
+        }})
+    }
+
+    fn async_question_reply() -> String {
+        format!(
+            "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+            json!([
+                {"questionItemId":"[\"request_user_input_async\",\"question-1\",0]","question":"Which receiver?","answer":"Use mine.\nKeep this exact."},
+                {"questionItemId":"[\"request_user_input_async\",\"question-1\",1]","question":"Which format?","answer":"JSON"}
+            ])
+        )
+    }
+
+    #[test]
+    fn async_question_reply_preserves_authorship_and_raw_content() {
+        let tmp = TempDir::new().unwrap();
+        let reply = async_question_reply();
+        let mut lines = snapshot_fixture_prefix("async-question");
+        let task_started = lines.remove(4);
+        lines.insert(2, task_started);
+        lines.insert(5, async_question_call());
+        lines.insert(6, user_message_line("2026-07-29T10:00:05Z", &reply));
+        lines.insert(7, json!({"timestamp":"2026-07-29T10:00:06Z","type":"event_msg","payload":{"type":"user_message","message":reply}}));
+        let path = write_rollout_lines(tmp.path(), "async-question.jsonl", &lines);
+        let messages = parse_rollout_file(&path).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE))
+            .unwrap();
+        assert_eq!(answer.timestamp, "2026-07-29T10:00:05Z");
+        assert_eq!(answer.content.as_ref().unwrap()[0]["text"], reply);
+        assert_eq!(
+            answer.data.as_ref().unwrap()["questionReply"],
+            json!({
+                "toolName":"request_user_input_async","replies":[
+                    {"toolCallId":"question-1","questionIndex":0,"question":"Which receiver?","answer":"Use mine.\nKeep this exact."},
+                    {"toolCallId":"question-1","questionIndex":1,"question":"Which format?","answer":"JSON"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn async_question_reply_rejects_unproven_or_partial_carriers() {
+        let tmp = TempDir::new().unwrap();
+        let reply = async_question_reply();
+        for (name, text, duplicate_call, mixed_content) in [
+            (
+                "unknown-call",
+                reply.replace("question-1", "unknown"),
+                false,
+                false,
+            ),
+            (
+                "wrong-title",
+                reply.replace("Which receiver?", "Different question"),
+                false,
+                false,
+            ),
+            ("bad-index", reply.replace(",0]", ",9]"), false, false),
+            (
+                "wrong-tool",
+                reply.replace("request_user_input_async", "request_user_input"),
+                false,
+                false,
+            ),
+            (
+                "duplicate-reply",
+                reply
+                    .replace(",1]", ",0]")
+                    .replace("Which format?", "Which receiver?"),
+                false,
+                false,
+            ),
+            (
+                "quoted",
+                format!("Here is the carrier: {reply}"),
+                false,
+                false,
+            ),
+            ("trailing", format!("{reply}\nMore text"), false, false),
+            (
+                "malformed",
+                reply.replace("\"answer\":\"JSON\"", "\"answer\":42"),
+                false,
+                false,
+            ),
+            ("duplicate-call", reply.clone(), true, false),
+            ("mixed-content", reply.clone(), false, true),
+            ("dropped-content", reply.clone(), false, true),
+            ("missing-call", reply.clone(), false, false),
+            ("wrong-call-name", reply.clone(), false, false),
+            ("bad-call-input", reply.clone(), false, false),
+        ] {
+            let mut lines = snapshot_fixture_prefix(name);
+            let mut call = async_question_call();
+            if name == "wrong-call-name" {
+                call["payload"]["name"] = json!("request_user_input");
+            }
+            if name == "bad-call-input" {
+                call["payload"]["arguments"] =
+                    json!("{\"questions\":[{\"title\":\"Which receiver?\",\"options\":42}]}");
+            }
+            if name != "missing-call" {
+                lines.push(call);
+            }
+            if duplicate_call {
+                lines.push(async_question_call());
+            }
+            let mut raw = user_message_line("2026-07-29T10:01:00Z", &text);
+            if mixed_content {
+                raw["payload"]["content"].as_array_mut().unwrap().push(
+                    if name == "dropped-content" {
+                        json!({"type":"unknown_content","payload":"do not discard"})
+                    } else {
+                        json!({"type":"input_image","image_url":"https://example.test/image.png"})
+                    },
+                );
+            }
+            lines.push(raw);
+            lines.push(json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"user_message","message":text}}));
+            let path = write_rollout_lines(tmp.path(), &format!("{name}.jsonl"), &lines);
+            let messages = parse_rollout_file(&path).unwrap();
+            assert!(
+                messages.iter().all(|message| message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("questionReply"))
+                    .is_none()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn async_question_reply_snapshot_replays_prior_question_calls() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let mut lines = snapshot_fixture_prefix("async-snapshot");
+        lines.insert(5, async_question_call());
+        let path = write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-07-29T10-00-00-async-snapshot.jsonl",
+            &lines,
+        );
+        let path_text = path.to_string_lossy();
+        let cursor = match load_session_snapshot(&path_text, None).unwrap() {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("expected initial cursor"),
+        };
+        append_rollout_lines(
+            &path,
+            &[
+                json!({"timestamp":"2026-07-29T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+                json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-2","item":{"type":"UserMessage","id":"reply-item","content":[{"type":"input_text","text":async_question_reply()}]}}}),
+            ],
+        );
+        let messages = match load_session_snapshot(&path_text, Some(&cursor)).unwrap() {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "unsafe-backward-reference");
+                messages
+            }
+            _ => panic!("a delayed reply must revalidate its preceding call"),
+        };
+        assert_snapshot_matches_fresh(&messages, &path);
+        let answer = messages
+            .iter()
+            .find(|message| message.uuid == "reply-item")
+            .unwrap();
+        assert_eq!(answer.subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            answer.data.as_ref().unwrap()["questionReply"]["replies"][0]["toolCallId"],
+            "question-1"
+        );
     }
 
     fn write_snapshot_fixture(sessions_dir: &Path, session_id: &str) -> PathBuf {
