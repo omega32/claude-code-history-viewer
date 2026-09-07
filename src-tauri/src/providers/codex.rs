@@ -37,7 +37,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 15;
+const SNAPSHOT_CURSOR_VERSION: u32 = 16;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -2632,7 +2632,10 @@ fn parse_rollout_slice(
         if pending_compacted_notification
             && !matches!(line_type, "world_state" | "turn_context" | "compacted")
             && !(line_type == "event_msg"
-                && matches!(event_type, "token_count" | "context_compacted"))
+                && matches!(
+                    event_type,
+                    "thread_settings_applied" | "token_count" | "context_compacted"
+                ))
         {
             pending_compacted_notification = false;
         }
@@ -7583,6 +7586,121 @@ mod tests {
         assert!(!cached
             .iter()
             .any(|message| message.subtype.as_deref() == Some("microcompact_boundary")));
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_compaction_pairing_preserves_bookkeeping_and_activity_boundaries() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let settings = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_id": "snapshot-compaction",
+                "thread_settings": {}
+            }
+        });
+        let notification = json!({
+            "type": "event_msg",
+            "payload": { "type": "context_compacted" }
+        });
+        let cases = [
+            ("legacy", true, vec![], 0),
+            ("settings", true, vec![settings.clone()], 0),
+            ("standalone", false, vec![settings.clone()], 1),
+            (
+                "assistant-activity",
+                true,
+                vec![
+                    settings.clone(),
+                    json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "continued" }]
+                        }
+                    }),
+                ],
+                1,
+            ),
+            (
+                "unknown-event",
+                true,
+                vec![
+                    settings,
+                    json!({ "type": "event_msg", "payload": { "type": "unknown_activity" } }),
+                ],
+                1,
+            ),
+            ("second-notification", true, vec![notification.clone()], 1),
+        ];
+        for (name, authoritative, intervening, expected_notifications) in cases {
+            let path = write_snapshot_fixture(&sessions_dir, name);
+            let path_text = path.to_string_lossy();
+            let (mut cached, mut cursor) =
+                match load_session_snapshot(&path_text, None).expect("initial snapshot") {
+                    SessionSnapshotLoad::Full {
+                        messages,
+                        cursor: Some(cursor),
+                        ..
+                    } => (messages, cursor),
+                    _ => panic!("initial snapshot should carry a cursor"),
+                };
+            let mut sequence = Vec::new();
+            if authoritative {
+                sequence.push(json!({
+                    "type": "compacted",
+                    "payload": { "replacement_history": [{ "type": "message" }] }
+                }));
+            }
+            sequence.extend([
+                json!({ "type": "world_state", "payload": {} }),
+                json!({ "type": "turn_context", "payload": {} }),
+            ]);
+            sequence.extend(intervening);
+            sequence.push(json!({ "type": "event_msg", "payload": { "type": "token_count" } }));
+            sequence.push(notification.clone());
+            // Refresh at every possible split, including immediately before and
+            // after settings, and compare each resumed result with a full parse.
+            for record in sequence {
+                append_rollout_lines(&path, &[record]);
+                match load_session_snapshot(&path_text, Some(&cursor)).expect("appended delta") {
+                    SessionSnapshotLoad::Replace {
+                        replace_from,
+                        messages,
+                        cursor: next_cursor,
+                        ..
+                    } => {
+                        cached.truncate(replace_from);
+                        cached.extend(messages);
+                        cursor = next_cursor;
+                    }
+                    _ => panic!("{name}: appended records should produce a replacement"),
+                }
+                assert_snapshot_matches_fresh(&cached, &path);
+            }
+            assert_eq!(
+                cached
+                    .iter()
+                    .filter(|message| message.subtype.as_deref() == Some("compact_boundary"))
+                    .count(),
+                usize::from(authoritative),
+                "{name}: retain each authoritative boundary"
+            );
+            assert_eq!(
+                cached
+                    .iter()
+                    .filter(|message| message.subtype.as_deref() == Some("microcompact_boundary"))
+                    .count(),
+                expected_notifications,
+                "{name}: suppress only the paired notification"
+            );
+        }
     }
 
     #[test]
