@@ -128,6 +128,8 @@ struct NativeTitle {
 struct SqliteTitle {
     title: String,
     preview: String,
+    name: Option<String>,
+    history_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4013,20 +4015,36 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
     for (id, sqlite) in sqlite_titles.drain() {
         let stored_title = sqlite.title.trim();
         let preview = sqlite.preview.trim();
+        let stored_name = sqlite
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let is_paginated = sqlite.history_mode.as_deref() == Some("paginated");
+        let paginated_name = if is_paginated { stored_name } else { None };
         let indexed_name = indexed_names.remove(&id);
         // The Codex extension sends both its initial generated title and manual
         // edits through `thread/name/set`. A single index name identical to the
         // SQLite title is therefore generated-title metadata, not rename
         // provenance. A non-reset name is explicit only when it differs from the
         // SQLite baseline or the append-only name history has changed.
-        let is_renamed = indexed_name.as_ref().is_some_and(|indexed| {
-            let name = indexed.latest.trim();
-            name != preview && (name != stored_title || indexed.changed)
-        });
-        // Match Codex's LocalThreadStore precedence: a title distinct from the
-        // preview is authoritative SQLite metadata; otherwise fall back to the
+        let is_renamed = if let Some(name) = paginated_name {
+            name != preview
+                && (name != stored_title
+                    || indexed_name.as_ref().is_some_and(|indexed| indexed.changed))
+        } else {
+            indexed_name.as_ref().is_some_and(|indexed| {
+                let name = indexed.latest.trim();
+                name != preview && (name != stored_title || indexed.changed)
+            })
+        };
+        // Match Codex's LocalThreadStore precedence. Paginated threads display
+        // their explicit SQLite `name`; `title` remains derived search metadata.
+        // Legacy threads display a distinct SQLite title, then fall back to the
         // append-only compatibility index (latest entry wins).
-        let resolved = if !stored_title.is_empty() && stored_title != preview {
+        let resolved = if let Some(name) = paginated_name {
+            name.to_string()
+        } else if !stored_title.is_empty() && stored_title != preview {
             stored_title.to_string()
         } else if let Some(indexed) = indexed_name {
             indexed.latest
@@ -4072,7 +4090,25 @@ fn query_sqlite_titles(
     conn: &Connection,
     preview_column: &str,
 ) -> Option<HashMap<String, SqliteTitle>> {
-    let sql = format!("SELECT id, title, {preview_column} FROM threads");
+    let mut columns = HashSet::new();
+    let mut table_info = conn.prepare("PRAGMA table_info(threads)").ok()?;
+    let rows = table_info
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?;
+    columns.extend(rows.filter_map(std::result::Result::ok));
+    let name_column = if columns.contains("name") {
+        "name"
+    } else {
+        "NULL"
+    };
+    let history_mode_column = if columns.contains("history_mode") {
+        "history_mode"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, title, {preview_column}, {name_column}, {history_mode_column} FROM threads"
+    );
     let mut stmt = conn.prepare(&sql).ok()?;
     let rows = stmt
         .query_map([], |row| {
@@ -4080,12 +4116,24 @@ fn query_sqlite_titles(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })
         .ok()?;
     Some(
         rows.filter_map(std::result::Result::ok)
-            .map(|(id, title, preview)| (id, SqliteTitle { title, preview }))
+            .map(|(id, title, preview, name, history_mode)| {
+                (
+                    id,
+                    SqliteTitle {
+                        title,
+                        preview,
+                        name,
+                        history_mode,
+                    },
+                )
+            })
             .collect(),
     )
 }
@@ -12617,6 +12665,133 @@ mod tests {
 
         assert_eq!(sessions[0].summary.as_deref(), Some("Persisted title"));
         assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn native_title_prefers_paginated_sqlite_name_over_derived_title_and_index() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("08");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-paginated-name.jsonl",
+            "paginated-name-session",
+            project_cwd,
+            "Original first prompt",
+        );
+
+        let conn = Connection::open(codex_home.join(STATE_DB_FILENAME))
+            .expect("codex state db should be created");
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                name TEXT,
+                preview TEXT NOT NULL,
+                first_user_message TEXT NOT NULL,
+                history_mode TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("threads table should be created");
+        conn.execute(
+            "INSERT INTO threads (id, title, name, preview, first_user_message, history_mode)
+             VALUES (?1, ?2, ?3, ?2, ?2, 'paginated')",
+            rusqlite::params![
+                "paginated-name-session",
+                "Original first prompt",
+                "Current explicit name"
+            ],
+        )
+        .expect("paginated thread row should be inserted");
+        drop(conn);
+        write_session_index(
+            &codex_home,
+            &[json!({
+                "id": "paginated-name-session",
+                "thread_name": "Stale compatibility-index name"
+            })],
+        );
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some("Current explicit name")
+        );
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    fn paginated_sqlite_name_preserves_generated_and_reset_rename_markers() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let conn = Connection::open(tmp.path().join(STATE_DB_FILENAME))
+            .expect("codex state db should be created");
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                name TEXT,
+                preview TEXT NOT NULL,
+                first_user_message TEXT NOT NULL,
+                history_mode TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("threads table should be created");
+        for (id, title, name, preview) in [
+            (
+                "generated-name-session",
+                "Generated title",
+                "Generated title",
+                "Original first prompt",
+            ),
+            (
+                "reset-name-session",
+                "Generated title",
+                "Original first prompt",
+                "Original first prompt",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO threads (id, title, name, preview, first_user_message, history_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'paginated')",
+                rusqlite::params![id, title, name, preview],
+            )
+            .expect("paginated thread row should be inserted");
+        }
+        drop(conn);
+        write_session_index(
+            tmp.path(),
+            &[
+                json!({"id":"generated-name-session","thread_name":"Generated title"}),
+                json!({"id":"reset-name-session","thread_name":"Temporary manual name"}),
+                json!({"id":"reset-name-session","thread_name":"Original first prompt"}),
+            ],
+        );
+
+        let titles = load_native_title_index(tmp.path().to_str().unwrap());
+        let generated = titles
+            .get("generated-name-session")
+            .expect("generated title should be loaded");
+        assert_eq!(generated.title, "Generated title");
+        assert!(!generated.is_renamed);
+
+        let reset = titles
+            .get("reset-name-session")
+            .expect("reset title should be loaded");
+        assert_eq!(reset.title, "Original first prompt");
+        assert!(!reset.is_renamed);
     }
 
     #[test]
