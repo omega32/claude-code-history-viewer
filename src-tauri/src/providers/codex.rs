@@ -5593,6 +5593,25 @@ fn codex_single_exec_view_image_locator(source: &str) -> Option<String> {
 }
 
 fn codex_batched_view_image_locators(source: &str) -> Option<Vec<String>> {
+    codex_destructured_view_image_locators(source)
+        .or_else(|| codex_result_array_view_image_locators(source))
+}
+
+fn codex_literal_view_image_paths(calls: &str) -> Option<Vec<String>> {
+    split_top_level_commas(calls)?
+        .iter()
+        .map(|call| {
+            let call = call.trim();
+            let invocation = call.strip_prefix("tools.view_image")?.trim_start();
+            if !invocation.starts_with('(') || !invocation.ends_with(')') {
+                return None;
+            }
+            codex_view_image_path_from_call(invocation)
+        })
+        .collect()
+}
+
+fn codex_destructured_view_image_locators(source: &str) -> Option<Vec<String>> {
     const PREFIX: &str = "const [";
     const PROMISE: &str = "] = await Promise.all([";
     let source = source.trim();
@@ -5609,21 +5628,10 @@ fn codex_batched_view_image_locators(source: &str) -> Option<Vec<String>> {
 
     let array_and_tail = &bindings[promise_index + PROMISE.len()..];
     let array_end = matching_square_bracket(array_and_tail)?;
-    let calls = split_top_level_commas(&array_and_tail[..array_end])?;
-    if calls.len() != names.len() {
+    let paths = codex_literal_view_image_paths(&array_and_tail[..array_end])?;
+    if paths.len() != names.len() {
         return None;
     }
-    let paths = calls
-        .iter()
-        .map(|call| {
-            let call = call.trim();
-            let invocation = call.strip_prefix("tools.view_image")?.trim_start();
-            if !invocation.starts_with('(') || !invocation.ends_with(')') {
-                return None;
-            }
-            codex_view_image_path_from_call(invocation)
-        })
-        .collect::<Option<Vec<_>>>()?;
 
     let mut tail = array_and_tail[array_end + 1..].trim_start();
     tail = tail.strip_prefix(");")?.trim_start();
@@ -5657,6 +5665,42 @@ fn codex_batched_view_image_locators(source: &str) -> Option<Vec<String>> {
         locators.push(paths[binding_index].clone());
     }
     (seen.len() == names.len()).then_some(locators)
+}
+
+fn codex_result_array_view_image_locators(source: &str) -> Option<Vec<String>> {
+    const PREFIX: &str = "const ";
+    const PROMISE: &str = " = await Promise.all([";
+    let source = source.trim();
+    let binding_and_tail = source.strip_prefix(PREFIX)?;
+    let promise_index = binding_and_tail.find(PROMISE)?;
+    let binding = binding_and_tail[..promise_index].trim();
+    if !is_javascript_identifier(binding) {
+        return None;
+    }
+
+    let array_and_tail = &binding_and_tail[promise_index + PROMISE.len()..];
+    let array_end = matching_square_bracket(array_and_tail)?;
+    let paths = codex_literal_view_image_paths(&array_and_tail[..array_end])?;
+    if paths.len() < 2 {
+        return None;
+    }
+
+    let tail = array_and_tail[array_end + 1..]
+        .trim_start()
+        .strip_prefix(");")?
+        .trim_start();
+    let after_for = tail.strip_prefix("for")?.trim_start().strip_prefix('(')?;
+    let header_end = after_for.find(')')?;
+    let header = after_for[..header_end].trim();
+    let body = after_for[header_end + 1..].trim_start();
+    let loop_binding = header.strip_prefix("const ")?;
+    let (item, collection) = loop_binding.split_once(" of ")?;
+    let item = item.trim();
+    if !is_javascript_identifier(item) || collection.trim() != binding {
+        return None;
+    }
+    let expected_body = format!("image({item}.image_url);");
+    (body == expected_body).then_some(paths)
 }
 
 fn codex_view_image_path_from_call(call: &str) -> Option<String> {
@@ -8871,6 +8915,25 @@ mod tests {
             r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url);"#,
             r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url); image(first.image_url);"#,
             r#"const [first, second] = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); image(first.image_url); image(second.image_url); text("extra");"#,
+        ] {
+            assert!(codex_batched_view_image_locators(rejected).is_none());
+        }
+    }
+
+    #[test]
+    fn batched_view_image_locator_accepts_an_exact_result_array_emission_loop() {
+        let ordered = r#"const results = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); for (const r of results) image(r.image_url);"#;
+        assert_eq!(
+            codex_batched_view_image_locators(ordered),
+            Some(vec!["first.png".to_string(), "second.png".to_string()])
+        );
+
+        for rejected in [
+            r#"const results = await Promise.all([tools.view_image({path:firstPath}), tools.view_image({path:"second.png"})]); for (const r of results) image(r.image_url);"#,
+            r#"const results = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); for (const r of results.toReversed()) image(r.image_url);"#,
+            r#"const results = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); for (const r of results) image(other.image_url);"#,
+            r#"const results = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); for (const r of results) { image(r.image_url); }"#,
+            r#"const results = await Promise.all([tools.view_image({path:"first.png"}), tools.view_image({path:"second.png"})]); for (const r of results) image(r.image_url); text("extra");"#,
         ] {
             assert!(codex_batched_view_image_locators(rejected).is_none());
         }
