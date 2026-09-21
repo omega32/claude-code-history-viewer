@@ -58,6 +58,8 @@ export interface ClaudeSession {
   has_tool_use: boolean;
   has_errors: boolean;
   summary?: string;
+  /** Earlier effective titles retained by provider-native append-only metadata. */
+  title_history?: string[];
   relevance?: number;
   /** Originating Claude Code client (raw JSONL `entrypoint` value). */
   entrypoint?: string;

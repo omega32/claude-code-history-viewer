@@ -1,6 +1,9 @@
 //! Session loading functions
 
-use crate::models::{ClaudeMessage, ClaudeSession, MessagePage, RawLogEntry};
+use crate::models::{
+    previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeSession,
+    MessagePage, RawLogEntry,
+};
 use crate::utils::{
     extract_project_name, find_line_ranges, find_line_starts, prompt_attachment_name,
     prompt_attachments_data,
@@ -86,7 +89,9 @@ struct SessionMetadataCache {
 // `summary` and conversational preview fallbacks.
 // Bumped 16 -> 17: provider-generated interruption records no longer count as
 // authored conversation or participate in title fallbacks.
-const CACHE_VERSION: u32 = 17;
+// Bumped 17 -> 18: session listings retain the chronological title transitions
+// recoverable from append-only rename records.
+const CACHE_VERSION: u32 = 18;
 const DEFAULT_SESSION_PAGE_LIMIT: usize = 250;
 const MAX_SESSION_PAGE_LIMIT: usize = 500;
 
@@ -189,6 +194,8 @@ struct IncrementalParseState {
     entrypoint: Option<String>,
     /// Project display name (already known)
     project_name: Option<String>,
+    /// Previous title transitions followed by the current displayed title.
+    title_transitions: Vec<String>,
 }
 
 /// Minimal struct for fast line classification (avoids full parsing)
@@ -342,6 +349,7 @@ fn extract_session_metadata_internal(
         mut entrypoint,
         mut session_cwd,
         incremental_project_name,
+        mut title_transitions,
     ) = if let Some(ref state) = incremental_state {
         (
             state.start_offset,
@@ -361,11 +369,28 @@ fn extract_session_metadata_internal(
             state.entrypoint.clone(),
             None,
             state.project_name.clone(),
+            state.title_transitions.clone(),
         )
     } else {
         (
-            0u64, 0usize, 0usize, None, None, None, None, false, false, None, None, None, None,
-            None, None, None, None,
+            0u64,
+            0usize,
+            0usize,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
         )
     };
 
@@ -428,6 +453,7 @@ fn extract_session_metadata_internal(
                 // Extract rename name from system/local_command messages before skipping
                 if entry.message_type == "system" {
                     if let Some(name) = try_extract_rename(&entry) {
+                        push_title_transition(&mut title_transitions, Some(&name));
                         rename_name = Some(name);
                     }
                     continue;
@@ -438,6 +464,7 @@ fn extract_session_metadata_internal(
                     if let Some(name) =
                         try_extract_custom_title(&entry.message_type, entry.custom_title.as_deref())
                     {
+                        push_title_transition(&mut title_transitions, Some(&name));
                         rename_name = Some(name);
                     }
                     continue;
@@ -627,6 +654,7 @@ fn extract_session_metadata_internal(
                 if line.contains("Session renamed to: ") {
                     if let Ok(entry) = serde_json::from_str::<SessionMetadataEntry>(&line) {
                         if let Some(name) = try_extract_rename(&entry) {
+                            push_title_transition(&mut title_transitions, Some(&name));
                             rename_name = Some(name);
                         }
                     }
@@ -640,6 +668,7 @@ fn extract_session_metadata_internal(
                     &classifier.message_type,
                     classifier.custom_title.as_deref(),
                 ) {
+                    push_title_transition(&mut title_transitions, Some(&name));
                     rename_name = Some(name);
                 }
                 continue;
@@ -753,13 +782,23 @@ fn extract_session_metadata_internal(
         .unwrap_or_else(|| extract_project_name(&raw_project_name));
     // Manual naming takes highest priority, followed by Claude's current
     // generated title, the legacy summary title, then conversational previews.
-    let final_summary = rename_name
+    let baseline_summary = ai_title
         .clone()
-        .or(ai_title.clone())
         .or(session_summary.clone())
         .or(first_user_content.clone())
         .or(first_assistant_text.clone())
         .or(last_user_content.clone());
+    if incremental_state.is_none() {
+        let mut complete = Vec::new();
+        push_title_transition(&mut complete, baseline_summary.as_deref());
+        for title in title_transitions {
+            push_title_transition(&mut complete, Some(&title));
+        }
+        title_transitions = complete;
+    }
+    let final_summary = rename_name.clone().or(baseline_summary);
+    let title_history =
+        previous_titles_from_transitions(title_transitions, final_summary.as_deref());
 
     Some(SessionExtractionResult {
         session: ClaudeSession {
@@ -776,6 +815,7 @@ fn extract_session_metadata_internal(
             has_tool_use,
             has_errors,
             summary: final_summary,
+            title_history,
             is_renamed: rename_name.is_some(),
             provider: None,
             storage_type: None,
@@ -1582,6 +1622,11 @@ pub async fn load_project_sessions(
                             ai_title: cached.ai_title.clone(),
                             entrypoint: session.entrypoint.clone(),
                             project_name: Some(session.project_name.clone()),
+                            title_transitions: {
+                                let mut transitions = session.title_history.clone();
+                                push_title_transition(&mut transitions, session.summary.as_deref());
+                                transitions
+                            },
                         },
                     ));
                     continue;
@@ -4118,6 +4163,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].summary, Some("MyProject".to_string()));
+        assert_eq!(result[0].title_history, vec!["Hello"]);
     }
 
     #[tokio::test]
@@ -4140,6 +4186,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].summary, Some("Beta".to_string()));
+        assert_eq!(result[0].title_history, vec!["Hello", "Alpha"]);
     }
 
     #[tokio::test]
@@ -4345,6 +4392,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         // Incremental parse should pick up the rename
         assert_eq!(result[0].summary, Some("AppendedRename".to_string()));
+        assert_eq!(result[0].title_history, vec!["Message 1"]);
         // System message not counted
         assert_eq!(result[0].message_count, 5);
     }

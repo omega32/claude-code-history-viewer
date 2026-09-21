@@ -387,6 +387,7 @@ fn extract_session_info(file_path: &Path, project_name: &str) -> Option<ClaudeSe
         has_tool_use: false,
         has_errors: false,
         summary: summary.or(Some(uuid)),
+        title_history: Vec::new(),
         is_renamed: false,
         provider: Some(PROVIDER_ID.to_string()),
         storage_type: Some("json".to_string()),

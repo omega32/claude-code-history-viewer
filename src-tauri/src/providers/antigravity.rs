@@ -418,6 +418,7 @@ pub fn load_sessions(path: &str, _exclude_sidechain: bool) -> Result<Vec<ClaudeS
             has_tool_use: false,
             has_errors: false,
             summary: Some(display_label),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some("antigravity".to_string()),
             storage_type: None,

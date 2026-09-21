@@ -1,8 +1,9 @@
 use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{
-    ClaudeMessage, ClaudeProject, ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage,
-    SubagentProvenance, TokenUsage,
+    previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeProject,
+    ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage, SubagentProvenance,
+    TokenUsage,
 };
 use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
@@ -122,6 +123,7 @@ struct CodexParseOutcome {
 struct NativeTitle {
     title: String,
     is_renamed: bool,
+    title_history: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -171,6 +173,7 @@ struct SessionIndexEntry {
 struct IndexedName {
     latest: String,
     changed: bool,
+    transitions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1921,9 +1924,7 @@ fn session_from_info(
     project_cwd: &str,
     title_index: &HashMap<String, NativeTitle>,
 ) -> ClaudeSession {
-    let native_title = title_index
-        .get(&info.session_id)
-        .map(|native| (native.title.clone(), native.is_renamed));
+    let native_title = title_index.get(&info.session_id).cloned();
     ClaudeSession {
         session_id: info.file_path.clone(),
         actual_session_id: info.session_id,
@@ -1940,9 +1941,13 @@ fn session_from_info(
         has_errors: false,
         summary: native_title
             .as_ref()
-            .map(|(title, _)| title.clone())
+            .map(|native| native.title.clone())
             .or(info.summary),
-        is_renamed: native_title.is_some_and(|(_, is_renamed)| is_renamed),
+        title_history: native_title
+            .as_ref()
+            .map(|native| native.title_history.clone())
+            .unwrap_or_default(),
+        is_renamed: native_title.is_some_and(|native| native.is_renamed),
         provider: Some("codex".to_string()),
         storage_type: None,
         entrypoint: info.entrypoint,
@@ -2223,6 +2228,7 @@ pub(crate) fn load_offline_session_metadata(
             has_tool_use: info.has_tool_use,
             has_errors: false,
             summary: info.summary,
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some("codex".to_string()),
             storage_type: None,
@@ -4046,8 +4052,8 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
             name.to_string()
         } else if !stored_title.is_empty() && stored_title != preview {
             stored_title.to_string()
-        } else if let Some(indexed) = indexed_name {
-            indexed.latest
+        } else if let Some(indexed) = indexed_name.as_ref() {
+            indexed.latest.clone()
         } else if !preview.is_empty() {
             preview.to_string()
         } else if !stored_title.is_empty() {
@@ -4055,11 +4061,37 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
         } else {
             continue;
         };
+        let mut transitions = Vec::new();
+        push_title_transition(&mut transitions, Some(preview));
+        if is_paginated {
+            push_title_transition(&mut transitions, Some(stored_title));
+            if let Some(indexed) = indexed_name.as_ref() {
+                for title in &indexed.transitions {
+                    push_title_transition(&mut transitions, Some(title));
+                }
+            }
+        } else if !stored_title.is_empty() && stored_title != preview {
+            if let Some(indexed) = indexed_name.as_ref() {
+                for title in &indexed.transitions {
+                    push_title_transition(&mut transitions, Some(title));
+                }
+            }
+            push_title_transition(&mut transitions, Some(stored_title));
+        } else {
+            push_title_transition(&mut transitions, Some(stored_title));
+            if let Some(indexed) = indexed_name.as_ref() {
+                for title in &indexed.transitions {
+                    push_title_transition(&mut transitions, Some(title));
+                }
+            }
+        }
+        let title_history = previous_titles_from_transitions(transitions, Some(&resolved));
         titles.insert(
             id,
             NativeTitle {
                 title: resolved,
                 is_renamed,
+                title_history,
             },
         );
     }
@@ -4068,11 +4100,14 @@ fn load_native_title_index(base_path: &str) -> HashMap<String, NativeTitle> {
     // Without a preview there is no reliable reset comparison, so a non-empty
     // index-only name is conservatively marked as renamed.
     for (id, indexed) in indexed_names {
+        let title_history =
+            previous_titles_from_transitions(indexed.transitions, Some(&indexed.latest));
         titles.insert(
             id,
             NativeTitle {
                 title: indexed.latest,
                 is_renamed: true,
+                title_history,
             },
         );
     }
@@ -4156,6 +4191,7 @@ fn load_session_index_names(base_path: &str) -> HashMap<String, IndexedName> {
             Some(indexed) => {
                 indexed.changed |= indexed.latest != name;
                 indexed.latest = name.to_string();
+                push_title_transition(&mut indexed.transitions, Some(name));
             }
             None => {
                 names.insert(
@@ -4163,6 +4199,7 @@ fn load_session_index_names(base_path: &str) -> HashMap<String, IndexedName> {
                     IndexedName {
                         latest: name.to_string(),
                         changed: false,
+                        transitions: vec![name.to_string()],
                     },
                 );
             }
@@ -12727,6 +12764,10 @@ mod tests {
             .expect("sessions should be loaded");
 
         assert_eq!(sessions[0].summary.as_deref(), Some("Persisted title"));
+        assert_eq!(
+            sessions[0].title_history,
+            vec!["Original first prompt", "Older title"]
+        );
         assert!(sessions[0].is_renamed);
     }
 
@@ -12792,6 +12833,10 @@ mod tests {
             sessions[0].summary.as_deref(),
             Some("Current explicit name")
         );
+        assert_eq!(
+            sessions[0].title_history,
+            vec!["Original first prompt", "Stale compatibility-index name"]
+        );
         assert!(sessions[0].is_renamed);
     }
 
@@ -12848,12 +12893,21 @@ mod tests {
             .get("generated-name-session")
             .expect("generated title should be loaded");
         assert_eq!(generated.title, "Generated title");
+        assert_eq!(generated.title_history, vec!["Original first prompt"]);
         assert!(!generated.is_renamed);
 
         let reset = titles
             .get("reset-name-session")
             .expect("reset title should be loaded");
         assert_eq!(reset.title, "Original first prompt");
+        assert_eq!(
+            reset.title_history,
+            vec![
+                "Original first prompt",
+                "Generated title",
+                "Temporary manual name"
+            ]
+        );
         assert!(!reset.is_renamed);
     }
 
@@ -13033,6 +13087,10 @@ mod tests {
             .expect("changed title history should be loaded");
 
         assert_eq!(title.title, "Manual title");
+        assert_eq!(
+            title.title_history,
+            vec!["Original first prompt", "Generated title"]
+        );
         assert!(title.is_renamed);
     }
 

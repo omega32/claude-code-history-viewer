@@ -4991,6 +4991,7 @@ mod tests {
             has_tool_use: true,
             has_errors: false,
             summary: None,
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some("antigravity".to_string()),
             storage_type: None,

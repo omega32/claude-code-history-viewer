@@ -799,6 +799,7 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
         has_tool_use,
         has_errors: false,
         summary: final_summary,
+        title_history: Vec::new(),
         is_renamed: false,
         provider: Some(PROVIDER_ID.to_string()),
         storage_type: None,

@@ -141,6 +141,7 @@ pub fn load_sessions(
                 .filter(|t| !t.trim().is_empty())
                 .or(summary)
                 .or_else(|| Some(sid.clone())),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some(PROVIDER.to_string()),
             storage_type: Some("json".to_string()),

@@ -280,6 +280,7 @@ pub(crate) fn load_sessions_for(
             has_tool_use: doc.has_tool_use,
             has_errors: false,
             summary,
+            title_history: Vec::new(),
             is_renamed: doc.title.is_some(),
             provider: Some(f.provider_id.to_string()),
             storage_type: Some("json".to_string()),

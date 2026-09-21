@@ -131,6 +131,7 @@ pub fn load_sessions(
                 has_tool_use: session.has_tool_use,
                 has_errors: session.has_errors,
                 summary: Some(session.title),
+                title_history: Vec::new(),
                 is_renamed: false,
                 provider: Some(PROVIDER.to_string()),
                 storage_type: Some("indexeddb".to_string()),

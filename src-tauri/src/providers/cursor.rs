@@ -186,6 +186,7 @@ pub fn load_sessions(
                 has_tool_use: mode == "agent",
                 has_errors: false,
                 summary: Some(name.to_string()),
+                title_history: Vec::new(),
                 is_renamed: false,
                 provider: Some("cursor".to_string()),
                 storage_type: Some("sqlite".to_string()),

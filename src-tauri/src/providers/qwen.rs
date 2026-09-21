@@ -204,6 +204,7 @@ pub fn load_sessions(
             has_tool_use: meta.has_tool_use,
             has_errors: false,
             summary: meta.summary,
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some(PROVIDER.to_string()),
             storage_type: None,

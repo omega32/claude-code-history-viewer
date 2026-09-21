@@ -1624,6 +1624,7 @@ fn synthesize_teleport_session(
             // pointer to a cloud session (remote→local), not necessarily a session
             // that was "moved to the cloud". No real title survives in the stub.
             summary: Some("(teleported · cloud session)".to_string()),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: None,
             storage_type: None,
@@ -1977,6 +1978,7 @@ mod tests {
             has_tool_use: false,
             has_errors: false,
             summary: Some("Test session".to_string()),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: None,
             storage_type: None,

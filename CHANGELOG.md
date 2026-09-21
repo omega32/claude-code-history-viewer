@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] - 2026-09-21
+
+### Added
+
+- Headless session metadata now exposes optional oldest-first `title_history` for Claude, Codex live storage, and Copilot Chat in VS Code when their append-only native records retain trustworthy earlier titles; the current title is excluded and unsupported/current-only providers omit the field.
+
 ## [1.21.3] - 2026-09-18
 
 ### Fixed

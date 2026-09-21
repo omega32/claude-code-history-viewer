@@ -60,6 +60,14 @@ pub struct ClaudeSession {
     pub has_tool_use: bool,
     pub has_errors: bool,
     pub summary: Option<String>,
+    /// Earlier user-facing titles in chronological order (oldest first).
+    ///
+    /// Providers populate this only when their native storage retains title
+    /// transitions. The current title is excluded; an empty vector means that
+    /// no trustworthy previous title is available, not that the session was
+    /// never renamed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub title_history: Vec<String>,
     /// Whether this session was explicitly renamed via the /rename command
     #[serde(default)]
     pub is_renamed: bool,
@@ -86,6 +94,40 @@ pub struct ClaudeSession {
     /// parent is independent of the optional history-fork parent above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_provenance: Option<SubagentProvenance>,
+}
+
+/// Append one non-empty title state while collapsing consecutive duplicates.
+pub(crate) fn push_title_transition(transitions: &mut Vec<String>, title: Option<&str>) {
+    let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
+        return;
+    };
+    if transitions
+        .last()
+        .map_or(true, |previous| previous != title)
+    {
+        transitions.push(title.to_string());
+    }
+}
+
+/// Convert chronological title states into the public previous-title list.
+///
+/// `current` is appended when it differs from the last observed transition, so
+/// callers may combine partial native histories with an authoritative current
+/// title. Only that final current state is removed; the same text may remain
+/// earlier when the session returned to a title it used before.
+pub(crate) fn previous_titles_from_transitions(
+    mut transitions: Vec<String>,
+    current: Option<&str>,
+) -> Vec<String> {
+    push_title_transition(&mut transitions, current);
+    if current
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .is_some_and(|title| transitions.last().is_some_and(|last| last == title))
+    {
+        transitions.pop();
+    }
+    transitions
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +173,7 @@ mod tests {
             has_tool_use: true,
             has_errors: false,
             summary: Some("Test conversation".to_string()),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: None,
             storage_type: None,
@@ -142,6 +185,7 @@ mod tests {
         let serialized = serde_json::to_string(&session).unwrap();
         assert!(!serialized.contains("forked_from_id"));
         assert!(!serialized.contains("subagent_provenance"));
+        assert!(!serialized.contains("title_history"));
         let deserialized: ClaudeSession = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.project_name, "my-project");
@@ -170,5 +214,16 @@ mod tests {
         let session: ClaudeSession = serde_json::from_str(json).unwrap();
         assert_eq!(session.forked_from_id, None);
         assert_eq!(session.subagent_provenance, None);
+        assert!(session.title_history.is_empty());
+    }
+
+    #[test]
+    fn title_history_keeps_prior_transitions_when_a_title_is_reused() {
+        let history = previous_titles_from_transitions(
+            vec!["Original".into(), "First rename".into(), "Original".into()],
+            Some("Original"),
+        );
+
+        assert_eq!(history, vec!["Original", "First rename"]);
     }
 }

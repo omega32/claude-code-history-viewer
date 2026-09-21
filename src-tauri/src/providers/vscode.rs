@@ -19,7 +19,10 @@
 //! `workspace.json`'s `folder` URI (same convention Cursor uses), so
 //! sessions are grouped per real project directory.
 
-use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
+use crate::models::{
+    previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeProject,
+    ClaudeSession, TokenUsage,
+};
 use crate::providers::ProviderInfo;
 use crate::utils::{
     build_provider_message, is_symlink, ms_to_iso, prompt_attachment_name, prompt_attachments_data,
@@ -604,6 +607,7 @@ fn session_from_metadata(
         has_errors: false,
         is_renamed: info.custom_title.is_some(),
         summary: info.custom_title.or(info.summary),
+        title_history: info.title_history,
         provider: Some(PROVIDER_ID.to_string()),
         storage_type: None,
         entrypoint: Some(ENTRYPOINT.to_string()),
@@ -1668,6 +1672,9 @@ struct SessionMetadata {
     /// by VS Code's own rename UI as a `{"kind":1,"k":["customTitle"],"v":…}`
     /// patch record. Present ⇒ the session was deliberately renamed.
     custom_title: Option<String>,
+    /// Earlier effective titles recovered from the append-only patch log.
+    #[serde(default)]
+    title_history: Vec<String>,
 }
 
 // ── Persistent metadata cache ────────────────────────────────────────────────
@@ -1704,7 +1711,7 @@ struct SessionMetadataCache {
     entries: std::collections::HashMap<String, CachedSessionMetadata>,
 }
 
-const METADATA_CACHE_VERSION: u32 = 2;
+const METADATA_CACHE_VERSION: u32 = 3;
 
 /// The cache file lives alongside the sessions it describes (mirroring Claude's
 /// `.session_cache.json`); VS Code only reads `*.jsonl` here, so the dotfile is
@@ -2349,6 +2356,9 @@ fn probe_session_metadata(session_path: &Path) -> Option<SessionMetadata> {
         }
     }
 
+    let current_title = custom_title.as_deref().or(summary.as_deref());
+    let title_history = vscode_title_history(&raw, summary.as_deref(), current_title);
+
     Some(SessionMetadata {
         session_id,
         message_count,
@@ -2357,7 +2367,57 @@ fn probe_session_metadata(session_path: &Path) -> Option<SessionMetadata> {
         has_tool_use,
         summary,
         custom_title,
+        title_history,
     })
+}
+
+/// Recover effective title transitions from VS Code's append-only patch log.
+/// The first-request summary is the generated baseline; `customTitle` strings
+/// replace it and null/blank patches reset to it. Only the final current state
+/// is removed from the returned history.
+fn vscode_title_history(
+    raw: &str,
+    original_title: Option<&str>,
+    current_title: Option<&str>,
+) -> Vec<String> {
+    let mut transitions = Vec::new();
+    push_title_transition(&mut transitions, original_title);
+    for line in raw.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        match record.get("kind").and_then(Value::as_u64) {
+            Some(0) => {
+                let value = record.get("v").and_then(|value| value.get("customTitle"));
+                match value.and_then(Value::as_str) {
+                    Some(title) if !title.trim().is_empty() => {
+                        push_title_transition(&mut transitions, Some(title));
+                    }
+                    _ if value.is_some() => {
+                        push_title_transition(&mut transitions, original_title);
+                    }
+                    _ => {}
+                }
+            }
+            Some(1)
+                if record
+                    .get("k")
+                    .and_then(Value::as_array)
+                    .is_some_and(|path| {
+                        path.len() == 1 && path[0].as_str() == Some("customTitle")
+                    }) =>
+            {
+                match record.get("v").and_then(Value::as_str) {
+                    Some(title) if !title.trim().is_empty() => {
+                        push_title_transition(&mut transitions, Some(title));
+                    }
+                    _ => push_title_transition(&mut transitions, original_title),
+                }
+            }
+            _ => {}
+        }
+    }
+    previous_titles_from_transitions(transitions, current_title)
 }
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {
@@ -3460,6 +3520,7 @@ mod tests {
         .unwrap();
         let metadata = probe_session_metadata(&session_path).unwrap();
         assert_eq!(metadata.custom_title.as_deref(), Some("Final Name"));
+        assert_eq!(metadata.title_history, vec!["hello", "First Name"]);
 
         // A trailing null set (a reset) clears it; blank/whitespace also clears.
         fs::write(
@@ -3474,6 +3535,7 @@ mod tests {
         .unwrap();
         let metadata = probe_session_metadata(&session_path).unwrap();
         assert_eq!(metadata.custom_title, None);
+        assert_eq!(metadata.title_history, vec!["hello", "Named"]);
 
         // No rename records at all: None.
         fs::write(&session_path, header.to_string()).unwrap();
@@ -3522,6 +3584,7 @@ mod tests {
             has_tool_use: false,
             summary: None,
             custom_title: None,
+            title_history: Vec::new(),
         }
     }
 

@@ -203,6 +203,7 @@ pub fn load_sessions_from_base_path(
             has_tool_use: info.has_tool_use,
             has_errors: false,
             summary: info.summary,
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some(PROVIDER_ID.to_string()),
             storage_type: Some("jsonl".to_string()),

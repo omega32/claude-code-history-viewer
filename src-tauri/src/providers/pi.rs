@@ -182,6 +182,7 @@ pub(crate) fn load_sessions_of(
             has_tool_use: meta.has_tool_use,
             has_errors: meta.has_errors,
             summary: meta.summary,
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some(store.id.to_string()),
             storage_type: None,

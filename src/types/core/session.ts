@@ -84,6 +84,8 @@ export interface ClaudeSession {
   has_tool_use: boolean;
   has_errors: boolean;
   summary?: string;
+  /** Earlier effective titles retained by provider-native append-only metadata. */
+  title_history?: string[];
   /** Whether this session was explicitly renamed via the /rename command */
   is_renamed?: boolean;
   relevance?: number;

@@ -145,6 +145,7 @@ pub fn load_sessions(
             has_tool_use: session.content.contains("\n> "),
             has_errors: false,
             summary: session.first_user_message.clone(),
+            title_history: Vec::new(),
             is_renamed: false,
             provider: Some("aider".to_string()),
             storage_type: Some("markdown".to_string()),

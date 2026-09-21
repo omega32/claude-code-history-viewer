@@ -157,6 +157,7 @@ pub fn load_sessions(
                 has_tool_use: true, // Cline is heavily tool-based
                 has_errors: false,
                 summary: session_summary(&task, label),
+                title_history: Vec::new(),
                 is_renamed: false,
                 provider: Some("cline".to_string()),
                 storage_type: Some("json".to_string()),

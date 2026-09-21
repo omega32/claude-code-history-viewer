@@ -147,6 +147,7 @@ fn load_sessions_conn(conn: &Connection, project_dir: &str) -> Result<Vec<Claude
                 has_tool_use: false,
                 has_errors: false,
                 summary: title.filter(|t| !t.trim().is_empty()).or(Some(id)),
+                title_history: Vec::new(),
                 is_renamed: false,
                 provider: Some(PROVIDER.to_string()),
                 storage_type: Some("sqlite".to_string()),
