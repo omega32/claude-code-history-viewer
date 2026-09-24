@@ -38,7 +38,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 16;
+const SNAPSHOT_CURSOR_VERSION: u32 = 17;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -696,20 +696,31 @@ fn legacy_user_event_content(event_payload: &Value) -> Option<Value> {
     let message = event_payload.get("message").and_then(Value::as_str)?;
     let mut content = vec![serde_json::json!({ "type": "text", "text": message })];
 
-    for field in ["images", "local_images"] {
-        for image in event_payload
-            .get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter(|image| !image.is_empty())
-        {
-            content.push(serde_json::json!({
-                "type": "image",
-                "source": { "type": "url", "url": image }
-            }));
-        }
+    for image in event_payload
+        .get("images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|image| !image.is_empty())
+    {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": { "type": "url", "url": image }
+        }));
+    }
+    for path in event_payload
+        .get("local_images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": { "type": "path", "path": path }
+        }));
     }
 
     Some(Value::Array(content))
@@ -5920,22 +5931,34 @@ fn convert_codex_content_array(
                         "text": text
                     }))
                 }
-                "input_image" | "image" | "local_image" => {
-                    let image_url = item
+                "input_image" | "image" => {
+                    let source = if let Some(image_url) = item
                         .get("image_url")
                         .or_else(|| item.get("url"))
-                        .or_else(|| item.get("path"))
                         .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if image_url.is_empty() {
-                        return None;
-                    }
+                        .filter(|value| !value.is_empty())
+                    {
+                        serde_json::json!({ "type": "url", "url": image_url })
+                    } else {
+                        let path = item
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())?;
+                        serde_json::json!({ "type": "path", "path": path })
+                    };
                     Some(serde_json::json!({
                         "type": "image",
-                        "source": {
-                            "type": "url",
-                            "url": image_url
-                        }
+                        "source": source
+                    }))
+                }
+                "local_image" => {
+                    let path = item
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.is_empty())?;
+                    Some(serde_json::json!({
+                        "type": "image",
+                        "source": { "type": "path", "path": path }
                     }))
                 }
                 "refusal" => {
@@ -8391,12 +8414,16 @@ mod tests {
     }
 
     #[test]
-    fn convert_content_array_maps_input_image_to_image() {
+    fn convert_content_array_preserves_remote_and_local_image_locator_kinds() {
         let converted = convert_codex_content_array(
             Some(&json!([
                 {
                     "type": "input_image",
                     "image_url": "data:image/png;base64,abc"
+                },
+                {
+                    "type": "local_image",
+                    "path": "C:\\screenshots\\local.png"
                 }
             ])),
             None,
@@ -8406,7 +8433,7 @@ mod tests {
         let arr = converted
             .as_array()
             .expect("converted content should be an array");
-        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].get("type").and_then(Value::as_str), Some("image"));
         assert_eq!(
             arr[0]
@@ -8414,6 +8441,38 @@ mod tests {
                 .and_then(|v| v.get("url"))
                 .and_then(Value::as_str),
             Some("data:image/png;base64,abc")
+        );
+        assert_eq!(
+            arr[1].get("source"),
+            Some(&json!({
+                "type": "path",
+                "path": "C:\\screenshots\\local.png"
+            }))
+        );
+    }
+
+    #[test]
+    fn legacy_user_event_preserves_remote_and_local_image_locator_kinds() {
+        let content = legacy_user_event_content(&json!({
+            "message": "Inspect both images.",
+            "images": ["https://example.test/remote.png"],
+            "local_images": ["C:\\screenshots\\local.png"]
+        }))
+        .expect("legacy user content should be converted");
+
+        assert_eq!(
+            content,
+            json!([
+                { "type": "text", "text": "Inspect both images." },
+                {
+                    "type": "image",
+                    "source": { "type": "url", "url": "https://example.test/remote.png" }
+                },
+                {
+                    "type": "image",
+                    "source": { "type": "path", "path": "C:\\screenshots\\local.png" }
+                }
+            ])
         );
     }
 
@@ -9816,7 +9875,90 @@ mod tests {
                 },
                 {
                     "type": "image",
-                    "source": { "type": "url", "url": "C:\\screenshots\\local.png" }
+                    "source": { "type": "path", "path": "C:\\screenshots\\local.png" }
+                }
+            ]))
+        );
+    }
+
+    #[test]
+    fn paginated_user_image_wrapper_mismatch_keeps_local_paths() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp
+            .path()
+            .join("paginated-user-image-wrapper-mismatch.jsonl");
+        let lines = [
+            json!({
+                "timestamp": "2026-09-22T12:28:50Z",
+                "type": "session_meta",
+                "payload": { "id": "paginated-user-image-wrapper-mismatch" }
+            }),
+            json!({
+                "timestamp": "2026-09-22T12:28:51Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Compare these images." },
+                        { "type": "input_text", "text": "<image path=\"C:\\Temp\\first.png\">" },
+                        { "type": "input_image", "image_url": "data:image/png;base64,first" },
+                        { "type": "input_text", "text": "</image>" },
+                        { "type": "input_text", "text": "<image path=\"C:\\Temp\\second.png\">" },
+                        { "type": "input_image", "image_url": "data:image/png;base64,second" },
+                        { "type": "input_text", "text": "</image>" }
+                    ],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn-131"
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-09-22T12:28:52Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "turn_id": "turn-131",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "canonical-user-131",
+                        "content": [
+                            { "type": "text", "text": "Compare these images." },
+                            { "type": "local_image", "path": "C:\\Temp\\first.png" },
+                            { "type": "local_image", "path": "C:\\Temp\\second.png" }
+                        ]
+                    }
+                }
+            }),
+        ];
+        write_terminal_context_fixture(&rollout_path, &lines, false);
+
+        let users = parse_rollout_file(&rollout_path)
+            .expect("rollout should parse")
+            .into_iter()
+            .filter(|message| message.message_type == "user")
+            .collect::<Vec<_>>();
+
+        assert_eq!(users.len(), 2);
+        assert!(users
+            .iter()
+            .any(|message| message.subtype.as_deref() == Some(INJECTED_CONTEXT_SUBTYPE)));
+        let authored = users
+            .iter()
+            .find(|message| message.subtype.as_deref() == Some(AUTHORED_USER_SUBTYPE))
+            .expect("canonical user event should remain the authored message");
+        assert_eq!(authored.uuid, "canonical-user-131");
+        assert_eq!(
+            authored.content,
+            Some(json!([
+                { "type": "text", "text": "Compare these images." },
+                {
+                    "type": "image",
+                    "source": { "type": "path", "path": "C:\\Temp\\first.png" }
+                },
+                {
+                    "type": "image",
+                    "source": { "type": "path", "path": "C:\\Temp\\second.png" }
                 }
             ]))
         );
