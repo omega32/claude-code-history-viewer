@@ -659,6 +659,25 @@ pub(crate) fn load_session_metadata_by_path(
     Ok(Some((session_from_info(info, &project_path), project_path)))
 }
 
+/// Load the exact CLI/Desktop carrier whose directory is the canonical UUID.
+/// The embedded id must agree because CLI carriers all share the filename
+/// `events.jsonl`; unlike VS Code, the filename itself cannot win selection.
+pub(crate) fn load_session_metadata_by_id(
+    id: &str,
+) -> Result<Option<(ClaudeSession, String)>, String> {
+    if !super::copilot::is_canonical_session_id(id) {
+        return Err("Copilot session id must be a canonical UUID".to_string());
+    }
+    let Some(base) = get_base_path() else {
+        return Ok(None);
+    };
+    let path = get_session_root_from_base(&base)
+        .join(id)
+        .join("events.jsonl");
+    Ok(load_session_metadata_by_path(&path.to_string_lossy())?
+        .filter(|(session, _)| session.actual_session_id == id))
+}
+
 /// Stream messages out of `events.jsonl`.
 #[allow(unsafe_code)] // Required for mmap performance optimization
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
@@ -1666,6 +1685,84 @@ mod tests {
                 serde_json::to_value(listed).unwrap()
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_metadata_by_id_loads_only_the_matching_cli_carrier() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let target_id = "12121212-1212-1212-1212-121212121212";
+        let target_path = write_session(
+            tmp.path(),
+            target_id,
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": target_id,
+                        "context": {"cwd": "/repo/target"}
+                    },
+                    "timestamp": "2026-01-12T00:00:00.000Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "target prompt"},
+                    "timestamp": "2026-01-12T00:00:01.000Z"
+                }),
+            ],
+        );
+        write_session(
+            tmp.path(),
+            "34343434-3434-3434-3434-343434343434",
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": "34343434-3434-3434-3434-343434343434",
+                        "context": {"cwd": "/repo/sibling"}
+                    },
+                    "timestamp": "2026-01-12T00:00:00.000Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "sibling prompt"},
+                    "timestamp": "2026-01-12T00:00:01.000Z"
+                }),
+            ],
+        );
+
+        let targeted = load_session_metadata_by_id(target_id)
+            .expect("an exact canonical id should be accepted")
+            .expect("the target carrier should load");
+        assert_eq!(targeted.0.actual_session_id, target_id);
+        assert_eq!(targeted.0.file_path, target_path.to_string_lossy());
+        assert_eq!(targeted.1, "/repo/target");
+
+        let mismatched_directory_id = "56565656-5656-5656-5656-565656565656";
+        write_session(
+            tmp.path(),
+            mismatched_directory_id,
+            &[
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": "78787878-7878-7878-7878-787878787878",
+                        "context": {"cwd": "/repo/mismatch"}
+                    },
+                    "timestamp": "2026-01-12T00:00:00.000Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "mismatched prompt"},
+                    "timestamp": "2026-01-12T00:00:01.000Z"
+                }),
+            ],
+        );
+        assert!(load_session_metadata_by_id(mismatched_directory_id)
+            .unwrap()
+            .is_none());
+        assert!(load_session_metadata_by_id("../outside").is_err());
     }
 
     #[test]

@@ -740,6 +740,108 @@ pub(crate) fn load_session_metadata_by_path(
     load_session_metadata_by_path_in(raw, &workspace_roots, &labeled_roots)
 }
 
+pub(crate) fn load_session_metadata_by_id(
+    id: &str,
+) -> Result<Vec<(ClaudeSession, String)>, String> {
+    let user_roots = get_user_data_roots();
+    let workspace_roots = user_roots
+        .iter()
+        .map(|root| root.path.join("workspaceStorage"))
+        .collect::<Vec<_>>();
+    let labeled_roots = user_roots
+        .iter()
+        .map(|root| (root.path.clone(), root.label))
+        .collect::<Vec<_>>();
+    load_session_metadata_by_id_in(id, &workspace_roots, &labeled_roots)
+}
+
+fn load_session_metadata_by_id_in(
+    id: &str,
+    workspace_storage_roots: &[PathBuf],
+    user_data_roots: &[(PathBuf, &str)],
+) -> Result<Vec<(ClaudeSession, String)>, String> {
+    if !super::copilot::is_canonical_session_id(id) {
+        return Err("Copilot session id must be a canonical UUID".to_string());
+    }
+    let filename = format!("{id}.jsonl");
+    let mut loaded = Vec::new();
+
+    for (user_data_root, _) in user_data_roots {
+        let listing_user_data_root = match user_data_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Failed to resolve VS Code user-data root: {error}"));
+            }
+        };
+
+        let configured_workspace_root = user_data_root.join("workspaceStorage");
+        if workspace_storage_roots
+            .iter()
+            .any(|allowed| allowed.as_os_str() == configured_workspace_root.as_os_str())
+        {
+            let workspace_root = listing_user_data_root.join("workspaceStorage");
+            if workspace_root.is_dir() {
+                let workspaces = fs::read_dir(&workspace_root).map_err(|error| {
+                    format!("Failed to read VS Code workspace storage: {error}")
+                })?;
+                for entry in workspaces.flatten() {
+                    let workspace = entry.path();
+                    let metadata = match fs::symlink_metadata(&workspace) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(format!("Failed to inspect VS Code workspace: {error}"));
+                        }
+                    };
+                    if !metadata.file_type().is_dir() || is_symlink_or_reparse(&metadata) {
+                        continue;
+                    }
+                    let candidate = workspace.join("chatSessions").join(&filename);
+                    match fs::symlink_metadata(&candidate) {
+                        Ok(_) => {
+                            if let Some(row) = load_session_metadata_by_path_in(
+                                &candidate.to_string_lossy(),
+                                workspace_storage_roots,
+                                user_data_roots,
+                            )? {
+                                loaded.push(row);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "Failed to inspect VS Code session candidate: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let empty_candidate = empty_window_chat_dir(&listing_user_data_root).join(&filename);
+        match fs::symlink_metadata(&empty_candidate) {
+            Ok(_) => {
+                if let Some(row) = load_session_metadata_by_path_in(
+                    &empty_candidate.to_string_lossy(),
+                    workspace_storage_roots,
+                    user_data_roots,
+                )? {
+                    loaded.push(row);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect VS Code empty-window session candidate: {error}"
+                ));
+            }
+        }
+    }
+
+    Ok(loaded)
+}
+
 fn load_session_metadata_by_path_in(
     raw: &str,
     workspace_storage_roots: &[PathBuf],
@@ -3921,6 +4023,72 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn targeted_metadata_by_id_checks_exact_workspace_and_empty_window_candidates() {
+        let user_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = user_data.path().join("workspaceStorage");
+        let workspace = workspace_root.join("hash-targeted-id");
+        let chat_dir = workspace.join("chatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::write(
+            workspace.join("workspace.json"),
+            r#"{"folder":"file:///Users/me/targeted-id-repo"}"#,
+        )
+        .unwrap();
+        let workspace_id = "13131313-1313-1313-1313-131313131313";
+        fs::write(
+            chat_dir.join(format!("{workspace_id}.jsonl")),
+            json!({"kind": 0, "v": {
+                "sessionId": workspace_id,
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "workspace prompt"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let sibling = workspace_root.join("hash-sibling-id");
+        fs::create_dir_all(sibling.join("chatSessions")).unwrap();
+        fs::write(
+            sibling.join("workspace.json"),
+            r#"{"folder":"file:///Users/me/sibling-id-repo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            sibling.join("chatSessions").join("unrelated.jsonl"),
+            "not json",
+        )
+        .unwrap();
+
+        let empty_id = "24242424-2424-2424-2424-242424242424";
+        let empty_dir = empty_window_chat_dir(user_data.path());
+        fs::create_dir_all(&empty_dir).unwrap();
+        fs::write(
+            empty_dir.join(format!("{empty_id}.jsonl")),
+            json!({"kind": 0, "v": {
+                "sessionId": empty_id,
+                "creationDate": 1779490058917u64,
+                "requests": [{"message": {"text": "empty prompt"}, "response": []}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let roots = vec![workspace_root];
+        let user_roots = vec![(user_data.path().to_path_buf(), "VS Code")];
+        let workspace_matches =
+            load_session_metadata_by_id_in(workspace_id, &roots, &user_roots).unwrap();
+        assert_eq!(workspace_matches.len(), 1);
+        assert_eq!(workspace_matches[0].0.actual_session_id, workspace_id);
+        assert_eq!(workspace_matches[0].1, "/Users/me/targeted-id-repo");
+
+        let empty_matches = load_session_metadata_by_id_in(empty_id, &roots, &user_roots).unwrap();
+        assert_eq!(empty_matches.len(), 1);
+        assert_eq!(empty_matches[0].0.actual_session_id, empty_id);
+        assert_eq!(empty_matches[0].1, "vscode-empty-window://code");
+        assert!(load_session_metadata_by_id_in("../outside", &roots, &user_roots).is_err());
     }
 
     #[test]

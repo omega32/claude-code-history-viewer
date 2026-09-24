@@ -334,6 +334,38 @@ pub(crate) struct CopilotSessionListing {
     pub(crate) project_path: String,
 }
 
+pub(crate) fn is_canonical_session_id(raw: &str) -> bool {
+    uuid::Uuid::parse_str(raw).is_ok_and(|parsed| parsed.hyphenated().to_string().as_str() == raw)
+}
+
+/// Resolve one canonical Copilot session id through the storage layouts that
+/// encode it in their carrier path. Each concrete provider probes only exact
+/// candidates; callers retain the wide listing fallback for legacy ids and
+/// unexpected layouts.
+pub(crate) fn load_session_metadata_by_id(id: &str) -> Result<Vec<CopilotSessionListing>, String> {
+    if !is_canonical_session_id(id) {
+        return Err("Copilot session id must be a canonical UUID".to_string());
+    }
+
+    let mut loaded = Vec::new();
+    if let Ok(Some((session, project_path))) = copilot_cli::load_session_metadata_by_id(id) {
+        loaded.push(CopilotSessionListing {
+            session,
+            project_path: group_key(&project_path),
+        });
+    }
+    if let Ok(rows) = vscode::load_session_metadata_by_id(id) {
+        loaded.extend(
+            rows.into_iter()
+                .map(|(session, project_path)| CopilotSessionListing {
+                    session,
+                    project_path: group_key(&project_path),
+                }),
+        );
+    }
+    Ok(loaded)
+}
+
 /// Load one exact live Copilot carrier without reading sibling carrier contents.
 /// Concrete providers may enumerate parent directory names to prove spelling.
 pub(crate) fn load_session_metadata_by_path(
@@ -570,6 +602,18 @@ pub fn search_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_session_ids_are_safe_exact_path_components() {
+        assert!(is_canonical_session_id(
+            "12121212-1212-1212-1212-121212121212"
+        ));
+        assert!(!is_canonical_session_id(
+            "12121212-1212-1212-1212-12121212121A"
+        ));
+        assert!(!is_canonical_session_id("12121212"));
+        assert!(!is_canonical_session_id("../outside"));
+    }
 
     fn project(actual_path: &str, path: &str, sessions: usize, messages: usize) -> ClaudeProject {
         ClaudeProject {

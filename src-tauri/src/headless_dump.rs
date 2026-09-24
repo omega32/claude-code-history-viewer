@@ -1881,6 +1881,25 @@ async fn session_metadata(
             })
         });
     }
+    if provider == "copilot" && copilot::is_canonical_session_id(selector) {
+        let classifier = CopilotClassifier::new(provider);
+        let targeted = copilot::load_session_metadata_by_id(selector)?
+            .into_iter()
+            .map(|row| {
+                wrap_session_listing(
+                    provider,
+                    row.session,
+                    Some(row.project_path),
+                    &HashSet::new(),
+                    &classifier,
+                    &HashMap::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !targeted.is_empty() {
+            return select_session_metadata(targeted, provider, selector);
+        }
+    }
     select_session_metadata(list_sessions(provider, None).await?, provider, selector)
 }
 
@@ -2977,6 +2996,35 @@ mod tests {
             "client_name: github/autopilot\nname: Desktop target\nuser_named: true\n",
         )
         .unwrap();
+        let fallback_id = "eeeeeeee-9999-9999-9999-999999999999";
+        let legacy_dir = copilot_home
+            .join("session-state")
+            .join("dddddddd-9999-9999-9999-999999999999");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("events.jsonl"),
+            [
+                json!({
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": fallback_id,
+                        "context": {"cwd": "/redacted/copilot-legacy-layout"}
+                    },
+                    "timestamp": "2026-08-07T00:03:00Z"
+                }),
+                json!({
+                    "type": "user.message",
+                    "data": {"content": "legacy layout prompt"},
+                    "timestamp": "2026-08-07T00:03:01Z"
+                }),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
 
         let list_output = temp.path().join("copilot-sessions.json");
         assert_eq!(
@@ -3007,20 +3055,42 @@ mod tests {
                 .find(|row| row["actual_session_id"] == id)
                 .expect("the fixture should be present in unified listing");
             assert_eq!(listed_row["entrypoint"], entrypoint);
-            let metadata_args = args(&[
+            for selector in [path.to_str().unwrap(), id] {
+                let metadata_args = args(&[
+                    "viewer",
+                    "--session-metadata",
+                    selector,
+                    "--provider",
+                    "copilot",
+                    "--output",
+                    metadata_output.to_str().unwrap(),
+                ]);
+                assert_eq!(run_session_metadata(&metadata_args), 0);
+                let targeted: Value =
+                    serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+                assert_eq!(&targeted, listed_row);
+            }
+        }
+
+        let fallback_row = listed
+            .iter()
+            .find(|row| row["actual_session_id"] == fallback_id)
+            .expect("the legacy-layout fixture should be present in unified listing");
+        assert_eq!(
+            run_session_metadata(&args(&[
                 "viewer",
                 "--session-metadata",
-                path.to_str().unwrap(),
+                fallback_id,
                 "--provider",
                 "copilot",
                 "--output",
                 metadata_output.to_str().unwrap(),
-            ]);
-            assert_eq!(run_session_metadata(&metadata_args), 0);
-            let targeted: Value =
-                serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
-            assert_eq!(&targeted, listed_row);
-        }
+            ])),
+            0
+        );
+        let fallback: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+        assert_eq!(&fallback, fallback_row);
 
         std::fs::remove_file(&carrier).unwrap();
         let metadata_args = args(&[
@@ -3059,8 +3129,8 @@ mod tests {
             r#"{"folder":"file:///redacted/vscode-targeted"}"#,
         )
         .unwrap();
-        let workspace_id = "vscode-workspace-target";
-        let empty_id = "vscode-empty-target";
+        let workspace_id = "bbbbbbbb-9999-9999-9999-999999999999";
+        let empty_id = "cccccccc-9999-9999-9999-999999999999";
         for (path, id, prompt) in [
             (
                 workspace_chats.join(format!("{workspace_id}.jsonl")),
@@ -3133,21 +3203,23 @@ mod tests {
             assert_eq!(listed_row["is_archived"], true);
             assert_eq!(listed_row["is_pinned"], true);
             let path = listed_row["file_path"].as_str().unwrap();
-            assert_eq!(
-                run_session_metadata(&args(&[
-                    "viewer",
-                    "--session-metadata",
-                    path,
-                    "--provider",
-                    "copilot",
-                    "--output",
-                    metadata_output.to_str().unwrap(),
-                ])),
-                0
-            );
-            let targeted: Value =
-                serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
-            assert_eq!(&targeted, listed_row);
+            for selector in [path, id] {
+                assert_eq!(
+                    run_session_metadata(&args(&[
+                        "viewer",
+                        "--session-metadata",
+                        selector,
+                        "--provider",
+                        "copilot",
+                        "--output",
+                        metadata_output.to_str().unwrap(),
+                    ])),
+                    0
+                );
+                let targeted: Value =
+                    serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+                assert_eq!(&targeted, listed_row);
+            }
         }
     }
 
