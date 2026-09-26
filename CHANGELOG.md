@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] - 2026-09-25
+
+### Added
+
+- Codex tool-result image artifacts now include stable MCP server/tool producer metadata when an exact direct call or a unique same-turn byte match proves it; conflicts and ambiguous matches remain unattributed.
+
 ## [1.22.2] - 2026-09-24
 
 ### Changed

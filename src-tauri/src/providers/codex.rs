@@ -38,7 +38,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 17;
+const SNAPSHOT_CURSOR_VERSION: u32 = 18;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -2592,6 +2592,7 @@ fn parse_rollout_slice(
     let mut inferred_provider_turn_messages = HashSet::<usize>::new();
     let mut authorship_tracker = CodexAuthorshipTracker::default();
     let mut question_calls = HashMap::new();
+    let mut tool_image_producers = CodexToolImageProducerTracker::default();
     let mut pending_compacted_notification = false;
     let mut pending_fork_rollback: Option<PendingForkRollback> = None;
     let mut pending_fork_branch: Option<PendingForkBranch> = None;
@@ -2776,12 +2777,19 @@ fn parse_rollout_slice(
                             });
                         let provider_turn_id_was_inferred =
                             explicit_provider_turn_id.is_none() && exact_provider_turn_id.is_some();
+                        if let Some(provider_turn_id) = exact_provider_turn_id {
+                            tool_image_producers.record_function_call(payload, provider_turn_id);
+                        }
                         merge_codex_message_provenance(&mut msg, exact_provider_turn_id, None);
                         if msg.message_type == "assistant" {
                             msg.inference = (!state.current_inference.is_empty())
                                 .then(|| state.current_inference.clone());
                         }
-                        if try_merge_tool_result_into_previous(&mut messages, &msg) {
+                        if try_merge_tool_result_into_previous_with_producers(
+                            &mut messages,
+                            &msg,
+                            Some(&tool_image_producers),
+                        ) {
                             continue;
                         }
                         if resumed && extract_tool_result_block(&msg).is_some() {
@@ -2854,6 +2862,7 @@ fn parse_rollout_slice(
             }
             "event_msg" => {
                 if let Some(payload) = val.get("payload") {
+                    tool_image_producers.record_completed_mcp_item(payload);
                     if event_type == "context_compacted" && pending_compacted_notification {
                         pending_compacted_notification = false;
                         continue;
@@ -5376,9 +5385,207 @@ fn normalize_tool_output(output: Value) -> Value {
     Value::String(raw)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexToolImageProducer {
+    server: String,
+    tool: String,
+}
+
+impl CodexToolImageProducer {
+    fn value(&self) -> Value {
+        serde_json::json!({
+            "kind": "mcp",
+            "server": self.server,
+            "tool": self.tool
+        })
+    }
+}
+
+#[derive(Default)]
+struct CodexToolImageProducerTracker {
+    direct_calls: HashMap<String, Option<CodexToolImageProducer>>,
+    completed_calls: HashMap<String, Option<CodexToolImageProducer>>,
+    images: HashMap<String, Option<CodexToolImageProducer>>,
+}
+
+impl CodexToolImageProducerTracker {
+    fn record_function_call(&mut self, payload: &Value, provider_turn_id: &str) {
+        if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+        let Some(namespace) = non_empty_string(payload.get("namespace")) else {
+            return;
+        };
+        let Some(server) = namespace
+            .strip_prefix("mcp__")
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let Some(tool) = non_empty_string(payload.get("name")) else {
+            return;
+        };
+        let Some(call_id) = non_empty_string(payload.get("call_id")) else {
+            return;
+        };
+        merge_codex_tool_image_producer(
+            &mut self.direct_calls,
+            codex_tool_image_call_key(provider_turn_id, call_id),
+            CodexToolImageProducer {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            },
+        );
+    }
+
+    fn record_completed_mcp_item(&mut self, payload: &Value) {
+        if payload.get("type").and_then(Value::as_str) != Some("item_completed") {
+            return;
+        }
+        let Some(provider_turn_id) = non_empty_string(payload.get("turn_id")) else {
+            return;
+        };
+        let Some(item) = payload.get("item") else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("McpToolCall")
+            || item.get("status").and_then(Value::as_str) != Some("completed")
+        {
+            return;
+        }
+        let Some(call_id) = non_empty_string(item.get("id")) else {
+            return;
+        };
+        let Some(server) = non_empty_string(item.get("server")) else {
+            return;
+        };
+        let Some(tool) = non_empty_string(item.get("tool")) else {
+            return;
+        };
+        let producer = CodexToolImageProducer {
+            server: server.to_string(),
+            tool: tool.to_string(),
+        };
+        merge_codex_tool_image_producer(
+            &mut self.completed_calls,
+            codex_tool_image_call_key(provider_turn_id, call_id),
+            producer.clone(),
+        );
+        let Some(content) = item
+            .get("result")
+            .and_then(|result| result.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in content {
+            let Some((media_type, bytes)) = decode_mcp_image_content(block) else {
+                continue;
+            };
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            merge_codex_tool_image_producer(
+                &mut self.images,
+                codex_tool_image_identity_key(provider_turn_id, media_type, bytes.len(), &sha256),
+                producer.clone(),
+            );
+        }
+    }
+
+    fn producer_for(
+        &self,
+        provider_turn_id: &str,
+        tool_call_id: &str,
+        media_type: &str,
+        byte_length: usize,
+        sha256: &str,
+    ) -> Option<&CodexToolImageProducer> {
+        let call_key = codex_tool_image_call_key(provider_turn_id, tool_call_id);
+        let exact = [
+            self.direct_calls.get(&call_key),
+            self.completed_calls.get(&call_key),
+        ];
+        if exact.iter().any(|entry| matches!(entry, Some(None))) {
+            return None;
+        }
+        let mut exact_producer = None;
+        for entry in exact.into_iter().flatten().flatten() {
+            if exact_producer.is_some_and(|existing| existing != entry) {
+                return None;
+            }
+            exact_producer = Some(entry);
+        }
+        if exact_producer.is_some() {
+            return exact_producer;
+        }
+        self.images
+            .get(&codex_tool_image_identity_key(
+                provider_turn_id,
+                media_type,
+                byte_length,
+                sha256,
+            ))
+            .and_then(Option::as_ref)
+    }
+}
+
+fn merge_codex_tool_image_producer(
+    target: &mut HashMap<String, Option<CodexToolImageProducer>>,
+    key: String,
+    producer: CodexToolImageProducer,
+) {
+    if let Some(existing) = target.get_mut(&key) {
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing != &producer)
+        {
+            *existing = None;
+        }
+        return;
+    }
+    target.insert(key, Some(producer));
+}
+
+fn codex_tool_image_call_key(provider_turn_id: &str, call_id: &str) -> String {
+    format!("{provider_turn_id}\0{call_id}")
+}
+
+fn codex_tool_image_identity_key(
+    provider_turn_id: &str,
+    media_type: &str,
+    byte_length: usize,
+    sha256: &str,
+) -> String {
+    format!("{provider_turn_id}\0{media_type}\0{byte_length}\0{sha256}")
+}
+
+fn decode_mcp_image_content(block: &Value) -> Option<(&str, Vec<u8>)> {
+    if block.get("type").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let declared_media_type = non_empty_string(block.get("mimeType"))
+        .or_else(|| non_empty_string(block.get("media_type")))?
+        .to_ascii_lowercase();
+    let bytes = BASE64_STANDARD
+        .decode(non_empty_string(block.get("data"))?)
+        .ok()?;
+    let media_type = detected_image_media_type(&bytes)?;
+    let declared_matches = declared_media_type == media_type
+        || (declared_media_type == "image/jpg" && media_type == "image/jpeg");
+    declared_matches.then_some((media_type, bytes))
+}
+
+#[cfg(test)]
 fn try_merge_tool_result_into_previous(
     messages: &mut [ClaudeMessage],
     msg: &ClaudeMessage,
+) -> bool {
+    try_merge_tool_result_into_previous_with_producers(messages, msg, None)
+}
+
+fn try_merge_tool_result_into_previous_with_producers(
+    messages: &mut [ClaudeMessage],
+    msg: &ClaudeMessage,
+    producer_tracker: Option<&CodexToolImageProducerTracker>,
 ) -> bool {
     if msg.message_type != "user" {
         return false;
@@ -5407,6 +5614,7 @@ fn try_merge_tool_result_into_previous(
                 &tool_use_id,
                 &tool_use,
                 &tool_result_block,
+                producer_tracker,
             );
             append_codex_image_artifacts(prev, image_artifacts);
             append_content_block(prev, tool_result_block);
@@ -5443,6 +5651,7 @@ fn codex_tool_result_image_artifacts(
     tool_use_id: &str,
     tool_use: &Value,
     tool_result: &Value,
+    producer_tracker: Option<&CodexToolImageProducerTracker>,
 ) -> Vec<Value> {
     let Some(provider_turn_id) = message
         .data
@@ -5500,6 +5709,19 @@ fn codex_tool_result_image_artifacts(
                 "byteLength": bytes.len(),
                 "sha256": sha256
             });
+            if let Some(producer) = producer_tracker.and_then(|tracker| {
+                tracker.producer_for(
+                    provider_turn_id,
+                    tool_use_id,
+                    media_type,
+                    bytes.len(),
+                    &sha256,
+                )
+            }) {
+                artifact
+                    .as_object_mut()?
+                    .insert("producer".to_string(), producer.value());
+            }
             if let Some(locator) = correlations.get(image_index).and_then(Option::as_ref) {
                 artifact.as_object_mut()?.insert(
                     "correlation".to_string(),
@@ -9386,6 +9608,142 @@ mod tests {
                         })
                     })
         }));
+    }
+
+    #[test]
+    fn rollout_indexes_direct_mcp_image_producer() {
+        let temp = TempDir::new().expect("temp directory should be created");
+        let path = write_rollout_lines(
+            temp.path(),
+            "rollout-2026-09-25T12-00-00-00000000-0000-0000-0000-000000000034.jsonl",
+            &[
+                json!({
+                    "timestamp": "2026-09-25T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "00000000-0000-0000-0000-000000000034" }
+                }),
+                json!({
+                    "timestamp": "2026-09-25T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-34" }
+                }),
+                json!({
+                    "timestamp": "2026-09-25T12:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "js",
+                        "namespace": "mcp__cua_repl",
+                        "call_id": "call-direct",
+                        "arguments": "{\"code\":\"await tab.getScreenshot()\"}"
+                    }
+                }),
+                json!({
+                    "timestamp": "2026-09-25T12:00:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-direct",
+                        "output": [{ "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=" }]
+                    }
+                }),
+            ],
+        );
+
+        let messages = parse_rollout_file(&path).expect("rollout should parse");
+        let artifact = messages
+            .iter()
+            .find_map(|message| message.data.as_ref()?.get("imageArtifacts")?.get(0))
+            .expect("tool image should be indexed");
+        assert_eq!(artifact["producer"]["kind"], "mcp");
+        assert_eq!(artifact["producer"]["server"], "cua_repl");
+        assert_eq!(artifact["producer"]["tool"], "js");
+    }
+
+    #[test]
+    fn rollout_correlates_nested_mcp_image_producer_and_fails_closed_on_ambiguity() {
+        let fixture = |name: &str, producers: &[(&str, &str, &str)]| {
+            let temp = TempDir::new().expect("temp directory should be created");
+            let mut lines = vec![
+                json!({
+                    "timestamp": "2026-09-25T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "00000000-0000-0000-0000-000000000035" }
+                }),
+                json!({
+                    "timestamp": "2026-09-25T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "turn-35" }
+                }),
+                json!({
+                    "timestamp": "2026-09-25T12:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-envelope",
+                        "input": "await tools.mcp__chrome_devtools__take_screenshot({});"
+                    }
+                }),
+            ];
+            for (index, (id, server, tool)) in producers.iter().enumerate() {
+                lines.push(json!({
+                    "timestamp": format!("2026-09-25T12:00:0{}Z", index + 3),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "turn_id": "turn-35",
+                        "item": {
+                            "type": "McpToolCall",
+                            "id": id,
+                            "server": server,
+                            "tool": tool,
+                            "status": "completed",
+                            "result": { "content": [{ "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo=" }] }
+                        }
+                    }
+                }));
+            }
+            lines.push(json!({
+                "timestamp": "2026-09-25T12:00:09Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-envelope",
+                    "output": [{ "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=" }]
+                }
+            }));
+            let path = write_rollout_lines(temp.path(), name, &lines);
+            let messages = parse_rollout_file(&path).expect("rollout should parse");
+            messages
+                .iter()
+                .find_map(|message| {
+                    message
+                        .data
+                        .as_ref()?
+                        .get("imageArtifacts")?
+                        .get(0)
+                        .cloned()
+                })
+                .expect("tool image should be indexed")
+        };
+
+        let artifact = fixture(
+            "rollout-2026-09-25T12-00-00-00000000-0000-0000-0000-000000000035.jsonl",
+            &[("inner-screenshot", "chrome-devtools", "take_screenshot")],
+        );
+        assert_eq!(artifact["producer"]["kind"], "mcp");
+        assert_eq!(artifact["producer"]["server"], "chrome-devtools");
+        assert_eq!(artifact["producer"]["tool"], "take_screenshot");
+
+        let ambiguous = fixture(
+            "rollout-2026-09-25T12-00-00-00000000-0000-0000-0000-000000000036.jsonl",
+            &[
+                ("inner-screenshot", "chrome-devtools", "take_screenshot"),
+                ("inner-browser", "cua_repl", "js"),
+            ],
+        );
+        assert!(ambiguous.get("producer").is_none());
     }
 
     #[test]
