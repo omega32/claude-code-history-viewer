@@ -38,7 +38,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 18;
+const SNAPSHOT_CURSOR_VERSION: u32 = 19;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -110,6 +110,15 @@ struct CodexSnapshotCursor {
     accepted_len: u64,
     accepted_digest: String,
     checkpoint: CodexParserCheckpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<Vec<CodexSnapshotLineageSegment>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexSnapshotLineageSegment {
+    canonical_path: String,
+    accepted_len: u64,
+    accepted_digest: String,
 }
 
 struct CodexParseOutcome {
@@ -2349,6 +2358,7 @@ fn append_rollout_lineage(
     bounded_by: Option<&CodexHistoryBase>,
     seen: &mut HashSet<String>,
     output: &mut Vec<u8>,
+    segments: &mut Vec<CodexSnapshotLineageSegment>,
 ) -> Result<(), String> {
     const MAX_LINEAGE_DEPTH: usize = 128;
     let identity = rollout_file_identity(rollout_path).ok_or_else(|| {
@@ -2391,20 +2401,40 @@ fn append_rollout_lineage(
             ));
         }
         let ancestor = find_rollout_path_by_id(base_path, &history_base.thread_id)?;
-        append_rollout_lineage(base_path, &ancestor, Some(history_base), seen, output)?;
+        append_rollout_lineage(
+            base_path,
+            &ancestor,
+            Some(history_base),
+            seen,
+            output,
+            segments,
+        )?;
     }
     let cutoff = match bounded_by {
         Some(base) => validate_history_cutoff(&identity.rollout_id, &bytes, base)?,
         None => bytes.len(),
     };
     output.extend_from_slice(&bytes[..cutoff]);
+    segments.push(CodexSnapshotLineageSegment {
+        canonical_path: rollout_path.to_string_lossy().into_owned(),
+        accepted_len: u64::try_from(cutoff)
+            .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
+        accepted_digest: digest_bytes(&bytes[..cutoff]),
+    });
     Ok(())
 }
 
 fn logical_rollout_bytes(
     base_path: &Path,
     selected_path: &Path,
-) -> Result<(Vec<u8>, CodexRolloutHeader), String> {
+) -> Result<
+    (
+        Vec<u8>,
+        CodexRolloutHeader,
+        Vec<CodexSnapshotLineageSegment>,
+    ),
+    String,
+> {
     let selected_bytes = read_rollout_bytes(selected_path)?;
     let selected_header = parse_rollout_header(&selected_bytes)?.ok_or_else(|| {
         format!(
@@ -2413,14 +2443,16 @@ fn logical_rollout_bytes(
         )
     })?;
     let mut bytes = Vec::new();
+    let mut segments = Vec::new();
     append_rollout_lineage(
         base_path,
         selected_path,
         None,
         &mut HashSet::new(),
         &mut bytes,
+        &mut segments,
     )?;
-    Ok((bytes, selected_header))
+    Ok((bytes, selected_header, segments))
 }
 
 fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
@@ -2432,7 +2464,7 @@ fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, Strin
         return parse_rollout_file(canonical_path);
     }
     let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
-    let (bytes, header) = logical_rollout_bytes(&base_path, canonical_path)?;
+    let (bytes, header, _) = logical_rollout_bytes(&base_path, canonical_path)?;
     let ranges = find_line_ranges(&bytes);
     let mut state = CodexParserState::initial(canonical_path);
     state.meta_seen = true;
@@ -3249,7 +3281,7 @@ fn parse_rollout_slice(
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
-    BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+    BASE64_URL_SAFE_NO_PAD.encode(blake3::hash(bytes).as_bytes())
 }
 
 fn encode_snapshot_cursor(cursor: &CodexSnapshotCursor) -> Result<String, String> {
@@ -3275,6 +3307,21 @@ pub(crate) fn snapshot_cursor_replace_from(encoded: &str) -> Result<usize, Strin
     Ok(decode_snapshot_cursor(encoded)?.checkpoint.replace_from)
 }
 
+/** Canonical carriers whose bounded contents are covered by a Codex cursor. */
+pub(crate) fn snapshot_cursor_source_dependencies(
+    encoded: &str,
+) -> Result<Option<Vec<String>>, String> {
+    Ok(decode_snapshot_cursor(encoded)?
+        .lineage
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| segment.canonical_path)
+                .collect()
+        })
+        .filter(|paths: &Vec<String>| !paths.is_empty()))
+}
+
 fn cursor_for(
     canonical_path: &Path,
     bytes: &[u8],
@@ -3288,6 +3335,7 @@ fn cursor_for(
             .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
         accepted_digest: digest_bytes(bytes),
         checkpoint,
+        lineage: None,
     })
 }
 
@@ -3311,12 +3359,294 @@ fn source_stayed_stable(
     after: &std::fs::Metadata,
     mapped_len: usize,
 ) -> bool {
+    before.len() == u64::try_from(mapped_len).unwrap_or(u64::MAX)
+        && metadata_stayed_stable(before, after)
+}
+
+fn metadata_stayed_stable(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     let (Ok(before_modified), Ok(after_modified)) = (before.modified(), after.modified()) else {
         return false;
     };
-    before.len() == u64::try_from(mapped_len).unwrap_or(u64::MAX)
-        && after.len() == before.len()
-        && after_modified == before_modified
+    after.len() == before.len() && after_modified == before_modified
+}
+
+fn complete_paginated_snapshot(
+    canonical_path: &Path,
+    reason: String,
+) -> Result<SessionSnapshotLoad, String> {
+    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
+    let (bytes, header, mut lineage) = logical_rollout_bytes(&base_path, canonical_path)?;
+    let current_prefix_len = lineage
+        .iter()
+        .take(lineage.len().saturating_sub(1))
+        .try_fold(0usize, |total, segment| {
+            usize::try_from(segment.accepted_len)
+                .ok()
+                .and_then(|length| total.checked_add(length))
+        })
+        .ok_or_else(|| "Codex paginated lineage is too large to cursor".to_string())?;
+    let ranges = find_line_ranges(&bytes);
+    let mut state = CodexParserState::initial(canonical_path);
+    state.meta_seen = true;
+    state.session_id = if header.session_id.is_empty() {
+        session_id_from_rollout_filename(canonical_path).unwrap_or_default()
+    } else {
+        header.session_id
+    };
+    state.forked_from_session_id = header.forked_from_id;
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        state: state.clone(),
+    };
+    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false).map_err(|()| {
+        "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
+    })?;
+    let original_len = outcome.messages.len();
+    let messages = finalize_loaded_messages(outcome.messages);
+    let cursor = if messages.len() == original_len && is_plain_rollout(canonical_path) {
+        let accepted_len = outcome
+            .accepted_len
+            .checked_sub(current_prefix_len)
+            .ok_or_else(|| "Codex paginated checkpoint precedes its current carrier".to_string())?;
+        let current_end = current_prefix_len
+            .checked_add(accepted_len)
+            .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
+        let current_bytes = bytes
+            .get(current_prefix_len..current_end)
+            .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
+        let current = lineage
+            .last_mut()
+            .ok_or_else(|| "Codex paginated lineage is empty".to_string())?;
+        let accepted_digest =
+            if current.accepted_len == u64::try_from(accepted_len).unwrap_or(u64::MAX) {
+                current.accepted_digest.clone()
+            } else {
+                digest_bytes(current_bytes)
+            };
+        current.accepted_len = u64::try_from(accepted_len)
+            .map_err(|_| "Codex rollout is too large to cursor".to_string())?;
+        current.accepted_digest = accepted_digest;
+        Some(encode_snapshot_cursor(&CodexSnapshotCursor {
+            version: SNAPSHOT_CURSOR_VERSION,
+            provider: "codex".to_string(),
+            canonical_path: canonical_path.to_string_lossy().into_owned(),
+            accepted_len: current.accepted_len,
+            accepted_digest: current.accepted_digest.clone(),
+            checkpoint: outcome.checkpoint,
+            lineage: Some(lineage),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(SessionSnapshotLoad::Full {
+        reason,
+        messages,
+        cursor_replace_from: cursor
+            .as_deref()
+            .map(snapshot_cursor_replace_from)
+            .transpose()?,
+        cursor,
+    })
+}
+
+fn load_paginated_snapshot(
+    canonical_path: &Path,
+    encoded_cursor: Option<&str>,
+) -> Result<SessionSnapshotLoad, String> {
+    let Some(encoded_cursor) = encoded_cursor else {
+        return complete_paginated_snapshot(canonical_path, "paginated-lineage".to_string());
+    };
+    let cursor = match decode_snapshot_cursor(encoded_cursor) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
+        }
+    };
+    let Some(lineage) = cursor.lineage.clone() else {
+        return complete_paginated_snapshot(canonical_path, "incompatible-cursor".to_string());
+    };
+    if cursor.version != SNAPSHOT_CURSOR_VERSION
+        || cursor.provider != "codex"
+        || cursor.canonical_path != canonical_path.to_string_lossy()
+        || lineage.len() < 2
+        || lineage.last().map_or(true, |segment| {
+            segment.canonical_path != canonical_path.to_string_lossy()
+                || segment.accepted_len != cursor.accepted_len
+                || segment.accepted_digest != cursor.accepted_digest
+        })
+    {
+        return complete_paginated_snapshot(canonical_path, "incompatible-cursor".to_string());
+    }
+
+    for segment in lineage.iter().take(lineage.len() - 1) {
+        let segment_path =
+            validate_session_path(Path::new(&segment.canonical_path), &segment.canonical_path)?;
+        let before = fs::metadata(&segment_path).map_err(|error| error.to_string())?;
+        let bytes = read_rollout_bytes(&segment_path)?;
+        let Ok(accepted_len) = usize::try_from(segment.accepted_len) else {
+            return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
+        };
+        if accepted_len > bytes.len()
+            || digest_bytes(&bytes[..accepted_len]) != segment.accepted_digest
+        {
+            return complete_paginated_snapshot(
+                canonical_path,
+                "lineage-prefix-mismatch".to_string(),
+            );
+        }
+        let after = fs::metadata(&segment_path).map_err(|error| error.to_string())?;
+        if !metadata_stayed_stable(&before, &after) {
+            return complete_paginated_snapshot(
+                canonical_path,
+                "source-changed-during-read".to_string(),
+            );
+        }
+    }
+
+    let (mmap, before) = map_plain_rollout(canonical_path)?;
+    let Ok(accepted_len) = usize::try_from(cursor.accepted_len) else {
+        return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
+    };
+    if accepted_len > mmap.len() {
+        return complete_paginated_snapshot(canonical_path, "source-shrank".to_string());
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&mmap[..accepted_len]);
+    if BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize().as_bytes()) != cursor.accepted_digest
+    {
+        return complete_paginated_snapshot(canonical_path, "prefix-mismatch".to_string());
+    }
+    let accepted_total = lineage.iter().try_fold(0usize, |total, segment| {
+        usize::try_from(segment.accepted_len)
+            .ok()
+            .and_then(|length| total.checked_add(length))
+    });
+    let Ok(checkpoint_offset) = usize::try_from(cursor.checkpoint.byte_offset) else {
+        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
+    };
+    if accepted_total.map_or(true, |total| checkpoint_offset > total) {
+        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
+    }
+    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
+    if !source_stayed_stable(&before, &after, mmap.len()) {
+        return complete_paginated_snapshot(
+            canonical_path,
+            "source-changed-during-read".to_string(),
+        );
+    }
+    if accepted_len == mmap.len() {
+        return Ok(SessionSnapshotLoad::Unchanged {
+            cursor: encoded_cursor.to_string(),
+        });
+    }
+
+    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
+    let (bytes, _, mut next_lineage) = logical_rollout_bytes(&base_path, canonical_path)?;
+    if next_lineage.len() != lineage.len()
+        || next_lineage
+            .iter()
+            .zip(&lineage)
+            .take(lineage.len() - 1)
+            .any(|(next, previous)| {
+                next.canonical_path != previous.canonical_path
+                    || next.accepted_len != previous.accepted_len
+                    || next.accepted_digest != previous.accepted_digest
+            })
+        || next_lineage.last().map_or(true, |current| {
+            current.canonical_path != canonical_path.to_string_lossy()
+                || usize::try_from(current.accepted_len).ok() != Some(mmap.len())
+                || current.accepted_digest != digest_bytes(&mmap)
+        })
+    {
+        return complete_paginated_snapshot(
+            canonical_path,
+            "lineage-changed-during-read".to_string(),
+        );
+    }
+    if checkpoint_offset > bytes.len()
+        || (checkpoint_offset > 0
+            && bytes
+                .get(checkpoint_offset - 1)
+                .is_some_and(|byte| *byte != b'\n'))
+    {
+        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
+    }
+    let replace_from = cursor.checkpoint.replace_from;
+    let ranges = find_line_ranges(&bytes);
+    let outcome = match parse_rollout_slice(
+        &bytes,
+        &ranges,
+        cursor.checkpoint.state.clone(),
+        cursor.checkpoint.clone(),
+        true,
+    ) {
+        Ok(outcome) => outcome,
+        Err(()) => {
+            return complete_paginated_snapshot(
+                canonical_path,
+                "unsafe-backward-reference".to_string(),
+            );
+        }
+    };
+    if outcome.accepted_len == accepted_total.unwrap_or_default() {
+        return Ok(SessionSnapshotLoad::Unchanged {
+            cursor: encoded_cursor.to_string(),
+        });
+    }
+
+    let current_prefix_len = next_lineage
+        .iter()
+        .take(next_lineage.len() - 1)
+        .try_fold(0usize, |total, segment| {
+            usize::try_from(segment.accepted_len)
+                .ok()
+                .and_then(|length| total.checked_add(length))
+        })
+        .ok_or_else(|| "Codex paginated lineage is too large to cursor".to_string())?;
+    let next_accepted_len = outcome
+        .accepted_len
+        .checked_sub(current_prefix_len)
+        .ok_or_else(|| "Codex paginated checkpoint precedes its current carrier".to_string())?;
+    let current_end = current_prefix_len
+        .checked_add(next_accepted_len)
+        .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
+    let current_bytes = bytes
+        .get(current_prefix_len..current_end)
+        .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
+    let full_digest = digest_bytes(current_bytes);
+    let cursor_replace_from = outcome.checkpoint.replace_from;
+    let original_len = outcome.messages.len();
+    let messages = finalize_loaded_messages(outcome.messages);
+    if messages.len() != original_len {
+        return complete_paginated_snapshot(
+            canonical_path,
+            "post-normalization-count-changed".to_string(),
+        );
+    }
+    let current = next_lineage
+        .last_mut()
+        .ok_or_else(|| "Codex paginated lineage is empty".to_string())?;
+    current.accepted_len = u64::try_from(next_accepted_len)
+        .map_err(|_| "Codex rollout is too large to cursor".to_string())?;
+    current.accepted_digest.clone_from(&full_digest);
+    let next_cursor = encode_snapshot_cursor(&CodexSnapshotCursor {
+        version: SNAPSHOT_CURSOR_VERSION,
+        provider: "codex".to_string(),
+        canonical_path: canonical_path.to_string_lossy().into_owned(),
+        accepted_len: current.accepted_len,
+        accepted_digest: full_digest,
+        checkpoint: outcome.checkpoint,
+        lineage: Some(next_lineage),
+    })?;
+
+    Ok(SessionSnapshotLoad::Replace {
+        replace_from,
+        messages,
+        cursor_replace_from,
+        cursor: next_cursor,
+    })
 }
 
 fn complete_snapshot_from_path(
@@ -3325,12 +3655,7 @@ fn complete_snapshot_from_path(
 ) -> Result<SessionSnapshotLoad, String> {
     let reason = reason.into();
     if read_rollout_header(canonical_path)?.is_some_and(|header| header.history_base.is_some()) {
-        return Ok(SessionSnapshotLoad::Full {
-            reason,
-            messages: finalize_loaded_messages(parse_live_rollout(canonical_path)?),
-            cursor: None,
-            cursor_replace_from: None,
-        });
+        return complete_paginated_snapshot(canonical_path, reason);
     }
     if !is_plain_rollout(canonical_path) {
         return Ok(SessionSnapshotLoad::Full {
@@ -3408,7 +3733,7 @@ pub(crate) fn load_session_snapshot(
     }
     let canonical_path = validate_session_path(path, session_path)?;
     if read_rollout_header(&canonical_path)?.is_some_and(|header| header.history_base.is_some()) {
-        return complete_snapshot_from_path(&canonical_path, "paginated-lineage");
+        return load_paginated_snapshot(&canonical_path, encoded_cursor);
     }
 
     let Some(encoded_cursor) = encoded_cursor else {
@@ -3440,9 +3765,9 @@ pub(crate) fn load_session_snapshot(
         return complete_snapshot_from_path(&canonical_path, "invalid-checkpoint");
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(&mmap[..accepted_len]);
-    let accepted_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize());
+    let accepted_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize().as_bytes());
     if accepted_digest != cursor.accepted_digest {
         return complete_snapshot_from_path(&canonical_path, "prefix-mismatch");
     }
@@ -3483,7 +3808,7 @@ pub(crate) fn load_session_snapshot(
     }
 
     hasher.update(&mmap[accepted_len..outcome.accepted_len]);
-    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize());
+    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
     let cursor_replace_from = outcome.checkpoint.replace_from;
     let original_len = outcome.messages.len();
     let messages = finalize_loaded_messages(outcome.messages);
@@ -3498,6 +3823,7 @@ pub(crate) fn load_session_snapshot(
             .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
         accepted_digest: full_digest,
         checkpoint: outcome.checkpoint,
+        lineage: None,
     })?;
 
     Ok(SessionSnapshotLoad::Replace {
@@ -14767,6 +15093,15 @@ mod tests {
                     }
                 }),
                 assistant_message_line("2026-09-03T22:22:00Z", 3, "current page"),
+                json!({
+                    "timestamp": "2026-09-03T22:22:30Z",
+                    "ordinal": 4,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-current"
+                    }
+                }),
             ],
         );
         (thread_id, base_path, current_path)
@@ -14813,22 +15148,140 @@ mod tests {
             .all(|message| message.session_id == thread_id));
         assert!(search("excluded ancestor suffix", 10).unwrap().is_empty());
         assert_eq!(search("retained ancestor", 10).unwrap().len(), 1);
-        match load_session_snapshot(&current_path.to_string_lossy(), None)
-            .expect("paginated snapshot should load")
+        let (initial_messages, cursor) =
+            match load_session_snapshot(&current_path.to_string_lossy(), None)
+                .expect("paginated snapshot should load")
+            {
+                SessionSnapshotLoad::Full {
+                    reason,
+                    messages,
+                    cursor,
+                    ..
+                } => {
+                    assert_eq!(reason, "paginated-lineage");
+                    let cursor = cursor.expect("paginated lineage should expose a cursor");
+                    assert_eq!(
+                        snapshot_cursor_source_dependencies(&cursor)
+                            .unwrap()
+                            .unwrap(),
+                        vec![
+                            base_path
+                                .canonicalize()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                            current_path
+                                .canonicalize()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ]
+                    );
+                    let rendered = serde_json::to_string(&messages).unwrap();
+                    assert!(rendered.contains("retained ancestor"));
+                    assert!(rendered.contains("current page"));
+                    (messages, cursor)
+                }
+                _ => panic!("paginated lineage should use a cursor-bearing complete snapshot"),
+            };
+
+        assert!(matches!(
+            load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor))
+                .expect("unchanged paginated snapshot should load"),
+            SessionSnapshotLoad::Unchanged { .. }
+        ));
+
+        append_rollout_lines(
+            &current_path,
+            &[assistant_message_line(
+                "2026-09-03T22:23:00Z",
+                5,
+                "appended current page",
+            )],
+        );
+        let replacement =
+            match load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor))
+                .expect("appended paginated snapshot should load")
+            {
+                SessionSnapshotLoad::Replace {
+                    replace_from,
+                    messages,
+                    cursor,
+                    cursor_replace_from,
+                } => {
+                    assert_eq!(
+                        snapshot_cursor_source_dependencies(&cursor)
+                            .unwrap()
+                            .unwrap(),
+                        vec![
+                            base_path
+                                .canonicalize()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                            current_path
+                                .canonicalize()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ]
+                    );
+                    (replace_from, messages, cursor_replace_from)
+                }
+                _ => panic!("an appended current page should return an exact replacement suffix"),
+            };
+        let mut projected = initial_messages;
+        projected.splice(replacement.0.., replacement.1);
+        let complete = finalize_loaded_messages(
+            parse_live_rollout(&current_path).expect("complete paginated parse should load"),
+        );
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&complete).unwrap()
+        );
+        assert!(replacement.2 <= projected.len());
+
+        append_rollout_lines(
+            &base_path,
+            &[assistant_message_line(
+                "2026-09-03T19:42:00Z",
+                6,
+                "another excluded ancestor suffix",
+            )],
+        );
+        let next_cursor = match load_session_snapshot(&current_path.to_string_lossy(), None)
+            .expect("fresh paginated snapshot should load")
         {
             SessionSnapshotLoad::Full {
-                reason,
-                messages,
-                cursor,
+                cursor: Some(cursor),
                 ..
+            } => cursor,
+            _ => panic!("fresh paginated snapshot should retain a cursor"),
+        };
+        assert!(matches!(
+            load_session_snapshot(&current_path.to_string_lossy(), Some(&next_cursor))
+                .expect("an excluded ancestor suffix must not invalidate the snapshot"),
+            SessionSnapshotLoad::Unchanged { .. }
+        ));
+
+        let ancestor = fs::read_to_string(&base_path).expect("ancestor should be readable");
+        fs::write(
+            &base_path,
+            ancestor.replacen("retained ancestor", "changed! ancestor", 1),
+        )
+        .expect("ancestor should be replaceable");
+        match load_session_snapshot(&current_path.to_string_lossy(), Some(&next_cursor))
+            .expect("changed ancestor should fall back")
+        {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
             } => {
-                assert_eq!(reason, "paginated-lineage");
-                assert!(cursor.is_none());
-                let rendered = serde_json::to_string(&messages).unwrap();
-                assert!(rendered.contains("retained ancestor"));
-                assert!(rendered.contains("current page"));
+                assert_eq!(reason, "lineage-prefix-mismatch");
+                assert!(serde_json::to_string(&messages)
+                    .unwrap()
+                    .contains("changed! ancestor"));
             }
-            _ => panic!("paginated lineage should use a cursorless complete snapshot"),
+            _ => panic!("a changed accepted ancestor prefix must use the complete fallback"),
         }
     }
 

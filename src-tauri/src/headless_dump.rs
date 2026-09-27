@@ -254,9 +254,13 @@ enum SessionSnapshotEnvelope {
         cursor: Option<String>,
         #[serde(rename = "cursorReplaceFrom", skip_serializing_if = "Option::is_none")]
         cursor_replace_from: Option<usize>,
+        #[serde(rename = "sourceDependencies", skip_serializing_if = "Option::is_none")]
+        source_dependencies: Option<Vec<String>>,
     },
     Unchanged {
         cursor: String,
+        #[serde(rename = "sourceDependencies", skip_serializing_if = "Option::is_none")]
+        source_dependencies: Option<Vec<String>>,
     },
     Replace {
         #[serde(rename = "replaceFrom")]
@@ -265,6 +269,8 @@ enum SessionSnapshotEnvelope {
         cursor: String,
         #[serde(rename = "cursorReplaceFrom")]
         cursor_replace_from: usize,
+        #[serde(rename = "sourceDependencies", skip_serializing_if = "Option::is_none")]
+        source_dependencies: Option<Vec<String>>,
     },
 }
 
@@ -418,6 +424,7 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
                 messages,
                 cursor: None,
                 cursor_replace_from: None,
+                source_dependencies: None,
             });
         }
 
@@ -436,11 +443,28 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
             } => Ok(SessionSnapshotEnvelope::Full {
                 reason,
                 messages,
+                source_dependencies: if provider == "codex" {
+                    cursor
+                        .as_deref()
+                        .map(codex::snapshot_cursor_source_dependencies)
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                },
                 cursor,
                 cursor_replace_from,
             }),
             SessionSnapshotLoad::Unchanged { cursor } => {
-                Ok(SessionSnapshotEnvelope::Unchanged { cursor })
+                let source_dependencies = if provider == "codex" {
+                    codex::snapshot_cursor_source_dependencies(&cursor)?
+                } else {
+                    None
+                };
+                Ok(SessionSnapshotEnvelope::Unchanged {
+                    cursor,
+                    source_dependencies,
+                })
             }
             SessionSnapshotLoad::Replace {
                 replace_from,
@@ -450,6 +474,11 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
             } => Ok(SessionSnapshotEnvelope::Replace {
                 replace_from,
                 messages,
+                source_dependencies: if provider == "codex" {
+                    codex::snapshot_cursor_source_dependencies(&cursor)?
+                } else {
+                    None
+                },
                 cursor,
                 cursor_replace_from,
             }),
@@ -1982,6 +2011,21 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn snapshot_envelope_serializes_provider_source_dependencies() {
+        let value = serde_json::to_value(SessionSnapshotEnvelope::Unchanged {
+            cursor: "cursor".to_string(),
+            source_dependencies: Some(vec!["base.jsonl".to_string(), "current.jsonl".to_string()]),
+        })
+        .unwrap();
+
+        assert_eq!(value["kind"], "unchanged");
+        assert_eq!(
+            value["sourceDependencies"],
+            json!(["base.jsonl", "current.jsonl"])
+        );
     }
 
     fn session(file_path: &Path, id: &str, entrypoint: Option<&str>) -> ClaudeSession {
