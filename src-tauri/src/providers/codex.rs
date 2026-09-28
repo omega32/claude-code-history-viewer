@@ -38,7 +38,8 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 19;
+const SNAPSHOT_CURSOR_VERSION: u32 = 20;
+const MAX_DETACHED_ACTIVE_LANES: usize = 64;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -96,10 +97,19 @@ struct PendingForkBranch {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexDetachedActiveLane {
+    turn_id: String,
+    authored_user_count: usize,
+    overlap_ambiguous: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexParserCheckpoint {
     byte_offset: u64,
     replace_from: usize,
     state: CodexParserState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    detached_active_lanes: Vec<CodexDetachedActiveLane>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -334,6 +344,67 @@ struct CodexAuthorshipTracker {
 }
 
 impl CodexAuthorshipTracker {
+    fn from_detached_active_lanes(lanes: &[CodexDetachedActiveLane]) -> Self {
+        Self {
+            lanes: lanes
+                .iter()
+                .map(|lane| {
+                    (
+                        CodexAuthorshipLaneKey::Turn(lane.turn_id.clone()),
+                        CodexAuthorshipLane {
+                            active: true,
+                            authored_user_count: lane.authored_user_count,
+                            pending_user_messages: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn detached_active_lanes(
+        &self,
+        active_turn_order: &[String],
+        overlap_ambiguous_turns: &HashSet<String>,
+    ) -> Option<Vec<CodexDetachedActiveLane>> {
+        if active_turn_order.is_empty()
+            || active_turn_order.len() > MAX_DETACHED_ACTIVE_LANES
+            || self
+                .lanes
+                .values()
+                .any(|lane| !lane.pending_user_messages.is_empty())
+        {
+            return None;
+        }
+
+        let active_lane_ids = self
+            .lanes
+            .iter()
+            .filter_map(|(key, lane)| lane.active.then_some(key.turn_id()).flatten())
+            .collect::<HashSet<_>>();
+        if active_lane_ids.len() != active_turn_order.len()
+            || active_turn_order
+                .iter()
+                .any(|turn_id| !active_lane_ids.contains(turn_id.as_str()))
+        {
+            return None;
+        }
+
+        active_turn_order
+            .iter()
+            .map(|turn_id| {
+                let lane = self
+                    .lanes
+                    .get(&CodexAuthorshipLaneKey::Turn(turn_id.clone()))?;
+                lane.active.then(|| CodexDetachedActiveLane {
+                    turn_id: turn_id.clone(),
+                    authored_user_count: lane.authored_user_count,
+                    overlap_ambiguous: overlap_ambiguous_turns.contains(turn_id),
+                })
+            })
+            .collect()
+    }
+
     fn start_turn(
         &mut self,
         turn_id: &str,
@@ -444,6 +515,49 @@ impl CodexAuthorshipTracker {
             );
         }
     }
+}
+
+fn detached_active_lanes_are_valid(lanes: &[CodexDetachedActiveLane]) -> bool {
+    if lanes.len() > MAX_DETACHED_ACTIVE_LANES {
+        return false;
+    }
+    let mut seen = HashSet::with_capacity(lanes.len());
+    lanes.iter().all(|lane| {
+        !lane.turn_id.is_empty() && lane.turn_id.len() <= 256 && seen.insert(lane.turn_id.as_str())
+    })
+}
+
+fn structural_provider_turn_id(value: &Value) -> Option<&str> {
+    let payload = value.get("payload")?;
+    non_empty_string(payload.get("turn_id")).or_else(|| {
+        non_empty_string(
+            payload
+                .get("internal_chat_message_metadata_passthrough")
+                .and_then(|metadata| metadata.get("turn_id")),
+        )
+    })
+}
+
+fn detached_lane_prefix_is_stable(
+    messages: &[ClaudeMessage],
+    inferred_provider_turn_messages: &HashSet<usize>,
+    detached_active_lanes: &[CodexDetachedActiveLane],
+) -> bool {
+    let detached_turn_ids = detached_active_lanes
+        .iter()
+        .map(|lane| lane.turn_id.as_str())
+        .collect::<HashSet<_>>();
+    inferred_provider_turn_messages.iter().all(|message_index| {
+        let Some(message) = messages.get(*message_index) else {
+            return false;
+        };
+        message
+            .data
+            .as_ref()
+            .and_then(|data| data.get("providerTurnId"))
+            .and_then(Value::as_str)
+            .map_or(true, |turn_id| !detached_turn_ids.contains(turn_id))
+    })
 }
 
 fn codex_user_response_text(payload: &Value) -> Option<String> {
@@ -2478,6 +2592,7 @@ fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, Strin
         byte_offset: 0,
         replace_from: 0,
         state: state.clone(),
+        detached_active_lanes: Vec::new(),
     };
     parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
         .map(|outcome| outcome.messages)
@@ -2509,6 +2624,7 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
         byte_offset: 0,
         replace_from: 0,
         state: state.clone(),
+        detached_active_lanes: Vec::new(),
     };
     parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
         .map(|outcome| outcome.messages)
@@ -2589,6 +2705,7 @@ pub(crate) fn parse_authorship_audit(
         byte_offset: 0,
         replace_from: 0,
         state: state.clone(),
+        detached_active_lanes: Vec::new(),
     };
     let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
         .map_err(|()| "Codex audit parse unexpectedly crossed its prefix".to_string())?;
@@ -2616,13 +2733,34 @@ fn parse_rollout_slice(
     let mut diagnostics = Vec::new();
     let slice_base_replace_from = checkpoint.replace_from;
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
-    let mut active_turn_id: Option<String> = None;
+    if !detached_active_lanes_are_valid(&checkpoint.detached_active_lanes) {
+        return Err(());
+    }
+    let detached_turn_ids = checkpoint
+        .detached_active_lanes
+        .iter()
+        .map(|lane| lane.turn_id.clone())
+        .collect::<HashSet<_>>();
+    let mut active_turn_id = checkpoint
+        .detached_active_lanes
+        .last()
+        .map(|lane| lane.turn_id.clone());
     let mut active_turn_message_start = 0usize;
     let mut active_turn_message_starts = HashMap::<String, usize>::new();
-    let mut active_turn_order = Vec::<String>::new();
-    let mut overlap_ambiguous_turns = HashSet::<String>::new();
+    let mut active_turn_order = checkpoint
+        .detached_active_lanes
+        .iter()
+        .map(|lane| lane.turn_id.clone())
+        .collect::<Vec<_>>();
+    let mut overlap_ambiguous_turns = checkpoint
+        .detached_active_lanes
+        .iter()
+        .filter(|lane| lane.overlap_ambiguous)
+        .map(|lane| lane.turn_id.clone())
+        .collect::<HashSet<_>>();
     let mut inferred_provider_turn_messages = HashSet::<usize>::new();
-    let mut authorship_tracker = CodexAuthorshipTracker::default();
+    let mut authorship_tracker =
+        CodexAuthorshipTracker::from_detached_active_lanes(&checkpoint.detached_active_lanes);
     let mut question_calls = HashMap::new();
     let mut tool_image_producers = CodexToolImageProducerTracker::default();
     let mut pending_compacted_notification = false;
@@ -2667,6 +2805,15 @@ fn parse_rollout_slice(
         } else {
             ""
         };
+        if resumed
+            && structural_provider_turn_id(&val)
+                .is_some_and(|turn_id| detached_turn_ids.contains(turn_id))
+        {
+            // A detached lane began before the replacement boundary. Any later
+            // structural reference can mutate its retained messages or revive
+            // ownership state that the compact cursor intentionally omitted.
+            return Err(());
+        }
         observe_pending_terminal_record(
             &mut authorship_tracker,
             &mut diagnostics,
@@ -3167,6 +3314,7 @@ fn parse_rollout_slice(
                     }
 
                     if matches!(event_type, "task_complete" | "turn_aborted") {
+                        let mut closed_active_lane = false;
                         if let Some(completed_turn_id) = payload
                             .get("turn_id")
                             .and_then(Value::as_str)
@@ -3176,6 +3324,7 @@ fn parse_rollout_slice(
                                 !overlap_ambiguous_turns.contains(completed_turn_id);
                             let key = CodexAuthorshipLaneKey::Turn(completed_turn_id.to_string());
                             if let Some(lane) = authorship_tracker.lanes.remove(&key) {
+                                closed_active_lane = lane.active;
                                 if lane.active {
                                     classify_pending_terminal_context(
                                         &mut messages,
@@ -3229,10 +3378,25 @@ fn parse_rollout_slice(
                                     .unwrap_or(messages.len());
                             }
                         }
-                        if authorship_tracker.is_quiescent()
-                            && pending_fork_rollback.is_none()
-                            && pending_fork_branch.is_none()
-                        {
+                        let detached_active_lanes = if authorship_tracker.is_quiescent() {
+                            Some(Vec::new())
+                        } else if closed_active_lane {
+                            authorship_tracker
+                                .detached_active_lanes(&active_turn_order, &overlap_ambiguous_turns)
+                                .filter(|lanes| {
+                                    detached_lane_prefix_is_stable(
+                                        &messages,
+                                        &inferred_provider_turn_messages,
+                                        lanes,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        if pending_fork_rollback.is_none() && pending_fork_branch.is_none() {
+                            let Some(detached_active_lanes) = detached_active_lanes else {
+                                continue;
+                            };
                             let next_offset = ranges
                                 .get(range_index + 1)
                                 .map_or(bytes.len(), |&(next_start, _)| next_start);
@@ -3240,6 +3404,7 @@ fn parse_rollout_slice(
                                 byte_offset: u64::try_from(next_offset).map_err(|_| ())?,
                                 replace_from: slice_base_replace_from + messages.len(),
                                 state: state.clone(),
+                                detached_active_lanes,
                             };
                         }
                     }
@@ -3398,6 +3563,7 @@ fn complete_paginated_snapshot(
         byte_offset: 0,
         replace_from: 0,
         state: state.clone(),
+        detached_active_lanes: Vec::new(),
     };
     let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false).map_err(|()| {
         "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
@@ -3470,6 +3636,7 @@ fn load_paginated_snapshot(
     if cursor.version != SNAPSHOT_CURSOR_VERSION
         || cursor.provider != "codex"
         || cursor.canonical_path != canonical_path.to_string_lossy()
+        || !detached_active_lanes_are_valid(&cursor.checkpoint.detached_active_lanes)
         || lineage.len() < 2
         || lineage.last().map_or(true, |segment| {
             segment.canonical_path != canonical_path.to_string_lossy()
@@ -3673,6 +3840,7 @@ fn complete_snapshot_from_path(
         byte_offset: 0,
         replace_from: 0,
         state: state.clone(),
+        detached_active_lanes: Vec::new(),
     };
     let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
         .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
@@ -3702,6 +3870,9 @@ fn complete_snapshot_from_path(
 }
 
 fn cursor_checkpoint_is_valid(cursor: &CodexSnapshotCursor, bytes: &[u8]) -> bool {
+    if !detached_active_lanes_are_valid(&cursor.checkpoint.detached_active_lanes) {
+        return false;
+    }
     let Ok(offset) = usize::try_from(cursor.checkpoint.byte_offset) else {
         return false;
     };
@@ -8437,6 +8608,29 @@ mod tests {
                 assert_eq!(reason, "incompatible-cursor");
             }
             _ => panic!("an incompatible cursor must force a complete snapshot"),
+        }
+
+        let mut cursor = decode_snapshot_cursor(&encoded).expect("cursor should decode");
+        cursor.checkpoint.detached_active_lanes = vec![
+            CodexDetachedActiveLane {
+                turn_id: "duplicate".to_string(),
+                authored_user_count: 0,
+                overlap_ambiguous: true,
+            },
+            CodexDetachedActiveLane {
+                turn_id: "duplicate".to_string(),
+                authored_user_count: 1,
+                overlap_ambiguous: false,
+            },
+        ];
+        let invalid_checkpoint = encode_snapshot_cursor(&cursor).expect("cursor should encode");
+        match load_session_snapshot(&path_text, Some(&invalid_checkpoint))
+            .expect("invalid checkpoint fallback")
+        {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "invalid-checkpoint");
+            }
+            _ => panic!("invalid detached lanes must force a complete snapshot"),
         }
 
         let archived_dir = codex_home.join("archived_sessions");
@@ -15283,6 +15477,156 @@ mod tests {
             }
             _ => panic!("a changed accepted ancestor prefix must use the complete fallback"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_detaches_abandoned_ancestor_tasks_without_weakening_fallback() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("28");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let thread_id = "01a0f000-0000-7000-8000-000000000001";
+        let current_rollout_id = "01a0f000-0000-7000-8000-000000000002";
+        let assistant = |ordinal: u64, turn_id: &str, text: &str| {
+            json!({
+                "timestamp": format!("2026-09-28T10:00:{ordinal:02}Z"),
+                "ordinal": ordinal,
+                "type": "response_item",
+                "payload": {
+                    "id": format!("assistant-{ordinal}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": text }],
+                    "internal_chat_message_metadata_passthrough": { "turn_id": turn_id }
+                }
+            })
+        };
+        let lifecycle = |ordinal: u64, event_type: &str, turn_id: &str| {
+            json!({
+                "timestamp": format!("2026-09-28T10:00:{ordinal:02}Z"),
+                "ordinal": ordinal,
+                "type": "event_msg",
+                "payload": { "type": event_type, "turn_id": turn_id }
+            })
+        };
+
+        let base_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-28T10-00-00-{thread_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-28T10:00:00Z",
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": { "id": thread_id, "cwd": "C:/Repo", "history_mode": "paginated" }
+                }),
+                lifecycle(1, "task_started", "stale-a"),
+                assistant(2, "stale-a", "stale task A output"),
+                lifecycle(3, "task_started", "stale-b"),
+                assistant(4, "stale-b", "stale task B output"),
+                lifecycle(5, "task_started", "completed-ancestor"),
+                assistant(6, "completed-ancestor", "completed ancestor output"),
+                lifecycle(7, "task_complete", "completed-ancestor"),
+            ],
+        );
+        let cutoff = fs::metadata(&base_path)
+            .expect("base rollout metadata")
+            .len();
+        let current_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-28T11-00-00-{thread_id}_{current_rollout_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-28T11:00:00Z",
+                    "ordinal": 8,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": thread_id,
+                            "end_ordinal_exclusive": 8,
+                            "end_byte_offset": cutoff
+                        }
+                    }
+                }),
+                lifecycle(9, "task_started", "completed-current"),
+                assistant(10, "completed-current", "completed current output"),
+                lifecycle(11, "task_complete", "completed-current"),
+            ],
+        );
+
+        let path_text = current_path.to_string_lossy();
+        let (initial_messages, cursor) = match load_session_snapshot(&path_text, None)
+            .expect("initial paginated snapshot should load")
+        {
+            SessionSnapshotLoad::Full {
+                messages,
+                cursor: Some(cursor),
+                cursor_replace_from: Some(cursor_replace_from),
+                ..
+            } => {
+                assert_eq!(
+                    cursor_replace_from,
+                    messages.len(),
+                    "completed later tasks should advance beyond abandoned ancestor lanes"
+                );
+                (messages, cursor)
+            }
+            _ => panic!("initial paginated snapshot should carry a checkpointed cursor"),
+        };
+
+        append_rollout_lines(
+            &current_path,
+            &[
+                lifecycle(12, "task_started", "active-current"),
+                assistant(13, "active-current", "active current output"),
+            ],
+        );
+        let (mut projected, active_cursor) = match load_session_snapshot(&path_text, Some(&cursor))
+            .expect("active append should load")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                cursor,
+                ..
+            } => {
+                assert_eq!(replace_from, initial_messages.len());
+                let mut projected = initial_messages;
+                projected.splice(replace_from.., messages);
+                (projected, cursor)
+            }
+            _ => panic!("active append should use the detached-lane replacement boundary"),
+        };
+        let fresh = crate::commands::multi_provider::finalize_loaded_messages(
+            load_messages(&path_text).expect("fresh paginated parse should succeed"),
+        );
+        assert_eq!(message_values(&projected), message_values(&fresh));
+
+        append_rollout_lines(&current_path, &[lifecycle(14, "task_complete", "stale-a")]);
+        match load_session_snapshot(&path_text, Some(&active_cursor))
+            .expect("a detached task reference should fall back safely")
+        {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "unsafe-backward-reference");
+                projected = messages;
+            }
+            _ => panic!("a detached task reference must force a complete projection"),
+        }
+        let fresh = crate::commands::multi_provider::finalize_loaded_messages(
+            load_messages(&path_text).expect("fresh paginated parse should succeed"),
+        );
+        assert_eq!(message_values(&projected), message_values(&fresh));
     }
 
     #[test]
