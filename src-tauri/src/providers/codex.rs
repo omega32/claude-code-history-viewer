@@ -27,6 +27,11 @@ use walkdir::WalkDir;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(test)]
+thread_local! {
+    static LOGICAL_ROLLOUT_MATERIALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use crate::commands::session::NativeRenameResult;
 
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
@@ -38,7 +43,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 20;
+const SNAPSHOT_CURSOR_VERSION: u32 = 21;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
@@ -107,6 +112,8 @@ struct CodexDetachedActiveLane {
 struct CodexParserCheckpoint {
     byte_offset: u64,
     replace_from: usize,
+    #[serde(default)]
+    source_line: usize,
     state: CodexParserState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     detached_active_lanes: Vec<CodexDetachedActiveLane>,
@@ -2549,6 +2556,8 @@ fn logical_rollout_bytes(
     ),
     String,
 > {
+    #[cfg(test)]
+    LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(|count| count.set(count.get() + 1));
     let selected_bytes = read_rollout_bytes(selected_path)?;
     let selected_header = parse_rollout_header(&selected_bytes)?.ok_or_else(|| {
         format!(
@@ -2591,10 +2600,11 @@ fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, Strin
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
         replace_from: 0,
+        source_line: 0,
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
+    parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0)
         .map(|outcome| outcome.messages)
         .map_err(|()| {
             "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
@@ -2623,10 +2633,11 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
         replace_from: 0,
+        source_line: 0,
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
+    parse_rollout_slice(&mmap, &ranges, state, checkpoint, false, 0)
         .map(|outcome| outcome.messages)
         .map_err(|()| "Codex rollout unexpectedly referenced an earlier prefix".to_string())
 }
@@ -2704,10 +2715,11 @@ pub(crate) fn parse_authorship_audit(
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
         replace_from: 0,
+        source_line: 0,
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false)
+    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0)
         .map_err(|()| "Codex audit parse unexpectedly crossed its prefix".to_string())?;
     let session_id = outcome
         .messages
@@ -2728,6 +2740,7 @@ fn parse_rollout_slice(
     mut state: CodexParserState,
     mut checkpoint: CodexParserCheckpoint,
     resumed: bool,
+    source_line_base: usize,
 ) -> Result<CodexParseOutcome, ()> {
     let mut messages: Vec<ClaudeMessage> = Vec::new();
     let mut diagnostics = Vec::new();
@@ -2773,7 +2786,10 @@ fn parse_rollout_slice(
         }
         let line = &bytes[start..end];
         let mut buf = line.to_vec();
-        let source_line = range_index + 1;
+        let source_line = source_line_base
+            .checked_add(range_index)
+            .and_then(|line| line.checked_add(1))
+            .ok_or(())?;
         let val: Value = if let Ok(value) = simd_json::from_slice(&mut buf) {
             value
         } else {
@@ -3403,6 +3419,7 @@ fn parse_rollout_slice(
                             checkpoint = CodexParserCheckpoint {
                                 byte_offset: u64::try_from(next_offset).map_err(|_| ())?,
                                 replace_from: slice_base_replace_from + messages.len(),
+                                source_line,
                                 state: state.clone(),
                                 detached_active_lanes,
                             };
@@ -3535,6 +3552,16 @@ fn metadata_stayed_stable(before: &std::fs::Metadata, after: &std::fs::Metadata)
     after.len() == before.len() && after_modified == before_modified
 }
 
+fn sources_stayed_stable(sources: &[(PathBuf, std::fs::Metadata)]) -> Result<bool, String> {
+    for (path, before) in sources {
+        let after = fs::metadata(path).map_err(|error| error.to_string())?;
+        if !metadata_stayed_stable(before, &after) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn complete_paginated_snapshot(
     canonical_path: &Path,
     reason: String,
@@ -3562,12 +3589,14 @@ fn complete_paginated_snapshot(
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
         replace_from: 0,
+        source_line: 0,
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false).map_err(|()| {
-        "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
-    })?;
+    let outcome =
+        parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0).map_err(|()| {
+            "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
+        })?;
     let original_len = outcome.messages.len();
     let messages = finalize_loaded_messages(outcome.messages);
     let cursor = if messages.len() == original_len && is_plain_rollout(canonical_path) {
@@ -3647,6 +3676,7 @@ fn load_paginated_snapshot(
         return complete_paginated_snapshot(canonical_path, "incompatible-cursor".to_string());
     }
 
+    let mut verified_ancestor_sources = Vec::with_capacity(lineage.len() - 1);
     for segment in lineage.iter().take(lineage.len() - 1) {
         let segment_path =
             validate_session_path(Path::new(&segment.canonical_path), &segment.canonical_path)?;
@@ -3670,6 +3700,7 @@ fn load_paginated_snapshot(
                 "source-changed-during-read".to_string(),
             );
         }
+        verified_ancestor_sources.push((segment_path, after));
     }
 
     let (mmap, before) = map_plain_rollout(canonical_path)?;
@@ -3690,10 +3721,13 @@ fn load_paginated_snapshot(
             .ok()
             .and_then(|length| total.checked_add(length))
     });
+    let Some(accepted_total) = accepted_total else {
+        return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
+    };
     let Ok(checkpoint_offset) = usize::try_from(cursor.checkpoint.byte_offset) else {
         return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
     };
-    if accepted_total.map_or(true, |total| checkpoint_offset > total) {
+    if checkpoint_offset > accepted_total {
         return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
     }
     let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
@@ -3704,50 +3738,49 @@ fn load_paginated_snapshot(
         );
     }
     if accepted_len == mmap.len() {
+        if !sources_stayed_stable(&verified_ancestor_sources)? {
+            return complete_paginated_snapshot(
+                canonical_path,
+                "source-changed-during-read".to_string(),
+            );
+        }
         return Ok(SessionSnapshotLoad::Unchanged {
             cursor: encoded_cursor.to_string(),
         });
     }
 
-    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
-    let (bytes, _, mut next_lineage) = logical_rollout_bytes(&base_path, canonical_path)?;
-    if next_lineage.len() != lineage.len()
-        || next_lineage
-            .iter()
-            .zip(&lineage)
-            .take(lineage.len() - 1)
-            .any(|(next, previous)| {
-                next.canonical_path != previous.canonical_path
-                    || next.accepted_len != previous.accepted_len
-                    || next.accepted_digest != previous.accepted_digest
-            })
-        || next_lineage.last().map_or(true, |current| {
-            current.canonical_path != canonical_path.to_string_lossy()
-                || usize::try_from(current.accepted_len).ok() != Some(mmap.len())
-                || current.accepted_digest != digest_bytes(&mmap)
-        })
-    {
+    let Some(current_prefix_len) = accepted_total.checked_sub(accepted_len) else {
+        return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
+    };
+    let Some(checkpoint_current_offset) = checkpoint_offset.checked_sub(current_prefix_len) else {
         return complete_paginated_snapshot(
             canonical_path,
-            "lineage-changed-during-read".to_string(),
+            "checkpoint-before-current-carrier".to_string(),
         );
-    }
-    if checkpoint_offset > bytes.len()
-        || (checkpoint_offset > 0
-            && bytes
-                .get(checkpoint_offset - 1)
+    };
+    if checkpoint_current_offset > accepted_len
+        || (checkpoint_current_offset > 0
+            && mmap
+                .get(checkpoint_current_offset - 1)
                 .is_some_and(|byte| *byte != b'\n'))
     {
         return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
     }
+
     let replace_from = cursor.checkpoint.replace_from;
-    let ranges = find_line_ranges(&bytes);
-    let outcome = match parse_rollout_slice(
-        &bytes,
+    // Cursor offsets address the complete logical lineage. Rebase only while
+    // parsing the current-carrier window, then restore the logical coordinate.
+    let parse_bytes = &mmap[checkpoint_current_offset..];
+    let ranges = find_line_ranges(parse_bytes);
+    let mut parse_checkpoint = cursor.checkpoint.clone();
+    parse_checkpoint.byte_offset = 0;
+    let mut outcome = match parse_rollout_slice(
+        parse_bytes,
         &ranges,
         cursor.checkpoint.state.clone(),
-        cursor.checkpoint.clone(),
+        parse_checkpoint,
         true,
+        cursor.checkpoint.source_line,
     ) {
         Ok(outcome) => outcome,
         Err(()) => {
@@ -3757,32 +3790,41 @@ fn load_paginated_snapshot(
             );
         }
     };
-    if outcome.accepted_len == accepted_total.unwrap_or_default() {
+
+    let Some(next_accepted_len) = checkpoint_current_offset.checked_add(outcome.accepted_len)
+    else {
+        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
+    };
+    if next_accepted_len < accepted_len || next_accepted_len > mmap.len() {
+        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
+    }
+    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
+    if !source_stayed_stable(&before, &after, mmap.len())
+        || !sources_stayed_stable(&verified_ancestor_sources)?
+    {
+        return complete_paginated_snapshot(
+            canonical_path,
+            "source-changed-during-read".to_string(),
+        );
+    }
+    if next_accepted_len == accepted_len {
         return Ok(SessionSnapshotLoad::Unchanged {
             cursor: encoded_cursor.to_string(),
         });
     }
 
-    let current_prefix_len = next_lineage
-        .iter()
-        .take(next_lineage.len() - 1)
-        .try_fold(0usize, |total, segment| {
-            usize::try_from(segment.accepted_len)
-                .ok()
-                .and_then(|length| total.checked_add(length))
-        })
-        .ok_or_else(|| "Codex paginated lineage is too large to cursor".to_string())?;
-    let next_accepted_len = outcome
-        .accepted_len
-        .checked_sub(current_prefix_len)
-        .ok_or_else(|| "Codex paginated checkpoint precedes its current carrier".to_string())?;
-    let current_end = current_prefix_len
-        .checked_add(next_accepted_len)
-        .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
-    let current_bytes = bytes
-        .get(current_prefix_len..current_end)
-        .ok_or_else(|| "Codex paginated checkpoint exceeds its current carrier".to_string())?;
-    let full_digest = digest_bytes(current_bytes);
+    hasher.update(&mmap[accepted_len..next_accepted_len]);
+    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
+    let checkpoint_window_base = current_prefix_len
+        .checked_add(checkpoint_current_offset)
+        .ok_or_else(|| "Codex paginated checkpoint exceeds its lineage".to_string())?;
+    let relative_checkpoint = usize::try_from(outcome.checkpoint.byte_offset)
+        .map_err(|_| "Codex paginated checkpoint does not fit this platform".to_string())?;
+    let next_checkpoint_offset = checkpoint_window_base
+        .checked_add(relative_checkpoint)
+        .ok_or_else(|| "Codex paginated checkpoint exceeds its lineage".to_string())?;
+    outcome.checkpoint.byte_offset = u64::try_from(next_checkpoint_offset)
+        .map_err(|_| "Codex paginated checkpoint is too large to cursor".to_string())?;
     let cursor_replace_from = outcome.checkpoint.replace_from;
     let original_len = outcome.messages.len();
     let messages = finalize_loaded_messages(outcome.messages);
@@ -3792,6 +3834,7 @@ fn load_paginated_snapshot(
             "post-normalization-count-changed".to_string(),
         );
     }
+    let mut next_lineage = lineage;
     let current = next_lineage
         .last_mut()
         .ok_or_else(|| "Codex paginated lineage is empty".to_string())?;
@@ -3839,10 +3882,11 @@ fn complete_snapshot_from_path(
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
         replace_from: 0,
+        source_line: 0,
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false)
+    let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false, 0)
         .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
     let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
     let original_len = outcome.messages.len();
@@ -3961,6 +4005,7 @@ pub(crate) fn load_session_snapshot(
         cursor.checkpoint.state.clone(),
         cursor.checkpoint.clone(),
         true,
+        0,
     ) {
         Ok(outcome) => outcome,
         Err(()) => {
@@ -15385,6 +15430,7 @@ mod tests {
             SessionSnapshotLoad::Unchanged { .. }
         ));
 
+        LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(|count| count.set(0));
         append_rollout_lines(
             &current_path,
             &[assistant_message_line(
@@ -15424,6 +15470,11 @@ mod tests {
                 }
                 _ => panic!("an appended current page should return an exact replacement suffix"),
             };
+        assert_eq!(
+            LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(std::cell::Cell::get),
+            0,
+            "an eligible append must not rematerialize the proven paginated lineage"
+        );
         let mut projected = initial_messages;
         projected.splice(replacement.0.., replacement.1);
         let complete = finalize_loaded_messages(
@@ -15476,6 +15527,137 @@ mod tests {
                     .contains("changed! ancestor"));
             }
             _ => panic!("a changed accepted ancestor prefix must use the complete fallback"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_replays_an_incomplete_current_line_without_rematerializing_lineage() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_thread_id, _base_path, current_path) =
+            write_paginated_rollout_pair(&codex_home, false);
+        let path_text = current_path.to_string_lossy();
+        let (mut projected, initial_cursor) =
+            match load_session_snapshot(&path_text, None).expect("initial snapshot should load") {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("initial paginated snapshot should expose a cursor"),
+            };
+
+        let appended =
+            assistant_message_line("2026-09-03T22:23:00Z", 5, "completed after a partial write")
+                .to_string();
+        let split = appended.len() / 2;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&current_path)
+            .expect("current rollout should open for append");
+        file.write_all(&appended.as_bytes()[..split])
+            .expect("partial rollout line should append");
+        file.sync_all().expect("partial rollout line should flush");
+        drop(file);
+
+        LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(|count| count.set(0));
+        let partial_cursor = match load_session_snapshot(&path_text, Some(&initial_cursor))
+            .expect("partial append should remain cursor-safe")
+        {
+            SessionSnapshotLoad::Unchanged { cursor } => cursor,
+            _ => panic!("an incomplete line must remain outside the accepted prefix"),
+        };
+        assert_eq!(
+            LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(std::cell::Cell::get),
+            0,
+            "a partial append must not rematerialize the proven lineage"
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&current_path)
+            .expect("current rollout should reopen for append");
+        file.write_all(&appended.as_bytes()[split..])
+            .expect("remaining rollout line should append");
+        file.write_all(b"\n")
+            .expect("completed rollout line should terminate");
+        file.sync_all()
+            .expect("completed rollout line should flush");
+        drop(file);
+
+        LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(|count| count.set(0));
+        match load_session_snapshot(&path_text, Some(&partial_cursor))
+            .expect("completed append should replay from the parser checkpoint")
+        {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                projected.splice(replace_from.., messages);
+            }
+            _ => panic!("the completed line should return an exact replacement"),
+        }
+        assert_eq!(
+            LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(std::cell::Cell::get),
+            0,
+            "completing a partial line must not rematerialize the proven lineage"
+        );
+
+        let complete = finalize_loaded_messages(
+            parse_live_rollout(&current_path).expect("complete paginated parse should load"),
+        );
+        assert_eq!(message_values(&projected), message_values(&complete));
+        assert!(serde_json::to_string(&projected)
+            .unwrap()
+            .contains("completed after a partial write"));
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_falls_back_when_the_checkpoint_precedes_the_current_carrier() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_thread_id, _base_path, current_path) =
+            write_paginated_rollout_pair(&codex_home, false);
+        let path_text = current_path.to_string_lossy();
+        let cursor = match load_session_snapshot(&path_text, None)
+            .expect("initial paginated snapshot should load")
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("initial paginated snapshot should expose a cursor"),
+        };
+        let mut decoded = decode_snapshot_cursor(&cursor).expect("cursor should decode");
+        decoded.checkpoint.byte_offset = 0;
+        decoded.checkpoint.source_line = 0;
+        let ancestor_checkpoint = encode_snapshot_cursor(&decoded).expect("cursor should encode");
+        append_rollout_lines(
+            &current_path,
+            &[assistant_message_line(
+                "2026-09-03T22:23:00Z",
+                5,
+                "append after an ancestor checkpoint",
+            )],
+        );
+
+        match load_session_snapshot(&path_text, Some(&ancestor_checkpoint))
+            .expect("an ancestor checkpoint should fall back safely")
+        {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "checkpoint-before-current-carrier");
+                assert!(serde_json::to_string(&messages)
+                    .unwrap()
+                    .contains("append after an ancestor checkpoint"));
+            }
+            _ => panic!("a checkpoint in ancestry must use the complete projection"),
         }
     }
 
