@@ -171,9 +171,19 @@ struct CodexHistoryBase {
 struct CodexRolloutHeader {
     session_id: String,
     forked_from_id: Option<String>,
+    subagent_provenance: Option<SubagentProvenance>,
     history_mode: Option<String>,
     history_base: Option<CodexHistoryBase>,
     first_ordinal: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexSubagentRelation {
+    pub(crate) actual_session_id: String,
+    pub(crate) file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forked_from_id: Option<String>,
+    pub(crate) subagent_provenance: SubagentProvenance,
 }
 
 #[derive(Clone, Debug)]
@@ -1770,6 +1780,10 @@ fn parse_rollout_header(bytes: &[u8]) -> Result<Option<CodexRolloutHeader>, Stri
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(String::from),
+            subagent_provenance: codex_subagent_provenance(
+                value.get("timestamp"),
+                payload.get("source"),
+            ),
             history_mode: payload
                 .get("history_mode")
                 .and_then(Value::as_str)
@@ -2308,6 +2322,262 @@ pub(crate) fn load_session_metadata_by_path(
         project_path,
         is_archived,
     }))
+}
+
+/// Resolve one canonical Codex thread id without parsing unrelated rollouts.
+/// SQLite owns the selected carrier for paginated threads; otherwise rollout
+/// filenames provide a bounded discovery index before the exact path loader
+/// applies its confinement, cache, current-carrier, and live-overlay checks.
+pub(crate) fn load_session_metadata_by_id(
+    session_id: &str,
+) -> Result<Option<CodexSessionListing>, String> {
+    if !is_canonical_session_id(session_id) {
+        return Ok(None);
+    }
+    let base_path_string = get_base_path().ok_or("Codex base path not found")?;
+    crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
+    let base_path = PathBuf::from(&base_path_string);
+
+    if let Some(selection) = load_sqlite_rollout_selections(&base_path).get(session_id) {
+        let selected_path = normalize_sqlite_rollout_path(&selection.rollout_path);
+        if selected_path.is_file() {
+            if let Ok(Some(listing)) =
+                load_session_metadata_by_path(&selected_path.to_string_lossy())
+            {
+                return Ok((listing.session.actual_session_id == session_id).then_some(listing));
+            }
+        }
+        if selection.history_mode.as_deref() == Some("paginated") {
+            return Ok(None);
+        }
+    }
+
+    let mut legacy = Vec::<PathBuf>::new();
+    let mut paginated = Vec::<(String, String, PathBuf)>::new();
+    for root in [
+        base_path.join("sessions"),
+        base_path.join("archived_sessions"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| is_discoverable_rollout(entry.path()))
+        {
+            let Some(identity) = rollout_file_identity(entry.path()) else {
+                continue;
+            };
+            if identity.thread_id != session_id {
+                continue;
+            }
+            let rollout_path = entry.into_path();
+            let header = read_rollout_header(&rollout_path).ok().flatten();
+            if header.as_ref().is_some_and(|header| {
+                !header.session_id.is_empty() && header.session_id != session_id
+            }) {
+                continue;
+            }
+            if header
+                .as_ref()
+                .and_then(|header| header.history_mode.as_deref())
+                == Some("paginated")
+            {
+                paginated.push((identity.ordering_key, identity.rollout_id, rollout_path));
+            } else {
+                legacy.push(rollout_path);
+            }
+        }
+    }
+    let logical_match_count = legacy.len() + usize::from(!paginated.is_empty());
+    if logical_match_count > 1 {
+        return Err(format!(
+            "'{session_id}' is ambiguous — {logical_match_count} codex sessions match; use a session path"
+        ));
+    }
+    let rollout_path = if let Some(rollout_path) = legacy.pop() {
+        rollout_path
+    } else if let Some((_, _, rollout_path)) = paginated
+        .into_iter()
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+    {
+        rollout_path
+    } else {
+        return Ok(None);
+    };
+    let listing = load_session_metadata_by_path(&rollout_path.to_string_lossy())?;
+    Ok(listing.filter(|listing| listing.session.actual_session_id == session_id))
+}
+
+/// Read only provider-authenticated rollout headers needed to discover the
+/// current descendant graph for one Codex parent. This deliberately avoids the
+/// provider-wide title, summary, count, and message metadata work performed by
+/// `load_all_sessions`.
+pub(crate) fn load_session_subagent_relations(
+    parent_session_id: &str,
+) -> Result<Vec<CodexSubagentRelation>, String> {
+    if !is_canonical_session_id(parent_session_id) {
+        return Err("Codex subagent parent must be a canonical session id".to_string());
+    }
+    let base_path_string = get_base_path().ok_or("Codex base path not found")?;
+    crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
+    let base_path = PathBuf::from(base_path_string);
+    let selections = load_sqlite_rollout_selections(&base_path);
+    let metadata_cache = load_session_metadata_cache(&base_path);
+
+    #[derive(Clone)]
+    struct Candidate {
+        relation: Option<CodexSubagentRelation>,
+        session_id: String,
+        history_mode: Option<String>,
+        ordering_key: String,
+        rollout_id: String,
+        rollout_path: PathBuf,
+    }
+
+    let mut candidates = Vec::new();
+    for root in [
+        base_path.join("sessions"),
+        base_path.join("archived_sessions"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| is_discoverable_rollout(entry.path()))
+        {
+            let rollout_path = entry.into_path();
+            let cached_info = session_metadata_cache_key(&base_path, &rollout_path)
+                .and_then(|key| metadata_cache.entries.get(&key))
+                .filter(|cached| {
+                    session_info_fingerprint(&rollout_path).as_ref() == Some(&cached.fingerprint)
+                })
+                .map(|cached| &cached.info);
+            let (session_id, forked_from_id, subagent_provenance, history_mode) =
+                if let Some(info) = cached_info {
+                    (
+                        info.session_id.clone(),
+                        info.forked_from_id.clone(),
+                        info.subagent_provenance.clone(),
+                        info.history_mode.clone(),
+                    )
+                } else {
+                    let Ok(Some(header)) = read_rollout_header(&rollout_path) else {
+                        continue;
+                    };
+                    (
+                        header.session_id,
+                        header.forked_from_id,
+                        header.subagent_provenance,
+                        header.history_mode,
+                    )
+                };
+            if session_id.is_empty() {
+                continue;
+            }
+            let identity = rollout_file_identity(&rollout_path);
+            let relation = subagent_provenance.map(|subagent_provenance| CodexSubagentRelation {
+                actual_session_id: session_id.clone(),
+                file_path: rollout_path.to_string_lossy().to_string(),
+                forked_from_id: forked_from_id.clone(),
+                subagent_provenance,
+            });
+            candidates.push(Candidate {
+                relation,
+                session_id,
+                history_mode,
+                ordering_key: identity
+                    .as_ref()
+                    .map(|identity| identity.ordering_key.clone())
+                    .unwrap_or_default(),
+                rollout_id: identity
+                    .map(|identity| identity.rollout_id)
+                    .unwrap_or_default(),
+                rollout_path,
+            });
+        }
+    }
+
+    let mut current = Vec::new();
+    let mut paginated = HashMap::<String, Vec<Candidate>>::new();
+    for candidate in candidates {
+        if candidate.history_mode.as_deref() == Some("paginated")
+            && !candidate.rollout_id.is_empty()
+        {
+            paginated
+                .entry(candidate.session_id.clone())
+                .or_default()
+                .push(candidate);
+        } else {
+            current.push(candidate);
+        }
+    }
+    for (session_id, mut pages) in paginated {
+        if let Some(selection) = selections.get(&session_id) {
+            if let Some(index) = pages.iter().position(|candidate| {
+                rollout_paths_match(&candidate.rollout_path, &selection.rollout_path)
+            }) {
+                current.push(pages.swap_remove(index));
+                continue;
+            }
+            if selection.history_mode.as_deref() == Some("paginated") {
+                continue;
+            }
+        }
+        if let Some(selected) = pages.into_iter().max_by(|left, right| {
+            left.ordering_key
+                .cmp(&right.ordering_key)
+                .then_with(|| left.rollout_id.cmp(&right.rollout_id))
+        }) {
+            current.push(selected);
+        }
+    }
+
+    let mut children = HashMap::<String, Vec<CodexSubagentRelation>>::new();
+    for relation in current
+        .into_iter()
+        .filter_map(|candidate| candidate.relation)
+    {
+        let Some(parent) = relation
+            .subagent_provenance
+            .parent_session_id
+            .as_ref()
+            .filter(|parent| !parent.is_empty())
+        else {
+            continue;
+        };
+        children.entry(parent.clone()).or_default().push(relation);
+    }
+    for relations in children.values_mut() {
+        relations.sort_by(|left, right| {
+            left.actual_session_id
+                .cmp(&right.actual_session_id)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
+    }
+
+    let mut descendants = Vec::new();
+    let mut pending = vec![parent_session_id.to_string()];
+    let mut next = 0usize;
+    let mut visited = HashSet::new();
+    while next < pending.len() {
+        let parent = pending[next].clone();
+        next += 1;
+        for relation in children.get(&parent).into_iter().flatten() {
+            if visited.insert(relation.actual_session_id.clone()) {
+                pending.push(relation.actual_session_id.clone());
+                descendants.push(relation.clone());
+            }
+        }
+    }
+    Ok(descendants)
 }
 
 fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
@@ -4300,6 +4570,10 @@ fn is_uuid_text(value: &str) -> bool {
         })
 }
 
+pub(crate) fn is_canonical_session_id(value: &str) -> bool {
+    is_uuid_text(value) && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
 /// Stable logical-thread and immutable-rollout identities encoded by Codex.
 ///
 /// Ordinary names end in `<thread-id>`. Paginated replacements keep that id
@@ -4455,6 +4729,27 @@ fn load_sqlite_rollout_selections(base_path: &Path) -> HashMap<String, SqliteRol
             )
         })
         .collect()
+}
+
+fn normalize_sqlite_rollout_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        // Codex persists Windows paths with the verbatim prefix. The exact-path
+        // loader intentionally performs lexical root confinement before its
+        // canonical check, so convert only this provider-owned representation
+        // back to the equivalent ordinary drive/UNC form first.
+        if raw
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            return PathBuf::from(format!(r"\\{}", &raw[8..]));
+        }
+        if let Some(ordinary) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(ordinary);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn rollout_paths_match(left: &Path, right: &Path) -> bool {
@@ -7213,6 +7508,142 @@ mod tests {
 
         assert_eq!(load_all_sessions().unwrap().len(), 2);
         assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_by_native_id_parses_only_the_selected_rollout() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("28");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let target_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d6";
+        let other_id = "01a0903e-6b82-7df3-8892-5e67623a4b9c";
+        write_codex_rollout(
+            &sessions_dir,
+            &format!("rollout-2026-09-28T10-00-00-{target_id}.jsonl"),
+            target_id,
+            "C:/Repo",
+            "target prompt",
+        );
+        write_codex_rollout(
+            &sessions_dir,
+            &format!("rollout-2026-09-28T09-00-00-{other_id}.jsonl"),
+            other_id,
+            "C:/Other",
+            "other prompt",
+        );
+        SESSION_INFO_PARSE_COUNT.store(0, Ordering::SeqCst);
+
+        let targeted = load_session_metadata_by_id(target_id)
+            .expect("targeted metadata should load")
+            .expect("targeted session should remain listed");
+
+        assert_eq!(targeted.session.actual_session_id, target_id);
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 1);
+        assert!(load_session_metadata_by_id("not-a-canonical-id")
+            .expect("noncanonical ids should be clean misses")
+            .is_none());
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_session_metadata_preserves_legacy_duplicate_ambiguity() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let session_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d6";
+        for timestamp in ["10-00-00", "11-00-00"] {
+            write_codex_rollout(
+                &sessions_dir,
+                &format!("rollout-2026-09-28T{timestamp}-{session_id}.jsonl"),
+                session_id,
+                "C:/Repo",
+                "duplicate prompt",
+            );
+        }
+        SESSION_INFO_PARSE_COUNT.store(0, Ordering::SeqCst);
+
+        let error = match load_session_metadata_by_id(session_id) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate legacy rows should remain ambiguous"),
+        };
+
+        assert!(error.contains("ambiguous"));
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn targeted_subagent_relations_read_headers_without_parsing_unrelated_rollouts() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("28");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let parent_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d6";
+        let child_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d7";
+        let grandchild_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d8";
+        let unrelated_id = "01a0903e-6b82-7df3-8892-5e67623a4b9c";
+        let write = |id: &str, parent: Option<&str>, agent_path: &str| {
+            let source = parent.map(|parent| {
+                json!({
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent,
+                            "agent_path": agent_path,
+                            "agent_nickname": "worker"
+                        }
+                    }
+                })
+            });
+            write_rollout_lines(
+                &sessions_dir,
+                &format!("rollout-2026-09-28T10-00-00-{id}.jsonl"),
+                &[json!({
+                    "timestamp": "2026-09-28T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": id, "cwd": "C:/Repo", "source": source }
+                })],
+            )
+        };
+        write(parent_id, None, "/root");
+        let child_path = write(child_id, Some(parent_id), "/root/child");
+        write(grandchild_id, Some(child_id), "/root/child/grandchild");
+        write(unrelated_id, None, "/unrelated");
+        SESSION_INFO_PARSE_COUNT.store(0, Ordering::SeqCst);
+
+        let relations =
+            load_session_subagent_relations(parent_id).expect("targeted relations should load");
+
+        assert_eq!(
+            relations
+                .iter()
+                .map(|relation| relation.actual_session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![child_id, grandchild_id]
+        );
+        assert_eq!(relations[0].file_path, child_path.to_string_lossy());
+        assert_eq!(
+            relations[0]
+                .subagent_provenance
+                .parent_session_id
+                .as_deref(),
+            Some(parent_id)
+        );
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -15353,13 +15784,24 @@ mod tests {
         let codex_home = tmp.path().join("codex-home");
         let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
         let (thread_id, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
-        create_paginated_state_db(&codex_home, &thread_id, &current_path);
+        #[cfg(windows)]
+        let selected_path = PathBuf::from(format!(r"\\?\{}", current_path.display()));
+        #[cfg(not(windows))]
+        let selected_path = current_path.clone();
+        create_paginated_state_db(&codex_home, &thread_id, &selected_path);
 
         let sessions = load_all_sessions().expect("paginated listing should succeed");
         assert_eq!(sessions.len(), 1, "one logical thread must have one row");
         assert_eq!(sessions[0].session.actual_session_id, thread_id);
         assert!(rollout_paths_match(
             Path::new(&sessions[0].session.file_path),
+            &current_path
+        ));
+        let targeted = load_session_metadata_by_id(&thread_id)
+            .expect("targeted paginated lookup should succeed")
+            .expect("the selected carrier should remain visible");
+        assert!(rollout_paths_match(
+            Path::new(&targeted.session.file_path),
             &current_path
         ));
         let projects = scan_projects_from_path(&codex_home.to_string_lossy())

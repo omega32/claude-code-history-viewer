@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.3] - 2026-09-28
+
+### Changed
+
+- Headless Codex session metadata now resolves canonical native UUIDs through the current exact rollout carrier instead of a provider-wide metadata listing, including Codex's verbatim Windows SQLite paths, and the additive `codex-session-subagents-v1` relation wire discovers one parent's current descendants from authenticated rollout headers without rebuilding unrelated session metadata.
+
 ## [1.23.0] - 2026-09-25
 
 ### Added

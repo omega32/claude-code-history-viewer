@@ -211,7 +211,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "audit-codex-authorship",
             "capabilities",
         ],
-        features: vec!["image-artifacts-v1"],
+        features: vec!["image-artifacts-v1", "codex-session-subagents-v1"],
     };
     emit_json(args, &caps)
 }
@@ -770,13 +770,14 @@ Return one authoritative session-listing row, or null when the session is no\n\
 longer listed. An absolute Codex rollout or Copilot carrier path is loaded\n\
 directly without a provider-wide scan. --provider defaults to 'claude'.";
 
-const SUBAGENT_LIST_USAGE: &str = "Usage: --list-session-subagents <session-id|session-path> --provider claude [--format json] [--output <file>]\n\n\
-Return structurally discovered Claude child transcript relations for one parent\n\
-session. Regular children include `spawned_at` only when their sibling meta file's\n\
-tool id uniquely matches a parent Agent/Task call. Child transcript content is not\n\
-returned or merged.";
+const SUBAGENT_LIST_USAGE: &str = "Usage: --list-session-subagents <session-id|session-path> --provider <claude|codex> [--format json] [--output <file>]\n\n\
+Return structurally discovered child transcript relations for one parent session.\n\
+Claude regular children include `spawned_at` only when their sibling meta file's\n\
+tool id uniquely matches a parent Agent/Task call. Codex requires a canonical\n\
+native session id and returns the current provider-authenticated descendant graph.\n\
+Child transcript content is not returned or merged.";
 
-/// Handle the read-only Claude child-relation command.
+/// Handle the read-only provider child-relation command.
 pub fn run_list_session_subagents(args: &[String]) -> i32 {
     let Some(selector) = extract_flag_value(args, "--list-session-subagents") else {
         eprintln!("{SUBAGENT_LIST_USAGE}");
@@ -784,17 +785,24 @@ pub fn run_list_session_subagents(args: &[String]) -> i32 {
     };
     let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
     let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
-    if provider != "claude" || format != "json" {
+    if !matches!(provider.as_str(), "claude" | "codex") || format != "json" {
         eprintln!("{SUBAGENT_LIST_USAGE}");
         return 2;
     }
 
-    let result = block_on(async {
-        let session_path = resolve_session_path("claude", &selector).await?;
-        crate::commands::session::get_session_subagents(session_path).await
-    });
+    let result = if provider == "codex" {
+        codex::load_session_subagent_relations(&selector).and_then(|relations| {
+            serde_json::to_value(relations).map_err(|error| error.to_string())
+        })
+    } else {
+        block_on(async {
+            let session_path = resolve_session_path("claude", &selector).await?;
+            crate::commands::session::get_session_subagents(session_path).await
+        })
+        .and_then(|relations| serde_json::to_value(relations).map_err(|error| error.to_string()))
+    };
     match result {
-        Ok(sessions) => emit_json(args, &sessions),
+        Ok(relations) => emit_json(args, &relations),
         Err(error) => {
             eprintln!("{error}");
             1
@@ -1895,6 +1903,11 @@ async fn session_metadata(
         return codex::load_session_metadata_by_path(selector)
             .map(|listed| listed.map(|row| wrap_codex_listing(row, &imports)));
     }
+    if provider == "codex" && codex::is_canonical_session_id(selector) {
+        let imports = codex::external_agent_imports();
+        return codex::load_session_metadata_by_id(selector)
+            .map(|listed| listed.map(|row| wrap_codex_listing(row, &imports)));
+    }
     if provider == "copilot" && looks_like_session_path(selector) {
         let classifier = CopilotClassifier::new(provider);
         return copilot::load_session_metadata_by_path(selector).map(|listed| {
@@ -2082,7 +2095,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(value["api_version"], HEADLESS_API_VERSION);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["features"], json!(["image-artifacts-v1"]));
+        assert_eq!(
+            value["features"],
+            json!(["image-artifacts-v1", "codex-session-subagents-v1"])
+        );
         assert_eq!(
             value["commands"],
             json!([
@@ -2188,6 +2204,70 @@ mod tests {
         assert_eq!(rows[0]["tool_use_id"], "toolu_agent");
         assert_eq!(rows[0]["spawned_at"], "2026-08-09T12:00:00Z");
         assert!(rows[0]["workflow_run_id"].is_null());
+    }
+
+    #[test]
+    #[serial]
+    fn list_session_subagents_emits_targeted_codex_descendants() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let parent_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d6";
+        let child_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d7";
+        std::fs::write(
+            sessions.join(format!("rollout-2026-09-28T10-00-00-{parent_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-09-28T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": parent_id, "cwd": "C:/Repo" }
+                })
+            ),
+        )
+        .unwrap();
+        let child = sessions.join(format!("rollout-2026-09-28T10-00-01-{child_id}.jsonl"));
+        std::fs::write(
+            &child,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-09-28T10:00:01Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "cwd": "C:/Repo",
+                        "source": { "subagent": { "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "agent_path": "/root/child"
+                        } } }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let output = temp.path().join("codex-subagents.json");
+        let argv = args(&[
+            "viewer",
+            "--list-session-subagents",
+            parent_id,
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+
+        assert_eq!(run_list_session_subagents(&argv), 0);
+        let rows: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["actual_session_id"], child_id);
+        assert_eq!(rows[0]["file_path"], child.to_string_lossy().as_ref());
+        assert_eq!(
+            rows[0]["subagent_provenance"]["parent_session_id"],
+            parent_id
+        );
     }
 
     #[test]
@@ -2891,9 +2971,10 @@ mod tests {
         let archived_dir = codex_home.join("archived_sessions");
         std::fs::create_dir_all(&archived_dir).unwrap();
         let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
-        let rollout = archived_dir.join("rollout-targeted.jsonl");
+        let session_id = "01a0bb2f-24a5-7712-8e2d-dbf43a5057d6";
+        let rollout = archived_dir.join(format!("rollout-2026-09-28T10-00-00-{session_id}.jsonl"));
         let records = [
-            json!({"type":"session_meta","payload":{"id":"targeted-thread","cwd":"/redacted/project","source":"vscode"}}),
+            json!({"type":"session_meta","payload":{"id":session_id,"cwd":"/redacted/project","source":"vscode"}}),
             json!({"type":"response_item","payload":{"type":"message","role":"user","created_at":"2026-08-07T00:00:00Z","content":[{"type":"input_text","text":"hello"}]}}),
         ];
         std::fs::write(
@@ -2912,7 +2993,7 @@ mod tests {
                 "records": [{
                     "source_path": "/home/test/.claude/projects/source.jsonl",
                     "content_sha256": "abc",
-                    "imported_thread_id": "targeted-thread",
+                    "imported_thread_id": session_id,
                     "imported_at": 1,
                     "source_modified_at": 1
                 }]
@@ -2935,19 +3016,25 @@ mod tests {
         assert_eq!(listed.len(), 1);
 
         let metadata_output = temp.path().join("metadata.json");
-        let metadata_args = args(&[
-            "viewer",
-            "--session-metadata",
-            rollout.to_str().unwrap(),
-            "--provider",
-            "codex",
-            "--output",
-            metadata_output.to_str().unwrap(),
-        ]);
-        assert_eq!(run_session_metadata(&metadata_args), 0);
+        let metadata_args = |selector: &str| {
+            args(&[
+                "viewer",
+                "--session-metadata",
+                selector,
+                "--provider",
+                "codex",
+                "--output",
+                metadata_output.to_str().unwrap(),
+            ])
+        };
+        for selector in [rollout.to_str().unwrap(), session_id] {
+            assert_eq!(run_session_metadata(&metadata_args(selector)), 0);
+            let targeted: Value =
+                serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
+            assert_eq!(targeted, listed[0]);
+        }
         let targeted: Value =
             serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
-        assert_eq!(targeted, listed[0]);
         assert_eq!(targeted["is_archived"], true);
         assert_eq!(targeted["is_imported"], true);
         assert_eq!(targeted["imported_from"], "claude");
@@ -2957,14 +3044,14 @@ mod tests {
             serde_json::to_vec(&json!({ "records": [] })).unwrap(),
         )
         .unwrap();
-        assert_eq!(run_session_metadata(&metadata_args), 0);
+        assert_eq!(run_session_metadata(&metadata_args(session_id)), 0);
         let refreshed: Value =
             serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
         assert_eq!(refreshed["is_imported"], false);
         assert!(refreshed.get("imported_from").is_none());
 
         std::fs::remove_file(&rollout).unwrap();
-        assert_eq!(run_session_metadata(&metadata_args), 0);
+        assert_eq!(run_session_metadata(&metadata_args(session_id)), 0);
         let missing: Value =
             serde_json::from_slice(&std::fs::read(&metadata_output).unwrap()).unwrap();
         assert!(missing.is_null());
