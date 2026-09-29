@@ -21,6 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -45,6 +46,9 @@ const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
 const SNAPSHOT_CURSOR_VERSION: u32 = 22;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
+const SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES: usize = 512 * 1024 * 1024;
+const SUPPLEMENTAL_HISTORY_MAX_REPLAYED_DECODED_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const SUPPLEMENTAL_HISTORY_MAX_GROUPS: usize = 64;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
 
@@ -191,6 +195,85 @@ struct RolloutFileIdentity {
     thread_id: String,
     rollout_id: String,
     ordering_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexSessionHistory {
+    #[serde(rename = "schemaVersion")]
+    pub(crate) schema_version: u32,
+    pub(crate) provider: &'static str,
+    #[serde(rename = "sessionId")]
+    pub(crate) session_id: String,
+    pub(crate) primary: Vec<ClaudeMessage>,
+    pub(crate) supplemental: Vec<CodexSupplementalHistoryGroup>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexSupplementalHistoryGroup {
+    pub(crate) reason: &'static str,
+    pub(crate) carrier: CodexSupplementalCarrier,
+    pub(crate) accepted_prefix: CodexSourceBounds,
+    pub(crate) tail: CodexSourceBounds,
+    pub(crate) source_fingerprint: CodexSourceFingerprint,
+    pub(crate) anchors: CodexSupplementalAnchors,
+    pub(crate) messages: Vec<ClaudeMessage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexSupplementalCarrier {
+    pub(crate) scheme: &'static str,
+    pub(crate) id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexSourceBounds {
+    pub(crate) byte_start: u64,
+    pub(crate) byte_end_exclusive: u64,
+    pub(crate) ordinal_start: u64,
+    pub(crate) ordinal_end_exclusive: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexSourceFingerprint {
+    pub(crate) algorithm: &'static str,
+    pub(crate) encoding: &'static str,
+    pub(crate) byte_domain: &'static str,
+    pub(crate) byte_length: u64,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexSupplementalAnchors {
+    pub(crate) before: RecordRef,
+    pub(crate) after: RecordRef,
+}
+
+#[derive(Debug)]
+struct CapturedCodexLineageCarrier {
+    canonical_path: PathBuf,
+    identity: RolloutFileIdentity,
+    header: CodexRolloutHeader,
+    history_base: Option<CodexHistoryBase>,
+    bytes: Vec<u8>,
+    accepted_len: usize,
+    metadata: std::fs::Metadata,
+}
+
+struct CodexLineageCapture {
+    carriers: Vec<CapturedCodexLineageCarrier>,
+    remaining_decoded_bytes: usize,
+}
+
+struct PendingCodexSupplementalGroup {
+    carrier: CodexSupplementalCarrier,
+    accepted_prefix: CodexSourceBounds,
+    tail: CodexSourceBounds,
+    source_fingerprint: CodexSourceFingerprint,
+    boundary_projection: Vec<ClaudeMessage>,
+    messages: Vec<ClaudeMessage>,
 }
 
 #[derive(Debug)]
@@ -1757,6 +1840,42 @@ fn read_rollout_bytes(path: &Path) -> Result<RolloutBytes, String> {
     Ok(RolloutBytes::Mapped(mmap))
 }
 
+#[allow(unsafe_code)] // Required for mmap performance optimization
+fn read_rollout_bytes_bounded(
+    path: &Path,
+    max_decoded_bytes: usize,
+) -> Result<RolloutBytes, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let is_compressed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"));
+    if is_compressed {
+        let decoder = zstd::Decoder::new(std::io::BufReader::new(file))
+            .map_err(|error| format!("Failed to decompress rollout: {error}"))?;
+        let limit = u64::try_from(max_decoded_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| "Codex supplemental decoded-byte limit is unsupported".to_string())?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("Failed to decompress rollout: {error}"))?;
+        if bytes.len() > max_decoded_bytes {
+            return Err("Codex supplemental history exceeds the decoded-byte limit".to_string());
+        }
+        return Ok(RolloutBytes::Owned(bytes));
+    }
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.len() > u64::try_from(max_decoded_bytes).unwrap_or(u64::MAX) {
+        return Err("Codex supplemental history exceeds the decoded-byte limit".to_string());
+    }
+    // SAFETY: The file is opened read-only and the mapping is only read.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|error| error.to_string())?;
+    Ok(RolloutBytes::Mapped(mmap))
+}
+
 fn parse_rollout_header(bytes: &[u8]) -> Result<Option<CodexRolloutHeader>, String> {
     let mut header = None;
     for_each_jsonl_line(bytes, |line| {
@@ -2763,6 +2882,7 @@ fn append_rollout_lineage(
     seen: &mut HashSet<String>,
     output: &mut Vec<u8>,
     segments: &mut Vec<CodexSnapshotLineageSegment>,
+    mut captured: Option<&mut CodexLineageCapture>,
 ) -> Result<(), String> {
     const MAX_LINEAGE_DEPTH: usize = 128;
     let identity = rollout_file_identity(rollout_path).ok_or_else(|| {
@@ -2781,7 +2901,17 @@ fn append_rollout_lineage(
         ));
     }
 
-    let bytes = read_rollout_bytes(rollout_path)?;
+    let metadata = captured
+        .is_some()
+        .then(|| fs::metadata(rollout_path).map_err(|error| error.to_string()))
+        .transpose()?;
+    let bytes = if let Some(capture) = captured.as_deref_mut() {
+        let bytes = read_rollout_bytes_bounded(rollout_path, capture.remaining_decoded_bytes)?;
+        capture.remaining_decoded_bytes -= bytes.len();
+        bytes
+    } else {
+        read_rollout_bytes(rollout_path)?
+    };
     let header = parse_rollout_header(&bytes)?.ok_or_else(|| {
         format!(
             "Codex paginated rollout has no session_meta: {}",
@@ -2812,6 +2942,7 @@ fn append_rollout_lineage(
             seen,
             output,
             segments,
+            captured.as_deref_mut(),
         )?;
     }
     let cutoff = match bounded_by {
@@ -2825,6 +2956,17 @@ fn append_rollout_lineage(
             .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
         accepted_digest: digest_bytes(&bytes[..cutoff]),
     });
+    if let (Some(captured), Some(metadata)) = (captured, metadata) {
+        captured.carriers.push(CapturedCodexLineageCarrier {
+            canonical_path: rollout_path.to_path_buf(),
+            identity,
+            header,
+            history_base: bounded_by.cloned(),
+            bytes: bytes.to_vec(),
+            accepted_len: cutoff,
+            metadata,
+        });
+    }
     Ok(())
 }
 
@@ -2857,8 +2999,79 @@ fn logical_rollout_bytes(
         &mut HashSet::new(),
         &mut bytes,
         &mut segments,
+        None,
     )?;
     Ok((bytes, selected_header, segments))
+}
+
+fn captured_logical_rollout_bytes(
+    base_path: &Path,
+    selected_path: &Path,
+) -> Result<
+    (
+        Vec<u8>,
+        CodexRolloutHeader,
+        Vec<CapturedCodexLineageCarrier>,
+    ),
+    String,
+> {
+    let mut bytes = Vec::new();
+    let mut segments = Vec::new();
+    let mut captured = CodexLineageCapture {
+        carriers: Vec::new(),
+        remaining_decoded_bytes: SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES,
+    };
+    append_rollout_lineage(
+        base_path,
+        selected_path,
+        None,
+        &mut HashSet::new(),
+        &mut bytes,
+        &mut segments,
+        Some(&mut captured),
+    )?;
+    let selected_header = captured
+        .carriers
+        .last()
+        .map(|carrier| carrier.header.clone())
+        .ok_or_else(|| "Codex paginated lineage is empty".to_string())?;
+    Ok((bytes, selected_header, captured.carriers))
+}
+
+fn parse_logical_rollout_bytes(
+    canonical_path: &Path,
+    header: &CodexRolloutHeader,
+    bytes: &[u8],
+) -> Result<Vec<ClaudeMessage>, String> {
+    parse_logical_rollout_outcome(canonical_path, header, bytes).map(|outcome| outcome.messages)
+}
+
+fn parse_logical_rollout_outcome(
+    canonical_path: &Path,
+    header: &CodexRolloutHeader,
+    bytes: &[u8],
+) -> Result<CodexParseOutcome, String> {
+    let ranges = find_line_ranges(bytes);
+    let mut state = CodexParserState::initial(canonical_path);
+    state.meta_seen = true;
+    state.session_id = if header.session_id.is_empty() {
+        session_id_from_rollout_filename(canonical_path).unwrap_or_default()
+    } else {
+        header.session_id.clone()
+    };
+    state
+        .forked_from_session_id
+        .clone_from(&header.forked_from_id);
+    let checkpoint = CodexParserCheckpoint {
+        byte_offset: 0,
+        replace_from: 0,
+        source_line: 0,
+        state: state.clone(),
+        detached_active_lanes: Vec::new(),
+    };
+    parse_rollout_slice(bytes, &ranges, state, checkpoint, false, 0).map_err(|()| {
+        "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
+    })
 }
 
 fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
@@ -2871,27 +3084,7 @@ fn parse_live_rollout(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, Strin
     }
     let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
     let (bytes, header, _) = logical_rollout_bytes(&base_path, canonical_path)?;
-    let ranges = find_line_ranges(&bytes);
-    let mut state = CodexParserState::initial(canonical_path);
-    state.meta_seen = true;
-    state.session_id = if header.session_id.is_empty() {
-        session_id_from_rollout_filename(canonical_path).unwrap_or_default()
-    } else {
-        header.session_id
-    };
-    state.forked_from_session_id = header.forked_from_id;
-    let checkpoint = CodexParserCheckpoint {
-        byte_offset: 0,
-        replace_from: 0,
-        source_line: 0,
-        state: state.clone(),
-        detached_active_lanes: Vec::new(),
-    };
-    parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0)
-        .map(|outcome| outcome.messages)
-        .map_err(|()| {
-            "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
-        })
+    parse_logical_rollout_bytes(canonical_path, &header, &bytes)
 }
 
 /// Load all messages from a Codex rollout file
@@ -2911,7 +3104,11 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 #[allow(unsafe_code)] // Required for mmap performance optimization
 pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
     let mmap = read_rollout_bytes(canonical_path)?;
-    let ranges = find_line_ranges(&mmap);
+    parse_rollout_bytes(canonical_path, &mmap)
+}
+
+fn parse_rollout_bytes(canonical_path: &Path, bytes: &[u8]) -> Result<Vec<ClaudeMessage>, String> {
+    let ranges = find_line_ranges(bytes);
     let state = CodexParserState::initial(canonical_path);
     let checkpoint = CodexParserCheckpoint {
         byte_offset: 0,
@@ -2920,9 +3117,391 @@ pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMess
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    parse_rollout_slice(&mmap, &ranges, state, checkpoint, false, 0)
+    parse_rollout_slice(bytes, &ranges, state, checkpoint, false, 0)
         .map(|outcome| outcome.messages)
         .map_err(|()| "Codex rollout unexpectedly referenced an earlier prefix".to_string())
+}
+
+fn message_vectors_match(left: &[ClaudeMessage], right: &[ClaudeMessage]) -> Result<bool, String> {
+    let left = serde_json::to_vec(left)
+        .map_err(|error| format!("Failed to compare normalized Codex messages: {error}"))?;
+    let right = serde_json::to_vec(right)
+        .map_err(|error| format!("Failed to compare normalized Codex messages: {error}"))?;
+    Ok(left == right)
+}
+
+fn require_message_prefix(
+    prefix: &[ClaudeMessage],
+    complete: &[ClaudeMessage],
+    boundary: &str,
+) -> Result<(), String> {
+    if prefix.len() > complete.len() || !message_vectors_match(prefix, &complete[..prefix.len()])? {
+        return Err(format!(
+            "Codex supplemental history changes normalized messages across the {boundary} boundary"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_supplemental_ordinal_range(
+    bytes: &[u8],
+    start_ordinal: u64,
+    range_name: &str,
+) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Ok(start_ordinal);
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(format!(
+            "Codex supplemental {range_name} ends with an incomplete final JSONL record"
+        ));
+    }
+    let mut expected = start_ordinal;
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+        if line.is_empty() {
+            return Err(format!(
+                "Codex supplemental {range_name} contains an empty JSONL record"
+            ));
+        }
+        let mut buffer = line.to_vec();
+        let value: Value = simd_json::from_slice(&mut buffer)
+            .map_err(|_| format!("Codex supplemental {range_name} contains malformed JSON"))?;
+        let ordinal = value
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!("Codex supplemental {range_name} record has no integer ordinal")
+            })?;
+        if ordinal != expected {
+            return Err(format!(
+                "Codex supplemental {range_name} ordinal {ordinal} does not match expected ordinal {expected}"
+            ));
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| format!("Codex supplemental {range_name} ordinal overflowed"))?;
+    }
+    Ok(expected)
+}
+
+fn validate_supplemental_authorship(messages: &[ClaudeMessage]) -> Result<(), String> {
+    let authored = messages.iter().filter(|message| {
+        message.message_type == "user"
+            && matches!(
+                message.subtype.as_deref(),
+                Some(AUTHORED_USER_SUBTYPE | STEER_SUBTYPE)
+            )
+    });
+    let mut count = 0usize;
+    for message in authored {
+        count += 1;
+        if !message.record_ref.as_ref().is_some_and(|record_ref| {
+            record_ref.version == 1
+                && record_ref.scope == "session"
+                && record_ref.scheme == "codex-response-item"
+        }) {
+            return Err(
+                "Codex supplemental authored input has no certified codex-response-item recordRef"
+                    .to_string(),
+            );
+        }
+    }
+    if count == 0 {
+        return Err("Codex supplemental tail has no certified authored user turn".to_string());
+    }
+    Ok(())
+}
+
+fn validate_history_record_refs<'a>(
+    message_sets: impl IntoIterator<Item = &'a [ClaudeMessage]>,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for messages in message_sets {
+        for record_ref in messages
+            .iter()
+            .filter_map(|message| message.record_ref.as_ref())
+        {
+            if !seen.insert(record_ref.clone()) {
+                return Err(
+                    "Codex supplemental history contains a duplicate certified recordRef"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_captured_history_sources(
+    base_path: &Path,
+    carriers: &[CapturedCodexLineageCarrier],
+) -> Result<(), String> {
+    for carrier in carriers {
+        if carrier.history_base.is_some() {
+            let resolved = find_rollout_path_by_id(base_path, &carrier.identity.rollout_id)?;
+            if !rollout_paths_match(&resolved, &carrier.canonical_path) {
+                return Err(
+                    "Codex supplemental carrier identity changed during capture".to_string()
+                );
+            }
+        }
+        let after = fs::metadata(&carrier.canonical_path).map_err(|error| error.to_string())?;
+        if !metadata_stayed_stable(&carrier.metadata, &after) {
+            return Err("Codex supplemental source changed during capture".to_string());
+        }
+        let verified = read_rollout_bytes_bounded(&carrier.canonical_path, carrier.bytes.len())?;
+        if &*verified != carrier.bytes.as_slice() {
+            return Err("Codex supplemental source fingerprint changed during capture".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn stable_non_paginated_history(canonical_path: &Path) -> Result<CodexSessionHistory, String> {
+    let before = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
+    let bytes = read_rollout_bytes_bounded(
+        canonical_path,
+        SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES,
+    )?;
+    let header = parse_rollout_header(&bytes)?;
+    if header
+        .as_ref()
+        .is_some_and(|header| header.history_base.is_some())
+    {
+        return Err("Codex history source changed pagination mode during capture".to_string());
+    }
+    let session_id = header
+        .map(|header| header.session_id)
+        .filter(|id| !id.is_empty())
+        .or_else(|| session_id_from_rollout_filename(canonical_path))
+        .ok_or_else(|| "Codex history source has no stable logical session id".to_string())?;
+    let primary = finalize_loaded_messages(parse_rollout_bytes(canonical_path, &bytes)?);
+    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
+    let verified = read_rollout_bytes_bounded(canonical_path, bytes.len())?;
+    if !metadata_stayed_stable(&before, &after) || *verified != *bytes {
+        return Err("Codex history source changed during capture".to_string());
+    }
+    Ok(CodexSessionHistory {
+        schema_version: 1,
+        provider: "codex",
+        session_id,
+        primary,
+        supplemental: Vec::new(),
+    })
+}
+
+/// Load the ordinary Codex projection plus independently certified superseded
+/// tails from same-thread paginated carriers.
+pub(crate) fn load_session_history(session_path: &str) -> Result<CodexSessionHistory, String> {
+    let path = Path::new(session_path);
+    if !path.exists() {
+        return Err(format!("Session file not found: {session_path}"));
+    }
+    let canonical_path = validate_session_path(path, session_path)?;
+    let selected_bytes = read_rollout_bytes_bounded(
+        &canonical_path,
+        SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES,
+    )?;
+    let selected_header = parse_rollout_header(&selected_bytes)?;
+    if !selected_header
+        .as_ref()
+        .is_some_and(|header| header.history_base.is_some())
+    {
+        return stable_non_paginated_history(&canonical_path);
+    }
+
+    let base_path = PathBuf::from(get_base_path().ok_or("Codex base path not found")?);
+    let (logical_bytes, selected_header, carriers) =
+        captured_logical_rollout_bytes(&base_path, &canonical_path)?;
+    let session_id = (!selected_header.session_id.is_empty())
+        .then(|| selected_header.session_id.clone())
+        .or_else(|| session_id_from_rollout_filename(&canonical_path))
+        .ok_or_else(|| "Codex paginated history has no stable logical session id".to_string())?;
+    let captured_bytes = carriers
+        .iter()
+        .try_fold(0usize, |total, carrier| {
+            total.checked_add(carrier.bytes.len())
+        })
+        .ok_or_else(|| "Codex supplemental history decoded-byte size overflowed".to_string())?;
+    if captured_bytes > SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES {
+        return Err("Codex supplemental history exceeds the decoded-byte limit".to_string());
+    }
+
+    let primary_raw =
+        parse_logical_rollout_bytes(&canonical_path, &selected_header, &logical_bytes)?;
+    let primary = finalize_loaded_messages(primary_raw);
+    let mut accepted_bytes = Vec::with_capacity(logical_bytes.len());
+    let mut pending = Vec::<PendingCodexSupplementalGroup>::new();
+    let mut replayed_decoded_bytes = logical_bytes.len();
+
+    for carrier in &carriers {
+        let prefix_before_carrier = accepted_bytes.len();
+        accepted_bytes.extend_from_slice(&carrier.bytes[..carrier.accepted_len]);
+        let Some(history_base) = carrier.history_base.as_ref() else {
+            continue;
+        };
+        if carrier.accepted_len == carrier.bytes.len() || carrier.identity.thread_id != session_id {
+            // A fork may retain a parent thread's accepted prefix, but its
+            // abandoned parent tail is not superseded history of the child.
+            continue;
+        }
+        if pending.len() >= SUPPLEMENTAL_HISTORY_MAX_GROUPS {
+            return Err("Codex supplemental history exceeds the group limit".to_string());
+        }
+
+        let accepted_ordinal_start = carrier
+            .header
+            .first_ordinal
+            .ok_or_else(|| "Codex supplemental carrier has no first ordinal".to_string())?;
+        let accepted_ordinal_end = validate_supplemental_ordinal_range(
+            &carrier.bytes[..carrier.accepted_len],
+            accepted_ordinal_start,
+            "accepted prefix",
+        )?;
+        if accepted_ordinal_end != history_base.end_ordinal_exclusive {
+            return Err(format!(
+                "Codex supplemental accepted prefix ends at ordinal {accepted_ordinal_end}, expected {}",
+                history_base.end_ordinal_exclusive
+            ));
+        }
+        let tail_end_ordinal = validate_supplemental_ordinal_range(
+            &carrier.bytes[carrier.accepted_len..],
+            history_base.end_ordinal_exclusive,
+            "tail",
+        )?;
+
+        let complete_carrier_len = prefix_before_carrier
+            .checked_add(carrier.bytes.len())
+            .ok_or_else(|| "Codex supplemental replay size overflowed".to_string())?;
+        replayed_decoded_bytes = replayed_decoded_bytes
+            .checked_add(accepted_bytes.len())
+            .and_then(|bytes| bytes.checked_add(complete_carrier_len))
+            .ok_or_else(|| "Codex supplemental replay size overflowed".to_string())?;
+        if replayed_decoded_bytes > SUPPLEMENTAL_HISTORY_MAX_REPLAYED_DECODED_BYTES {
+            return Err("Codex supplemental history exceeds the replay-byte limit".to_string());
+        }
+        let accepted_outcome =
+            parse_logical_rollout_outcome(&canonical_path, &selected_header, &accepted_bytes)?;
+        if usize::try_from(accepted_outcome.checkpoint.byte_offset).ok()
+            != Some(accepted_bytes.len())
+            || !accepted_outcome.checkpoint.detached_active_lanes.is_empty()
+        {
+            return Err(
+                "Codex supplemental accepted prefix is not a completed parser checkpoint"
+                    .to_string(),
+            );
+        }
+        let mut complete_carrier_bytes = Vec::with_capacity(complete_carrier_len);
+        complete_carrier_bytes.extend_from_slice(&accepted_bytes[..prefix_before_carrier]);
+        complete_carrier_bytes.extend_from_slice(&carrier.bytes);
+        let complete_outcome = parse_logical_rollout_outcome(
+            &canonical_path,
+            &selected_header,
+            &complete_carrier_bytes,
+        )?;
+        if usize::try_from(complete_outcome.checkpoint.byte_offset).ok()
+            != Some(complete_carrier_bytes.len())
+            || !complete_outcome.checkpoint.detached_active_lanes.is_empty()
+        {
+            return Err(
+                "Codex supplemental tail does not end at a completed parser checkpoint".to_string(),
+            );
+        }
+        require_message_prefix(
+            &accepted_outcome.messages,
+            &complete_outcome.messages,
+            "raw history_base",
+        )?;
+        let raw_messages = complete_outcome.messages[accepted_outcome.messages.len()..].to_vec();
+        let boundary_projection = finalize_loaded_messages(accepted_outcome.messages);
+        let complete_projection = finalize_loaded_messages(complete_outcome.messages);
+        require_message_prefix(
+            &boundary_projection,
+            &complete_projection,
+            "finalized history_base",
+        )?;
+        let messages = finalize_loaded_messages(raw_messages);
+        let projected_suffix = &complete_projection[boundary_projection.len()..];
+        if !message_vectors_match(&messages, projected_suffix)? {
+            return Err("Codex supplemental tail is not independently normalizable".to_string());
+        }
+        validate_supplemental_authorship(&messages)?;
+
+        pending.push(PendingCodexSupplementalGroup {
+            carrier: CodexSupplementalCarrier {
+                scheme: "codex-rollout",
+                id: carrier.identity.rollout_id.clone(),
+            },
+            accepted_prefix: CodexSourceBounds {
+                byte_start: 0,
+                byte_end_exclusive: u64::try_from(carrier.accepted_len)
+                    .map_err(|_| "Codex supplemental byte offset is too large".to_string())?,
+                ordinal_start: accepted_ordinal_start,
+                ordinal_end_exclusive: history_base.end_ordinal_exclusive,
+            },
+            tail: CodexSourceBounds {
+                byte_start: u64::try_from(carrier.accepted_len)
+                    .map_err(|_| "Codex supplemental byte offset is too large".to_string())?,
+                byte_end_exclusive: u64::try_from(carrier.bytes.len())
+                    .map_err(|_| "Codex supplemental byte offset is too large".to_string())?,
+                ordinal_start: history_base.end_ordinal_exclusive,
+                ordinal_end_exclusive: tail_end_ordinal,
+            },
+            source_fingerprint: CodexSourceFingerprint {
+                algorithm: "blake3",
+                encoding: "base64url-no-pad",
+                byte_domain: "decoded-jsonl",
+                byte_length: u64::try_from(carrier.bytes.len())
+                    .map_err(|_| "Codex supplemental source is too large".to_string())?,
+                value: digest_bytes(&carrier.bytes),
+            },
+            boundary_projection,
+            messages,
+        });
+    }
+
+    let mut record_ref_sets = Vec::with_capacity(pending.len() + 1);
+    record_ref_sets.push(primary.as_slice());
+    record_ref_sets.extend(pending.iter().map(|group| group.messages.as_slice()));
+    validate_history_record_refs(record_ref_sets)?;
+
+    let mut supplemental = Vec::with_capacity(pending.len());
+    for group in pending {
+        require_message_prefix(&group.boundary_projection, &primary, "primary placement")?;
+        let boundary = group.boundary_projection.len();
+        let before = primary[..boundary]
+            .iter()
+            .rev()
+            .find_map(|message| message.record_ref.clone())
+            .ok_or_else(|| {
+                "Codex supplemental history has no certified preceding primary anchor".to_string()
+            })?;
+        let after = primary[boundary..]
+            .iter()
+            .find_map(|message| message.record_ref.clone())
+            .ok_or_else(|| {
+                "Codex supplemental history has no certified following primary anchor".to_string()
+            })?;
+        supplemental.push(CodexSupplementalHistoryGroup {
+            reason: "superseded-history-base-tail",
+            carrier: group.carrier,
+            accepted_prefix: group.accepted_prefix,
+            tail: group.tail,
+            source_fingerprint: group.source_fingerprint,
+            anchors: CodexSupplementalAnchors { before, after },
+            messages: group.messages,
+        });
+    }
+
+    verify_captured_history_sources(&base_path, &carriers)?;
+    Ok(CodexSessionHistory {
+        schema_version: 1,
+        provider: "codex",
+        session_id,
+        primary,
+        supplemental,
+    })
 }
 
 pub(crate) fn validate_authorship_audit_path(session_path: &Path) -> Result<PathBuf, String> {
@@ -16374,6 +16953,28 @@ mod tests {
         let parent_cutoff = fs::metadata(&parent_path)
             .expect("parent rollout metadata")
             .len();
+        append_rollout_lines(
+            &parent_path,
+            &[
+                paginated_user_item_line(
+                    "2026-09-03T19:02:00Z",
+                    2,
+                    "parent-superseded-turn",
+                    "parent-superseded-user",
+                    "parent superseded history",
+                ),
+                assistant_message_line("2026-09-03T19:02:01Z", 3, "parent superseded answer"),
+                json!({
+                    "timestamp": "2026-09-03T19:02:02Z",
+                    "ordinal": 4,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "parent-superseded-turn"
+                    }
+                }),
+            ],
+        );
         let child_path = write_rollout_lines(
             &sessions_dir,
             &format!("rollout-2026-09-03T16-00-00-{child_id}_{child_rollout_id}.jsonl"),
@@ -16407,6 +17008,12 @@ mod tests {
         assert!(messages
             .iter()
             .all(|message| message.session_id == child_id));
+        let history = load_session_history(&child_path.to_string_lossy())
+            .expect("cross-thread history should remain available without parent tails");
+        assert!(history.supplemental.is_empty());
+        assert!(!serde_json::to_string(&history.primary)
+            .unwrap()
+            .contains("parent superseded history"));
     }
 
     #[test]
@@ -16421,5 +17028,584 @@ mod tests {
         let error = load_messages(&current_path.to_string_lossy())
             .expect_err("misaligned history cutoff must fail closed");
         assert!(error.contains("history_base"), "unexpected error: {error}");
+    }
+
+    fn paginated_user_item_line(
+        timestamp: &str,
+        ordinal: u64,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+    ) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "ordinal": ordinal,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": turn_id,
+                "item": {
+                    "type": "UserMessage",
+                    "id": item_id,
+                    "content": [{ "type": "text", "text": text }]
+                }
+            }
+        })
+    }
+
+    fn write_paginated_history_fixture(
+        codex_home: &Path,
+        tail_item_id: &str,
+    ) -> (PathBuf, PathBuf) {
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("29");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let thread_id = "01a10000-0000-7000-8000-000000000001";
+        let rollout_id = "01a10000-0000-7000-8000-000000000002";
+        let base_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-29T10-00-00-{thread_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-29T13:00:00Z",
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated"
+                    }
+                }),
+                paginated_user_item_line(
+                    "2026-09-29T13:00:01Z",
+                    1,
+                    "turn-retained",
+                    "user-retained",
+                    "retained user",
+                ),
+                json!({
+                    "timestamp": "2026-09-29T13:00:02Z",
+                    "ordinal": 2,
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-retained" }
+                }),
+            ],
+        );
+        let cutoff = fs::metadata(&base_path)
+            .expect("base metadata should load")
+            .len();
+        append_rollout_lines(
+            &base_path,
+            &[
+                paginated_user_item_line(
+                    "2026-09-29T13:01:00Z",
+                    3,
+                    "turn-superseded",
+                    tail_item_id,
+                    "superseded user",
+                ),
+                assistant_message_line("2026-09-29T13:01:01Z", 4, "superseded answer"),
+                json!({
+                    "timestamp": "2026-09-29T13:01:02Z",
+                    "ordinal": 5,
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-superseded" }
+                }),
+            ],
+        );
+        let current_path = write_rollout_lines(
+            &sessions_dir,
+            &format!("rollout-2026-09-29T11-00-00-{thread_id}_{rollout_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-29T14:00:00Z",
+                    "ordinal": 3,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": thread_id,
+                            "end_ordinal_exclusive": 3,
+                            "end_byte_offset": cutoff
+                        }
+                    }
+                }),
+                paginated_user_item_line(
+                    "2026-09-29T14:00:01Z",
+                    4,
+                    "turn-current",
+                    "user-current",
+                    "current user",
+                ),
+                assistant_message_line("2026-09-29T14:00:02Z", 5, "current answer"),
+                json!({
+                    "timestamp": "2026-09-29T14:00:03Z",
+                    "ordinal": 6,
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-current" }
+                }),
+            ],
+        );
+        (base_path, current_path)
+    }
+
+    fn update_history_base_cutoff(current_path: &Path, ancestor_path: &Path, line_count: usize) {
+        let ancestor = fs::read(ancestor_path).expect("ancestor fixture should be readable");
+        let cutoff = ancestor
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+            .nth(line_count - 1)
+            .expect("ancestor fixture should contain the accepted prefix");
+        let body = fs::read_to_string(current_path).expect("current fixture should be readable");
+        let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut header: Value =
+            serde_json::from_str(&lines[0]).expect("current fixture header should parse");
+        header["payload"]["history_base"]["end_byte_offset"] = json!(cutoff);
+        lines[0] = header.to_string();
+        fs::write(current_path, format!("{}\n", lines.join("\n")))
+            .expect("current fixture should be replaceable");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_preserves_primary_and_certifies_the_superseded_tail() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+
+        let history = load_session_history(&current_path.to_string_lossy())
+            .expect("supplemental history should load");
+        let ordinary = finalize_loaded_messages(
+            load_messages(&current_path.to_string_lossy()).expect("ordinary history should load"),
+        );
+        assert_eq!(history.schema_version, 1);
+        assert_eq!(history.provider, "codex");
+        assert_eq!(history.session_id, "01a10000-0000-7000-8000-000000000001");
+        assert_eq!(
+            serde_json::to_value(&history.primary).unwrap(),
+            serde_json::to_value(&ordinary).unwrap(),
+            "the primary lane must remain byte-shape equivalent to the ordinary dump"
+        );
+        assert_eq!(history.supplemental.len(), 1);
+        let group = &history.supplemental[0];
+        assert_eq!(group.reason, "superseded-history-base-tail");
+        assert_eq!(group.carrier.scheme, "codex-rollout");
+        assert_eq!(group.carrier.id, "01a10000-0000-7000-8000-000000000001");
+        assert_eq!(group.accepted_prefix.byte_start, 0);
+        assert_eq!(group.accepted_prefix.ordinal_start, 0);
+        assert_eq!(group.accepted_prefix.ordinal_end_exclusive, 3);
+        assert_eq!(
+            group.tail.byte_start,
+            group.accepted_prefix.byte_end_exclusive
+        );
+        assert_eq!(group.tail.ordinal_start, 3);
+        assert_eq!(group.tail.ordinal_end_exclusive, 6);
+        assert_eq!(group.source_fingerprint.algorithm, "blake3");
+        assert_eq!(group.source_fingerprint.encoding, "base64url-no-pad");
+        assert_eq!(group.source_fingerprint.byte_domain, "decoded-jsonl");
+        assert_eq!(
+            group.source_fingerprint.byte_length,
+            fs::read(&base_path).unwrap().len() as u64
+        );
+        assert_eq!(group.anchors.before.id, "user-retained");
+        assert_eq!(group.anchors.after.id, "user-current");
+        let primary = serde_json::to_string(&history.primary).unwrap();
+        let supplemental = serde_json::to_string(&group.messages).unwrap();
+        assert!(primary.contains("retained user"));
+        assert!(primary.contains("current user"));
+        assert!(!primary.contains("superseded user"));
+        assert!(supplemental.contains("superseded user"));
+        assert!(supplemental.contains("superseded answer"));
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_uses_decoded_bounds_for_compressed_ancestors() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let decoded = fs::read(&base_path).expect("base fixture should be readable");
+        let compressed_path = PathBuf::from(format!("{}.zst", base_path.display()));
+        fs::write(
+            &compressed_path,
+            zstd::encode_all(decoded.as_slice(), 3).expect("base fixture should compress"),
+        )
+        .expect("compressed ancestor should be written");
+        fs::remove_file(&base_path).expect("plain ancestor should be removed");
+
+        let history = load_session_history(&current_path.to_string_lossy())
+            .expect("compressed supplemental history should load");
+        assert_eq!(history.supplemental.len(), 1);
+        let group = &history.supplemental[0];
+        assert_eq!(group.source_fingerprint.byte_domain, "decoded-jsonl");
+        assert_eq!(group.source_fingerprint.byte_length, decoded.len() as u64);
+        assert_eq!(group.tail.byte_end_exclusive, decoded.len() as u64);
+        assert!(serde_json::to_string(&group.messages)
+            .unwrap()
+            .contains("superseded user"));
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_preserves_oldest_to_newest_lineage_order() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_base_path, middle_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let middle_cutoff = fs::metadata(&middle_path)
+            .expect("middle metadata should load")
+            .len();
+        append_rollout_lines(
+            &middle_path,
+            &[
+                paginated_user_item_line(
+                    "2026-09-29T14:01:00Z",
+                    7,
+                    "turn-middle-superseded",
+                    "user-middle-superseded",
+                    "middle superseded user",
+                ),
+                assistant_message_line("2026-09-29T14:01:01Z", 8, "middle superseded answer"),
+                json!({
+                    "timestamp": "2026-09-29T14:01:02Z",
+                    "ordinal": 9,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-middle-superseded"
+                    }
+                }),
+            ],
+        );
+        let thread_id = "01a10000-0000-7000-8000-000000000001";
+        let middle_rollout_id = "01a10000-0000-7000-8000-000000000002";
+        let final_rollout_id = "01a10000-0000-7000-8000-000000000003";
+        let final_path = write_rollout_lines(
+            middle_path.parent().unwrap(),
+            &format!("rollout-2026-09-29T12-00-00-{thread_id}_{final_rollout_id}.jsonl"),
+            &[
+                json!({
+                    "timestamp": "2026-09-29T15:00:00Z",
+                    "ordinal": 7,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "C:/Repo",
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": middle_rollout_id,
+                            "end_ordinal_exclusive": 7,
+                            "end_byte_offset": middle_cutoff
+                        }
+                    }
+                }),
+                paginated_user_item_line(
+                    "2026-09-29T15:00:01Z",
+                    8,
+                    "turn-final",
+                    "user-final",
+                    "final user",
+                ),
+                assistant_message_line("2026-09-29T15:00:02Z", 9, "final answer"),
+                json!({
+                    "timestamp": "2026-09-29T15:00:03Z",
+                    "ordinal": 10,
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "turn-final" }
+                }),
+            ],
+        );
+
+        let history = load_session_history(&final_path.to_string_lossy())
+            .expect("recursive supplemental history should load");
+        assert_eq!(history.supplemental.len(), 2);
+        assert_eq!(
+            history
+                .supplemental
+                .iter()
+                .map(|group| group.carrier.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![thread_id, middle_rollout_id]
+        );
+        assert!(serde_json::to_string(&history.supplemental[0].messages)
+            .unwrap()
+            .contains("superseded user"));
+        assert!(serde_json::to_string(&history.supplemental[1].messages)
+            .unwrap()
+            .contains("middle superseded user"));
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_rejects_malformed_or_non_contiguous_tail_records() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+
+        let body = fs::read_to_string(&base_path).expect("base fixture should be readable");
+        fs::write(
+            &base_path,
+            body.replacen("\"ordinal\":3", "\"ordinal\":9", 1),
+        )
+        .expect("base fixture should be replaceable");
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("ordinal drift in a supplemental tail must fail closed");
+        assert!(error.contains("ordinal"), "unexpected error: {error}");
+
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let mut bytes = fs::read(&base_path).expect("base fixture should be readable");
+        bytes.extend_from_slice(b"not-json\n");
+        fs::write(&base_path, bytes).expect("base fixture should be replaceable");
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("malformed supplemental JSON must fail closed");
+        assert!(error.contains("JSON"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_rejects_invalid_intermediate_accepted_prefix_records() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let body = fs::read_to_string(&base_path).expect("base fixture should be readable");
+        fs::write(
+            &base_path,
+            body.replacen("\"ordinal\":1", "\"ordinal\":7", 1),
+        )
+        .expect("base fixture should be replaceable");
+        update_history_base_cutoff(&current_path, &base_path, 3);
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("an accepted-prefix ordinal gap must fail closed");
+        assert!(error.contains("ordinal"), "unexpected error: {error}");
+
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let body = fs::read_to_string(&base_path).expect("base fixture should be readable");
+        let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+        lines[1] = "not-json".to_string();
+        fs::write(&base_path, format!("{}\n", lines.join("\n")))
+            .expect("base fixture should be replaceable");
+        update_history_base_cutoff(&current_path, &base_path, 3);
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("malformed accepted-prefix JSON must fail closed");
+        assert!(error.contains("JSON"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_rejects_a_task_lane_crossing_the_cutoff() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let body = fs::read_to_string(&base_path).expect("base fixture should be readable");
+        fs::write(
+            &base_path,
+            body.replacen("\"type\":\"task_complete\"", "\"type\":\"task_started\"", 1),
+        )
+        .expect("base fixture should be replaceable");
+        update_history_base_cutoff(&current_path, &base_path, 3);
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("an active task lane at the cutoff must fail closed");
+        assert!(
+            error.contains("completed parser checkpoint"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_rejects_an_unresolved_overlapping_tail_lane() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let prefix = fs::read(&base_path).expect("base fixture should be readable");
+        let cutoff = prefix
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+            .nth(2)
+            .expect("base fixture should contain its accepted prefix");
+        fs::write(&base_path, &prefix[..cutoff]).expect("base fixture should be truncated");
+        append_rollout_lines(
+            &base_path,
+            &[
+                json!({
+                    "timestamp": "2026-09-29T13:01:00Z",
+                    "ordinal": 3,
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "tail-stale" }
+                }),
+                paginated_user_item_line(
+                    "2026-09-29T13:01:01Z",
+                    4,
+                    "tail-stale",
+                    "user-tail-stale",
+                    "stale overlapping user",
+                ),
+                json!({
+                    "timestamp": "2026-09-29T13:01:02Z",
+                    "ordinal": 5,
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "tail-completed" }
+                }),
+                paginated_user_item_line(
+                    "2026-09-29T13:01:03Z",
+                    6,
+                    "tail-completed",
+                    "user-tail-completed",
+                    "completed overlapping user",
+                ),
+                assistant_message_line("2026-09-29T13:01:04Z", 7, "completed overlapping answer"),
+                json!({
+                    "timestamp": "2026-09-29T13:01:05Z",
+                    "ordinal": 8,
+                    "type": "event_msg",
+                    "payload": { "type": "task_complete", "turn_id": "tail-completed" }
+                }),
+            ],
+        );
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("an unresolved overlapping tail lane must fail closed");
+        assert!(
+            error.contains("tail does not end at a completed parser checkpoint"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_rejects_record_refs_duplicated_across_lanes() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-current");
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("a certified identity collision must reject supplemental history");
+        assert!(error.contains("recordRef"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_requires_certified_primary_anchors_on_both_sides() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let body = fs::read_to_string(&current_path).expect("current fixture should be readable");
+        fs::write(&current_path, body.replacen("user-current", "", 1))
+            .expect("current fixture should be replaceable");
+
+        let error = load_session_history(&current_path.to_string_lossy())
+            .expect_err("a supplemental tail without a following anchor must fail closed");
+        assert!(
+            error.contains("following primary anchor"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_source_revalidation_detects_excluded_tail_changes() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let (_, _, carriers) = captured_logical_rollout_bytes(&codex_home, &current_path)
+            .expect("history carriers should be captured");
+        append_rollout_lines(
+            &base_path,
+            &[assistant_message_line(
+                "2026-09-29T13:01:03Z",
+                5,
+                "late mutation",
+            )],
+        );
+
+        let error = verify_captured_history_sources(&codex_home, &carriers)
+            .expect_err("changed captured bytes must fail revalidation");
+        assert!(error.contains("changed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_source_revalidation_rejects_new_ambiguous_carriers() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let (_, _, carriers) = captured_logical_rollout_bytes(&codex_home, &current_path)
+            .expect("history carriers should be captured");
+        let duplicate_dir = codex_home
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("29");
+        fs::create_dir_all(&duplicate_dir).expect("archive fixture should be created");
+        fs::copy(
+            &base_path,
+            duplicate_dir.join(base_path.file_name().unwrap()),
+        )
+        .expect("duplicate carrier should be written");
+
+        let error = verify_captured_history_sources(&codex_home, &carriers)
+            .expect_err("a newly ambiguous rollout id must fail revalidation");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_source_revalidation_rejects_a_new_plain_twin() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (base_path, current_path) =
+            write_paginated_history_fixture(&codex_home, "user-superseded");
+        let decoded = fs::read(&base_path).expect("base fixture should be readable");
+        let compressed_path = PathBuf::from(format!("{}.zst", base_path.display()));
+        fs::write(
+            &compressed_path,
+            zstd::encode_all(decoded.as_slice(), 3).expect("base fixture should compress"),
+        )
+        .expect("compressed ancestor should be written");
+        fs::remove_file(&base_path).expect("plain ancestor should be removed");
+        let (_, _, carriers) = captured_logical_rollout_bytes(&codex_home, &current_path)
+            .expect("compressed history carriers should be captured");
+        fs::write(&base_path, &decoded).expect("plain twin should be materialized");
+
+        let error = verify_captured_history_sources(&codex_home, &carriers)
+            .expect_err("a newly materialized plain twin must fail revalidation");
+        assert!(
+            error.contains("identity changed"),
+            "unexpected error: {error}"
+        );
     }
 }

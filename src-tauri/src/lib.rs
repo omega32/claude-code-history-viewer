@@ -111,6 +111,14 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_dump_session(&args));
         }
+        // Opt-in two-lane Codex history export. Superseded paginated tails are
+        // kept separate so the ordinary dump and its turn numbering stay fixed.
+        if args
+            .iter()
+            .any(|a| a == "--dump-session-history" || a.starts_with("--dump-session-history="))
+        {
+            std::process::exit(headless_dump::run_dump_session_history(&args));
+        }
         // Immutable ccmsg backup carrier dump. Its explicit root confinement
         // keeps provider discovery and current indexes out of the read path.
         if args

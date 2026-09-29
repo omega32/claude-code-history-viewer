@@ -1,5 +1,5 @@
-//! Headless normalized session dumps (`--dump-session` and
-//! `--dump-session-snapshot`).
+//! Headless normalized session dumps (`--dump-session`,
+//! `--dump-session-snapshot`, and `--dump-session-history`).
 //!
 //! Routes a session id (or provider-scoped session path) through the
 //! multi-provider registry and prints the normalized `Vec<ClaudeMessage>` as
@@ -22,6 +22,8 @@
 //! verified authored-user boundary; Copilot replays its authoritative source
 //! and hashes the retained normalized prefix before emitting a suffix.
 //! The ordinary `--dump-session` array contract remains unchanged.
+//! `--dump-session-history` is a separate Codex-only, capability-gated export
+//! whose superseded paginated tails remain outside that ordinary array.
 //!
 //! Other companion commands share this file: `--list-sessions` (which also
 //! stamps each session with its decoded project directory, so callers can match
@@ -200,6 +202,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
         commands: vec![
             "dump-session",
             "dump-session-snapshot",
+            "dump-session-history",
             "dump-backup-session",
             "list-sessions",
             "list-session-subagents",
@@ -215,6 +218,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "image-artifacts-v1",
             "codex-session-subagents-v1",
             "stable-record-ref-v1",
+            "supplemental-history-v1",
         ],
     };
     emit_json(args, &caps)
@@ -233,6 +237,11 @@ Return a normalized session envelope. A provider-owned cursor may produce an\n\
 unchanged result or an exact normalized replacement suffix; unsupported or\n\
 unverifiable transitions return the complete message array. The established\n\
 --dump-session array contract remains unchanged.";
+
+const HISTORY_USAGE: &str = "Usage: --dump-session-history <session-id|session-path> --provider codex [--format json] [--output <file>]\n\n\
+Return the unchanged ordinary Codex projection as primary plus independently\n\
+certified superseded paginated carrier tails. Any uncertain supplemental proof\n\
+fails the command without changing the established --dump-session contract.";
 
 const BACKUP_DUMP_USAGE: &str = "Usage: --dump-backup-session <relative-path> --backup-root <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
 Normalize one immutable session carrier confined beneath an explicit verified\n\
@@ -364,6 +373,46 @@ pub fn run_dump_session(args: &[String]) -> i32 {
         }
     };
     emit_json(args, &messages)
+}
+
+/// Handle the capability-gated Codex two-lane history export.
+pub fn run_dump_session_history(args: &[String]) -> i32 {
+    let Some(id) = extract_flag_value(args, "--dump-session-history") else {
+        eprintln!("{HISTORY_USAGE}");
+        return 2;
+    };
+    if has_explicit_empty_flag(args, "--provider")
+        || has_explicit_empty_flag(args, "--format")
+        || has_explicit_empty_flag(args, "--output")
+    {
+        eprintln!("{HISTORY_USAGE}");
+        return 2;
+    }
+    let Some(provider) = extract_flag_value(args, "--provider") else {
+        eprintln!("{HISTORY_USAGE}");
+        return 2;
+    };
+    if provider != "codex" {
+        eprintln!("--dump-session-history currently supports only --provider codex");
+        return 2;
+    }
+    let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
+    if format != "json" {
+        eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
+        return 2;
+    }
+
+    let result = block_on(async {
+        let session_path = resolve_session_path(&provider, &id).await?;
+        codex::load_session_history(&session_path)
+    });
+    match result {
+        Ok(history) => emit_json(args, &history),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
 }
 
 /// Handle the opt-in Codex parser/app-server authorship differential audit.
@@ -2104,7 +2153,8 @@ mod tests {
             json!([
                 "image-artifacts-v1",
                 "codex-session-subagents-v1",
-                "stable-record-ref-v1"
+                "stable-record-ref-v1",
+                "supplemental-history-v1"
             ])
         );
         assert_eq!(
@@ -2112,6 +2162,7 @@ mod tests {
             json!([
                 "dump-session",
                 "dump-session-snapshot",
+                "dump-session-history",
                 "dump-backup-session",
                 "list-sessions",
                 "list-session-subagents",
@@ -2124,6 +2175,112 @@ mod tests {
                 "capabilities"
             ])
         );
+    }
+
+    #[test]
+    fn supplemental_history_command_requires_an_explicit_codex_provider() {
+        assert_eq!(
+            run_dump_session_history(&args(&["viewer", "--dump-session-history", "session-id"])),
+            2
+        );
+        assert_eq!(
+            run_dump_session_history(&args(&[
+                "viewer",
+                "--dump-session-history",
+                "session-id",
+                "--provider",
+                "claude",
+            ])),
+            2
+        );
+        assert_eq!(
+            run_dump_session_history(&args(&[
+                "viewer",
+                "--dump-session-history",
+                "session-id",
+                "--provider",
+                "codex",
+                "--format",
+                "yaml",
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supplemental_history_command_nests_the_unchanged_ordinary_codex_projection() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("29");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_id = "01a10000-0000-7000-8000-000000000010";
+        let rollout = sessions.join(format!("rollout-2026-09-29T12-00-00-{session_id}.jsonl"));
+        let lines = [
+            json!({
+                "timestamp": "2026-09-29T15:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": session_id, "cwd": "C:/Repo" }
+            }),
+            json!({
+                "timestamp": "2026-09-29T15:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "assistant-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ordinary message" }]
+                }
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&rollout, format!("{body}\n")).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let ordinary_output = temp.path().join("ordinary.json");
+        let history_output = temp.path().join("history.json");
+
+        assert_eq!(
+            run_dump_session(&args(&[
+                "viewer",
+                "--dump-session",
+                rollout.to_str().unwrap(),
+                "--provider",
+                "codex",
+                "--output",
+                ordinary_output.to_str().unwrap(),
+            ])),
+            0
+        );
+        assert_eq!(
+            run_dump_session_history(&args(&[
+                "viewer",
+                "--dump-session-history",
+                rollout.to_str().unwrap(),
+                "--provider",
+                "codex",
+                "--output",
+                history_output.to_str().unwrap(),
+            ])),
+            0
+        );
+
+        let ordinary: Value =
+            serde_json::from_slice(&std::fs::read(ordinary_output).unwrap()).unwrap();
+        let history: Value =
+            serde_json::from_slice(&std::fs::read(history_output).unwrap()).unwrap();
+        assert_eq!(history["schemaVersion"], 1);
+        assert_eq!(history["provider"], "codex");
+        assert_eq!(history["sessionId"], session_id);
+        assert_eq!(history["primary"], ordinary);
+        assert_eq!(history["supplemental"], json!([]));
     }
 
     #[test]
