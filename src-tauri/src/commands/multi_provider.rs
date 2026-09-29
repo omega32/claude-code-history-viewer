@@ -1,9 +1,10 @@
-use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, MessagePage};
+use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, MessagePage, RecordRef};
 use crate::providers;
 use crate::utils::parse_rfc3339_utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Parameter for passing custom Claude paths from frontend
@@ -485,8 +486,28 @@ pub async fn load_provider_messages(
 /// headless complete/delta session surfaces.
 pub(crate) fn finalize_loaded_messages(messages: Vec<ClaudeMessage>) -> Vec<ClaudeMessage> {
     let mut messages = merge_tool_execution_messages(messages);
+    clear_duplicate_record_refs(&mut messages);
     hydrate_inference_metadata(&mut messages);
     messages
+}
+
+fn clear_duplicate_record_refs(messages: &mut [ClaudeMessage]) {
+    let mut counts = HashMap::<RecordRef, usize>::new();
+    for record_ref in messages
+        .iter()
+        .filter_map(|message| message.record_ref.as_ref())
+    {
+        *counts.entry(record_ref.clone()).or_default() += 1;
+    }
+    for message in messages {
+        let collides = message
+            .record_ref
+            .as_ref()
+            .is_some_and(|record_ref| counts.get(record_ref).is_some_and(|count| *count > 1));
+        if collides {
+            message.record_ref = None;
+        }
+    }
 }
 
 fn hydrate_inference_metadata(messages: &mut [ClaudeMessage]) {
@@ -1222,6 +1243,7 @@ mod tests {
     fn make_message(message_type: &str, content: Value) -> ClaudeMessage {
         ClaudeMessage {
             uuid: format!("{message_type}-id"),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session-1".to_string(),
             timestamp: "2026-02-19T12:00:00Z".to_string(),
@@ -1575,6 +1597,31 @@ mod tests {
         assert_eq!(
             remaining_user_blocks[2].get("type").and_then(Value::as_str),
             Some("text")
+        );
+    }
+
+    #[test]
+    fn finalization_clears_every_colliding_record_ref() {
+        let mut first = make_message("user", serde_json::json!([{"type":"text","text":"one"}]));
+        first.uuid = "first".to_string();
+        first.record_ref = Some(crate::models::RecordRef::session("native", "duplicate"));
+        let mut second = make_message("user", serde_json::json!([{"type":"text","text":"two"}]));
+        second.uuid = "second".to_string();
+        second.record_ref = Some(crate::models::RecordRef::session("native", "duplicate"));
+        let mut unique = make_message("user", serde_json::json!([{"type":"text","text":"three"}]));
+        unique.uuid = "unique".to_string();
+        unique.record_ref = Some(crate::models::RecordRef::session("native", "unique"));
+
+        let messages = finalize_loaded_messages(vec![first, second, unique]);
+
+        assert_eq!(messages[0].record_ref, None);
+        assert_eq!(messages[1].record_ref, None);
+        assert_eq!(
+            messages[2]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("unique")
         );
     }
 }

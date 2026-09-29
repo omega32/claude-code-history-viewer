@@ -2,7 +2,7 @@ use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
 use crate::models::{
     previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeProject,
-    ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage, SubagentProvenance,
+    ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage, RecordRef, SubagentProvenance,
     TokenUsage,
 };
 use crate::utils::{
@@ -43,7 +43,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 21;
+const SNAPSHOT_CURSOR_VERSION: u32 = 22;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
 /// Snapshot date of the published Codex `ChatGPT` credit rate card used below.
 const CODEX_CREDIT_RATE_CARD_VERSION: &str = "2026-07-31";
@@ -228,6 +228,7 @@ struct ExternalAgentImportRecord {
 struct PendingCodexUserMessage {
     message_index: usize,
     message_id: String,
+    native_record_id: Option<String>,
     source_line: usize,
     response_text: Option<String>,
     single_text_carrier: bool,
@@ -989,6 +990,14 @@ fn project_canonical_user_event(
                 .map(|candidate| candidate.message_index)
         })
         .flatten();
+    let matched_native_record_id = matched_index.and_then(|_| {
+        tracker
+            .lanes
+            .get(&lane_key)
+            .and_then(|lane| lane.pending_user_messages.last())
+            .and_then(|candidate| candidate.native_record_id.clone())
+    });
+    let native_record_id = canonical.id.clone().or(matched_native_record_id);
     let question_reply_carrier = canonical.single_text_carrier
         && (matched_index.is_none()
             || tracker
@@ -1011,6 +1020,8 @@ fn project_canonical_user_event(
         if let Some(id) = canonical.id.as_ref() {
             messages[message_index].uuid.clone_from(id);
         }
+        messages[message_index].record_ref =
+            native_record_id.map(|id| RecordRef::session("codex-response-item", id));
         merge_codex_message_provenance(
             &mut messages[message_index],
             confirmed_turn_id.as_deref(),
@@ -1038,6 +1049,8 @@ fn project_canonical_user_event(
             None,
         );
         message.subtype = Some(subtype.to_string());
+        message.record_ref =
+            native_record_id.map(|id| RecordRef::session("codex-response-item", id));
         merge_codex_message_provenance(
             &mut message,
             confirmed_turn_id.as_deref(),
@@ -3311,6 +3324,8 @@ fn parse_rollout_slice(
                                 authorship_tracker.push_candidate(PendingCodexUserMessage {
                                     message_index,
                                     message_id: messages[message_index].uuid.clone(),
+                                    native_record_id: non_empty_string(payload.get("id"))
+                                        .map(str::to_string),
                                     source_line,
                                     response_text: codex_user_response_text(payload),
                                     single_text_carrier: codex_single_text_carrier(
@@ -11028,7 +11043,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_projects_legacy_user_event_without_response_item() {
+    fn load_messages_projects_legacy_user_event_without_record_ref() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("event-only-user-message.jsonl");
         let lines = [
@@ -11062,6 +11077,7 @@ mod tests {
 
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(users[0].record_ref, None);
         assert_eq!(
             message_data_str(&users[0], "providerTurnId"),
             Some("turn-1")
@@ -11137,7 +11153,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_projects_paginated_completed_user_item() {
+    fn load_messages_projects_paginated_completed_user_item_with_record_ref() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("paginated-user-message.jsonl");
         let lines = [
@@ -11173,6 +11189,14 @@ mod tests {
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].uuid, "canonical-user-1");
         assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        let record_ref = users[0]
+            .record_ref
+            .as_ref()
+            .expect("native completed user item should carry a record ref");
+        assert_eq!(record_ref.version, 1);
+        assert_eq!(record_ref.scope, "session");
+        assert_eq!(record_ref.scheme, "codex-response-item");
+        assert_eq!(record_ref.id, "canonical-user-1");
         assert_eq!(
             message_data_str(&users[0], "providerTurnId"),
             Some("turn-1")
@@ -11390,7 +11414,7 @@ mod tests {
     }
 
     #[test]
-    fn paginated_user_items_in_one_turn_mark_later_input_as_steer() {
+    fn paginated_user_items_in_one_turn_mark_later_input_as_steer_with_record_refs() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("paginated-steer.jsonl");
         let lines = [
@@ -11429,6 +11453,20 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
         assert_eq!(users[1].subtype.as_deref(), Some(STEER_SUBTYPE));
+        assert_eq!(
+            users[0]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("user-1")
+        );
+        assert_eq!(
+            users[1]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("user-2")
+        );
     }
 
     #[test]
@@ -12270,7 +12308,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_classifies_overlapping_task_corridors_per_turn() {
+    fn load_messages_classifies_overlapping_task_corridors_and_record_refs_per_turn() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let rollout_path = tmp.path().join("overlapping-task-context.jsonl");
         let authored = "keep our chat in English";
@@ -12405,22 +12443,45 @@ mod tests {
         assert_eq!(users.len(), 5);
         assert_eq!(users[0].uuid, "context-b");
         assert_eq!(users[0].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(users[0].record_ref, None);
         assert_eq!(users[1].uuid, "authored-b");
         assert_eq!(users[1].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            users[1]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("authored-b")
+        );
         assert_eq!(
             message_data_str(&users[1], "clientMessageId"),
             Some("client-b")
         );
         assert_eq!(users[2].uuid, "context-a");
         assert_eq!(users[2].subtype.as_deref(), Some(INJECTED_CONTEXT_SUBTYPE));
+        assert_eq!(users[2].record_ref, None);
         assert_eq!(users[3].uuid, "authored-a");
         assert_eq!(users[3].subtype.as_deref(), Some(AUTHORED_USER_SUBTYPE));
+        assert_eq!(
+            users[3]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("authored-a")
+        );
         assert_eq!(
             message_data_str(&users[3], "clientMessageId"),
             Some("client-a")
         );
         assert_eq!(users[4].uuid, "steer-a");
         assert_eq!(users[4].subtype.as_deref(), Some(STEER_SUBTYPE));
+        assert_eq!(
+            users[4]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| record_ref.id.as_str()),
+            Some("steer-a")
+        );
         assert_eq!(
             message_data_str(&users[4], "clientMessageId"),
             Some("client-a-steer")

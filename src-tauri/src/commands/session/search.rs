@@ -218,6 +218,7 @@ fn search_in_file(file_path: &PathBuf, matcher: &AhoCorasick) -> Vec<ClaudeMessa
             uuid: log_entry
                 .uuid
                 .unwrap_or_else(|| format!("{}-line-{}", Uuid::new_v4(), line_num + 1)),
+            record_ref: None,
             parent_uuid: log_entry.parent_uuid,
             session_id: log_entry
                 .session_id

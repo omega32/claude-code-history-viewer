@@ -636,6 +636,7 @@ mod tests {
     fn message(uuid: &str, timestamp: &str) -> ClaudeMessage {
         ClaudeMessage {
             uuid: uuid.to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: timestamp.to_string(),

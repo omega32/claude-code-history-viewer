@@ -195,9 +195,35 @@ pub struct RawLogEntry {
     pub attachment: Option<serde_json::Value>,
 }
 
+/// Provider-certified identity of one persisted source record.
+///
+/// Unlike `uuid`, this is present only when an adapter observed a non-empty
+/// native id; generated, content-derived, counter, and positional fallbacks are
+/// deliberately ineligible.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecordRef {
+    pub version: u32,
+    pub scope: String,
+    pub scheme: String,
+    pub id: String,
+}
+
+impl RecordRef {
+    pub fn session(scheme: &str, id: impl Into<String>) -> Self {
+        Self {
+            version: 1,
+            scope: "session".to_string(),
+            scheme: scheme.to_string(),
+            id: id.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeMessage {
     pub uuid: String,
+    #[serde(rename = "recordRef", skip_serializing_if = "Option::is_none")]
+    pub record_ref: Option<RecordRef>,
     #[serde(rename = "parentUuid")]
     pub parent_uuid: Option<String>,
     #[serde(rename = "sessionId")]
@@ -491,9 +517,10 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_message_serialization() {
+    fn test_claude_message_record_ref_serialization() {
         let message = ClaudeMessage {
             uuid: "msg-uuid-123".to_string(),
+            record_ref: Some(RecordRef::session("claude-message", "native-user-1")),
             parent_uuid: Some("parent-uuid".to_string()),
             session_id: "session-123".to_string(),
             timestamp: "2025-06-26T12:00:00Z".to_string(),
@@ -534,12 +561,22 @@ mod tests {
         assert_eq!(deserialized.uuid, "msg-uuid-123");
         assert_eq!(deserialized.session_id, "session-123");
         assert_eq!(deserialized.message_type, "user");
+        assert_eq!(
+            serde_json::to_value(deserialized.record_ref.unwrap()).unwrap(),
+            json!({
+                "version": 1,
+                "scope": "session",
+                "scheme": "claude-message",
+                "id": "native-user-1"
+            })
+        );
     }
 
     #[test]
     fn test_claude_message_with_optional_fields_skipped() {
         let message = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -583,6 +620,7 @@ mod tests {
         assert!(!serialized.contains("stop_reason"));
         assert!(!serialized.contains("costUSD"));
         assert!(!serialized.contains("durationMs"));
+        assert!(!serialized.contains("recordRef"));
     }
 
     #[test]

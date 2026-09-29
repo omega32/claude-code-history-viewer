@@ -524,6 +524,7 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
         // Fake "user" turn so the viewer has a matching pair
         messages.push(ClaudeMessage {
             uuid: format!("{session_id}-{sequence}-u"),
+            record_ref: None,
             parent_uuid: None,
             session_id: session_id.clone(),
             timestamp: timestamp.clone(),
@@ -561,6 +562,7 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
         // Assistant turn with real token usage
         messages.push(ClaudeMessage {
             uuid: format!("{session_id}-{sequence}-a"),
+            record_ref: None,
             parent_uuid: Some(format!("{session_id}-{sequence}-u")),
             session_id: session_id.clone(),
             timestamp,
@@ -672,6 +674,7 @@ pub fn search(query: &str, max_results: usize) -> Result<Vec<ClaudeMessage>, Str
 
         results.push(ClaudeMessage {
             uuid: format!("ag-search-{}-{}", session_id, 0),
+            record_ref: None,
             parent_uuid: None,
             session_id: session_id.clone(),
             timestamp,
@@ -773,6 +776,7 @@ mod tests {
     fn test_merge_tool_names_into_messages_appends_tool_use_blocks() {
         let messages = vec![ClaudeMessage {
             uuid: "assistant-1".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session-123".to_string(),
             timestamp: "2026-04-12T10:00:00Z".to_string(),
@@ -958,6 +962,7 @@ mod tests {
 
             results.push(ClaudeMessage {
                 uuid: format!("ag-search-{}-{}", session_id, 0),
+                record_ref: None,
                 parent_uuid: None,
                 session_id: session_id.clone(),
                 timestamp: last_timestamp,

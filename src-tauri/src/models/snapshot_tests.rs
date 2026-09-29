@@ -17,6 +17,7 @@ mod claude_message_snapshots {
     fn snapshot_user_message() {
         let message = ClaudeMessage {
             uuid: "test-uuid-1234".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session-abc".to_string(),
             timestamp: "2025-01-01T12:00:00Z".to_string(),
@@ -58,6 +59,7 @@ mod claude_message_snapshots {
     fn snapshot_assistant_message() {
         let message = ClaudeMessage {
             uuid: "test-uuid-5678".to_string(),
+            record_ref: None,
             parent_uuid: Some("test-uuid-1234".to_string()),
             session_id: "session-abc".to_string(),
             timestamp: "2025-01-01T12:00:01Z".to_string(),
@@ -107,6 +109,7 @@ mod claude_message_snapshots {
     fn snapshot_forgecode_message() {
         let message = ClaudeMessage {
             uuid: "forgecode://workspace/ws-123/conversation/conv-456/message/3".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "conv-456".to_string(),
             timestamp: "2026-01-10T08:00:10Z".to_string(),
@@ -177,6 +180,7 @@ mod claude_message_snapshots {
     fn snapshot_pi_message() {
         let message = ClaudeMessage {
             uuid: "a1".to_string(),
+            record_ref: None,
             parent_uuid: Some("u1".to_string()),
             session_id: "0197a288-41fb-4cce-8b2d-a027c391b4da".to_string(),
             timestamp: "2026-06-08T20:32:10.000Z".to_string(),
@@ -232,6 +236,7 @@ mod claude_message_snapshots {
     fn snapshot_message_with_tool_use() {
         let message = ClaudeMessage {
             uuid: "test-uuid-tool".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session-abc".to_string(),
             timestamp: "2025-01-01T12:00:02Z".to_string(),

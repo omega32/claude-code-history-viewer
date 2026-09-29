@@ -527,6 +527,7 @@ pub fn build_provider_message(
 ) -> ClaudeMessage {
     ClaudeMessage {
         uuid,
+        record_ref: None,
         parent_uuid: None,
         session_id: session_id.to_string(),
         timestamp,

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-const SNAPSHOT_CURSOR_VERSION: u32 = 1;
+const SNAPSHOT_CURSOR_VERSION: u32 = 2;
 
 /// Detect Claude Code installation
 pub fn detect() -> Option<ProviderInfo> {
@@ -683,6 +683,13 @@ mod tests {
             serde_json::to_value(load_complete_messages(file.path()).expect("ordinary messages"))
                 .expect("ordinary messages")
         );
+        assert_eq!(
+            initial[0]
+                .record_ref
+                .as_ref()
+                .map(|record_ref| (record_ref.scheme.as_str(), record_ref.id.as_str())),
+            Some(("claude-message", "u1"))
+        );
         assert_eq!(snapshot_cursor_replace_from(&cursor).expect("boundary"), 2);
         assert!(matches!(
             load_session_snapshot(&path, Some(&cursor)).expect("unchanged"),
@@ -719,6 +726,32 @@ mod tests {
             snapshot_cursor_replace_from(&next_cursor).expect("next boundary"),
             4
         );
+    }
+
+    #[test]
+    fn snapshot_falls_back_for_an_older_cursor_version() {
+        let file = write_lines(&[
+            user("u1", None, "one"),
+            assistant("a1", "u1", serde_json::json!("answer one")),
+        ]);
+        let path = file.path().to_string_lossy().into_owned();
+        let encoded = match load_session_snapshot(&path, None).expect("initial snapshot") {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("initial snapshot should carry a cursor"),
+        };
+        let mut cursor = decode_snapshot_cursor(&encoded).expect("cursor should decode");
+        cursor.version = SNAPSHOT_CURSOR_VERSION - 1;
+        let incompatible = encode_snapshot_cursor(&cursor).expect("cursor should encode");
+
+        match load_session_snapshot(&path, Some(&incompatible)).expect("fallback snapshot") {
+            SessionSnapshotLoad::Full { reason, .. } => {
+                assert_eq!(reason, "incompatible-cursor");
+            }
+            _ => panic!("an older cursor must force a complete snapshot"),
+        }
     }
 
     #[test]

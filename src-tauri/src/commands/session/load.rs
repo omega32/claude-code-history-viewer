@@ -2,7 +2,7 @@
 
 use crate::models::{
     previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeSession,
-    MessagePage, RawLogEntry,
+    MessagePage, RawLogEntry, RecordRef,
 };
 use crate::utils::{
     extract_project_name, find_line_ranges, find_line_starts, prompt_attachment_name,
@@ -1804,6 +1804,7 @@ fn parse_line_to_message(
 
         return Some(ClaudeMessage {
             uuid,
+            record_ref: None,
             parent_uuid: log_entry.leaf_uuid,
             session_id: log_entry
                 .session_id
@@ -1875,6 +1876,7 @@ fn parse_line_to_message(
 
     Some(ClaudeMessage {
         uuid,
+        record_ref: None,
         parent_uuid: log_entry.parent_uuid,
         session_id: log_entry
             .session_id
@@ -2129,6 +2131,7 @@ fn parse_line_simd(
 
         return Some(ClaudeMessage {
             uuid,
+            record_ref: None,
             parent_uuid: log_entry.leaf_uuid,
             session_id: log_entry
                 .session_id
@@ -2173,6 +2176,11 @@ fn parse_line_simd(
         return None;
     }
 
+    let native_uuid = log_entry
+        .uuid
+        .as_deref()
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string);
     let uuid = log_entry
         .uuid
         .unwrap_or_else(|| format!("{}-line-{}", Uuid::new_v4(), line_num + 1));
@@ -2186,6 +2194,7 @@ fn parse_line_simd(
         if let Some(content) = queued_command_prompt(log_entry.attachment.as_ref()) {
             return Some(ClaudeMessage {
                 uuid,
+                record_ref: None,
                 parent_uuid: log_entry.parent_uuid,
                 session_id: log_entry
                     .session_id
@@ -2271,9 +2280,32 @@ fn parse_line_simd(
         };
 
     let prompt_attachment_data = prompt_file_attachment_data(log_entry.attachment.as_ref());
+    let has_tool_result = log_entry.tool_use_result.is_some()
+        || log_entry.message.as_ref().is_some_and(|message| {
+            message.content.as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                })
+            })
+        });
+    let record_ref = native_uuid.and_then(|native_uuid| {
+        let authored_user = log_entry.message_type == "user"
+            && role.as_deref() == Some("user")
+            && !is_interruption
+            && !is_task_notification
+            && !log_entry.is_compact_summary.unwrap_or(false)
+            && command_subtype.is_none()
+            && !matches!(
+                log_entry.subtype.as_deref(),
+                Some("queued_command" | "task_notification" | "compact_summary" | "local_command")
+            )
+            && !has_tool_result;
+        authored_user.then(|| RecordRef::session("claude-message", native_uuid))
+    });
 
     Some(ClaudeMessage {
         uuid,
+        record_ref,
         parent_uuid: log_entry.parent_uuid,
         session_id: log_entry
             .session_id
@@ -4872,6 +4904,34 @@ mod tests {
         let mut pbytes = plain.as_bytes().to_vec();
         let pmsg = parse_line_simd(0, &mut pbytes, false).expect("plain user should parse");
         assert_eq!(pmsg.subtype, None);
+    }
+
+    #[test]
+    fn claude_authored_user_record_ref_requires_a_native_uuid() {
+        let native = r#"{"type":"user","uuid":"native-user-1","sessionId":"s1","timestamp":"2026-09-29T10:00:00Z","message":{"role":"user","content":"hello"}}"#;
+        let mut native_bytes = native.as_bytes().to_vec();
+        let native_message =
+            parse_line_simd(0, &mut native_bytes, false).expect("native user should parse");
+        let record_ref = native_message
+            .record_ref
+            .expect("native authored user should carry a record ref");
+        assert_eq!(record_ref.version, 1);
+        assert_eq!(record_ref.scope, "session");
+        assert_eq!(record_ref.scheme, "claude-message");
+        assert_eq!(record_ref.id, "native-user-1");
+
+        let missing = r#"{"type":"user","sessionId":"s1","timestamp":"2026-09-29T10:00:01Z","message":{"role":"user","content":"fallback"}}"#;
+        let mut missing_bytes = missing.as_bytes().to_vec();
+        let missing_message =
+            parse_line_simd(1, &mut missing_bytes, false).expect("fallback user should parse");
+        assert!(missing_message.uuid.ends_with("-line-2"));
+        assert_eq!(missing_message.record_ref, None);
+
+        let compact = r#"{"type":"user","uuid":"compact-1","sessionId":"s1","timestamp":"2026-09-29T10:00:02Z","isCompactSummary":true,"message":{"role":"user","content":"summary"}}"#;
+        let mut compact_bytes = compact.as_bytes().to_vec();
+        let compact_message =
+            parse_line_simd(2, &mut compact_bytes, false).expect("compact summary should parse");
+        assert_eq!(compact_message.record_ref, None);
     }
 
     #[test]

@@ -211,7 +211,11 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "audit-codex-authorship",
             "capabilities",
         ],
-        features: vec!["image-artifacts-v1", "codex-session-subagents-v1"],
+        features: vec![
+            "image-artifacts-v1",
+            "codex-session-subagents-v1",
+            "stable-record-ref-v1",
+        ],
     };
     emit_json(args, &caps)
 }
@@ -2097,7 +2101,11 @@ mod tests {
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             value["features"],
-            json!(["image-artifacts-v1", "codex-session-subagents-v1"])
+            json!([
+                "image-artifacts-v1",
+                "codex-session-subagents-v1",
+                "stable-record-ref-v1"
+            ])
         );
         assert_eq!(
             value["commands"],

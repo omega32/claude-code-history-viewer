@@ -3546,6 +3546,7 @@ impl TryFrom<RawLogEntry> for ClaudeMessage {
             uuid: log_entry
                 .uuid
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            record_ref: None,
             parent_uuid: log_entry.parent_uuid,
             session_id: log_entry
                 .session_id
@@ -4017,6 +4018,7 @@ mod tests {
     ) -> ClaudeMessage {
         ClaudeMessage {
             uuid: "test-uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session-123".to_string(),
             timestamp: "2025-06-26T10:00:00Z".to_string(),
@@ -4391,6 +4393,7 @@ mod tests {
     fn test_extract_token_usage_from_usage_field() {
         let msg = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -4443,6 +4446,7 @@ mod tests {
     fn test_extract_token_usage_from_content() {
         let msg = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -4494,6 +4498,7 @@ mod tests {
     fn test_extract_token_usage_from_tool_use_result() {
         let msg = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -4543,6 +4548,7 @@ mod tests {
     fn test_extract_token_usage_from_total_tokens() {
         let msg = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -4589,6 +4595,7 @@ mod tests {
     fn test_extract_token_usage_empty() {
         let msg = ClaudeMessage {
             uuid: "uuid".to_string(),
+            record_ref: None,
             parent_uuid: None,
             session_id: "session".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),

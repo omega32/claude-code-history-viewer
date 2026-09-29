@@ -167,6 +167,7 @@ impl MessageBuilder {
             uuid: self
                 .uuid
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            record_ref: None,
             parent_uuid: self.parent_uuid,
             session_id: self
                 .session_id

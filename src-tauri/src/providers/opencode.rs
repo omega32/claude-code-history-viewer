@@ -577,6 +577,7 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 
         messages.push(ClaudeMessage {
             uuid: msg_id,
+            record_ref: None,
             parent_uuid,
             session_id: session_id.to_string(),
             timestamp: created_at,
@@ -1071,6 +1072,7 @@ fn load_messages_with_conn(conn: &Connection, session_id: &str) -> Option<Vec<Cl
 
         messages.push(ClaudeMessage {
             uuid: msg_id,
+            record_ref: None,
             parent_uuid,
             session_id: session_id.to_string(),
             timestamp: created_at,

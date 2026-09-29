@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.4] - 2026-09-29
+
+### Added
+
+- Headless normalized dumps now advertise `stable-record-ref-v1` and attach optional session-scoped `recordRef` identities to Claude and Codex authored user boundaries only when a non-empty native provider record id is present; generated fallbacks remain uncertified and duplicate identities fail closed.
+
 ## [1.24.3] - 2026-09-28
 
 ### Changed
