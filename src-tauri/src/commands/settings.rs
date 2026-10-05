@@ -377,7 +377,7 @@ mod tests {
         };
 
         let saved = save_preset(input).await.unwrap();
-        assert!(!saved.id.is_empty());
+        assert_ne!(saved.id, "");
         assert_ne!(saved.id, "Auto ID");
     }
 

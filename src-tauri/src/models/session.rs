@@ -214,7 +214,7 @@ mod tests {
         let session: ClaudeSession = serde_json::from_str(json).unwrap();
         assert_eq!(session.forked_from_id, None);
         assert_eq!(session.subagent_provenance, None);
-        assert!(session.title_history.is_empty());
+        assert_eq!(session.title_history, Vec::<String>::new());
     }
 
     #[test]

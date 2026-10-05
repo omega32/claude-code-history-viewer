@@ -2909,8 +2909,14 @@ mod tests {
         assert_eq!(extract_compaction_summaries(&req).len(), 2);
 
         // none when absent.
-        assert!(extract_compaction_summaries(&json!({"result": {"metadata": {}}})).is_empty());
-        assert!(extract_compaction_summaries(&json!({"message": {"text": "x"}})).is_empty());
+        assert_eq!(
+            extract_compaction_summaries(&json!({"result": {"metadata": {}}})),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            extract_compaction_summaries(&json!({"message": {"text": "x"}})),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

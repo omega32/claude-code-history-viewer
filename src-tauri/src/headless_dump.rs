@@ -28,9 +28,9 @@
 //! Other companion commands share this file: `--list-sessions` (which also
 //! stamps each session with its decoded project directory, so callers can match
 //! the cwd without reproducing Claude's storage-path encoding),
-//! `--hide-session` (Claude's reversible VS Code deletion state),
-//! `--archive-session` / `--unarchive-session` (Copilot VS Code's per-workspace
-//! archive state), and `--capabilities` (a tiny version/feature probe so callers
+//! `--hide-session` (the legacy Claude archive alias),
+//! `--archive-session` / `--unarchive-session` (Claude global and Copilot
+//! per-workspace archive state), and `--capabilities` (a tiny probe so callers
 //! can fail fast on an incompatible build).
 
 use crate::cli_args::{extract_flag_value, has_explicit_empty_flag};
@@ -219,6 +219,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "codex-session-subagents-v1",
             "stable-record-ref-v1",
             "supplemental-history-v1",
+            "claude-session-archive-v1",
         ],
     };
     emit_json(args, &caps)
@@ -863,11 +864,10 @@ pub fn run_list_session_subagents(args: &[String]) -> i32 {
     }
 }
 
-/// The Claude Code VS Code extension "deletes" a session by adding its id to a
-/// `hiddenSessionIds` array in the editor's global-state DB — a soft hide that
-/// leaves the `.jsonl` on disk untouched, so a filesystem scan still lists it.
-/// These helpers read that list so `--list-sessions` can stamp `is_hidden`,
-/// letting a caller mark such sessions instead of showing them as active.
+/// Claude Code's VS Code archive marker retains the historical field name
+/// `hiddenSessionIds`. Read it live for both the current `is_archived` and the
+/// legacy `is_hidden` wire marker; transcript fingerprints cannot track changes
+/// to independently stored editor state.
 ///
 /// The store is `<user-data>/globalStorage/state.vscdb` (an `SQLite` DB with one
 /// `ItemTable(key, value)`); the extension's blob lives under key
@@ -932,7 +932,7 @@ fn read_hidden_ids(db: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// The union of Claude VS Code hidden (soft-deleted) session ids across every
+/// The union of Claude VS Code archived session ids across every
 /// installed editor flavor. Empty when nothing is installed or readable.
 fn claude_hidden_session_ids() -> HashSet<String> {
     let mut hidden = HashSet::new();
@@ -946,7 +946,7 @@ fn claude_hidden_session_ids() -> HashSet<String> {
 
 const HIDE_USAGE: &str =
     "Usage: --hide-session <session-id> [--provider claude] [--format json] [--output <file>]\n\n\
-Apply Claude Code's reversible VS Code deletion state by appending <session-id>\n\
+Apply Claude Code's reversible VS Code archive state by appending <session-id>\n\
 to hiddenSessionIds in each installed Claude extension state store. The session\n\
 transcript remains on disk. Only the claude provider is supported.";
 
@@ -964,6 +964,69 @@ struct HideSessionOutcome {
 /// means that editor has no Claude extension state. Malformed or locked Claude
 /// stores are errors to the caller, which can continue with the other flavors.
 fn hide_session_in_db(db: &Path, session_id: &str) -> Result<Option<bool>, String> {
+    set_claude_archive_in_db(db, session_id, true, 0, |_| Ok(()))
+}
+
+const CLAUDE_UNARCHIVE_GRACE_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+
+fn update_claude_archive_state(
+    state: &mut serde_json::Map<String, serde_json::Value>,
+    session_id: &str,
+    archived: bool,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let had_ids = state.contains_key("hiddenSessionIds");
+    let ids = state
+        .entry("hiddenSessionIds")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "hiddenSessionIds is not an array".to_string())?;
+    if ids.iter().any(|id| !id.is_string()) {
+        return Err("hiddenSessionIds contains a non-string session id".to_string());
+    }
+    if archived {
+        if ids.iter().any(|id| id.as_str() == Some(session_id)) {
+            return Ok(false);
+        }
+        ids.push(serde_json::Value::String(session_id.to_string()));
+        return Ok(true);
+    }
+
+    let original_count = ids.len();
+    ids.retain(|id| id.as_str() != Some(session_id));
+    let ids_changed = !had_ids || ids.len() != original_count;
+    // Native unarchive refreshes this grace even for an already active id;
+    // removing only the marker lets the inactivity sweep archive it again.
+    let previous_grace = state.get("sessionUnarchivedAt");
+    let mut grace = match previous_grace {
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| "sessionUnarchivedAt is not an object".to_string())?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
+    if grace.values().any(|value| value.as_f64().is_none()) {
+        return Err("sessionUnarchivedAt contains a non-numeric timestamp".to_string());
+    }
+    grace.insert(
+        session_id.to_string(),
+        serde_json::Value::Number(now_ms.into()),
+    );
+    let cutoff = (now_ms - CLAUDE_UNARCHIVE_GRACE_MS) as f64;
+    grace.retain(|_, value| value.as_f64().is_some_and(|timestamp| timestamp > cutoff));
+    let grace = serde_json::Value::Object(grace);
+    let grace_changed = previous_grace != Some(&grace);
+    state.insert("sessionUnarchivedAt".to_string(), grace);
+    Ok(ids_changed || grace_changed)
+}
+
+fn set_claude_archive_in_db(
+    db: &Path,
+    session_id: &str,
+    archived: bool,
+    now_ms: i64,
+    ensure_stopped: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<Option<bool>, String> {
     let mut conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(2))
@@ -986,15 +1049,10 @@ fn hide_session_in_db(db: &Path, session_id: &str) -> Result<Option<bool>, Strin
     let state = parsed
         .as_object_mut()
         .ok_or_else(|| "Claude extension state is not a JSON object".to_string())?;
-    let ids = state
-        .entry("hiddenSessionIds")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| "hiddenSessionIds is not an array".to_string())?;
-    if ids.iter().any(|v| v.as_str() == Some(session_id)) {
+    if !update_claude_archive_state(state, session_id, archived, now_ms)? {
         return Ok(Some(false));
     }
-    ids.push(serde_json::Value::String(session_id.to_string()));
+    ensure_stopped(db)?;
     let updated = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
     tx.execute(
         "UPDATE ItemTable SET value = ?1 WHERE key = ?2",
@@ -1003,6 +1061,46 @@ fn hide_session_in_db(db: &Path, session_id: &str) -> Result<Option<bool>, Strin
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(Some(true))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ClaudeArchiveOutcome {
+    session_id: String,
+    archived: bool,
+    stores_updated: usize,
+    stores_unchanged: usize,
+    stores_unavailable: usize,
+}
+
+fn set_claude_session_archived(
+    session_id: &str,
+    archived: bool,
+    dbs: Vec<PathBuf>,
+    now_ms: i64,
+    ensure_stopped: impl Fn(&Path) -> Result<(), String>,
+) -> Result<ClaudeArchiveOutcome, String> {
+    let mut outcome = ClaudeArchiveOutcome {
+        session_id: session_id.to_string(),
+        archived,
+        stores_updated: 0,
+        stores_unchanged: 0,
+        stores_unavailable: 0,
+    };
+    for db in dbs {
+        match set_claude_archive_in_db(&db, session_id, archived, now_ms, &ensure_stopped) {
+            Ok(Some(true)) => outcome.stores_updated += 1,
+            Ok(Some(false)) => outcome.stores_unchanged += 1,
+            Ok(None) => {}
+            Err(_) => outcome.stores_unavailable += 1,
+        }
+    }
+    if outcome.stores_updated + outcome.stores_unchanged == 0 {
+        return Err(format!(
+            "No writable Claude VS Code extension state store was found ({} unavailable). Exit every owning editor completely and ensure its Claude extension state is valid, then try again.",
+            outcome.stores_unavailable,
+        ));
+    }
+    Ok(outcome)
 }
 
 fn hide_claude_session(session_id: &str, dbs: Vec<PathBuf>) -> Result<HideSessionOutcome, String> {
@@ -1030,7 +1128,7 @@ fn hide_claude_session(session_id: &str, dbs: Vec<PathBuf>) -> Result<HideSessio
     Ok(outcome)
 }
 
-/// Handle Claude's reversible session deletion. This intentionally updates the
+/// Handle the legacy Claude archive alias. This intentionally updates the
 /// same private VS Code global-state field as the extension; it never removes a
 /// transcript file. Every readable editor flavor is updated so the union used
 /// by `--list-sessions` cannot leave the row active in another installed editor.
@@ -1135,6 +1233,9 @@ enum EditorFlavor {
     Code,
     CodeInsiders,
     Vscodium,
+    VscodiumInsiders,
+    Cursor,
+    Windsurf,
 }
 
 impl EditorFlavor {
@@ -1143,6 +1244,9 @@ impl EditorFlavor {
             Self::Code => "Visual Studio Code",
             Self::CodeInsiders => "Visual Studio Code Insiders",
             Self::Vscodium => "VSCodium",
+            Self::VscodiumInsiders => "VSCodium Insiders",
+            Self::Cursor => "Cursor",
+            Self::Windsurf => "Windsurf",
         }
     }
 
@@ -1152,6 +1256,9 @@ impl EditorFlavor {
             Self::Code => "Code.exe",
             Self::CodeInsiders => "Code - Insiders.exe",
             Self::Vscodium => "VSCodium.exe",
+            Self::VscodiumInsiders => "VSCodium - Insiders.exe",
+            Self::Cursor => "Cursor.exe",
+            Self::Windsurf => "Windsurf.exe",
         }
     }
 
@@ -1169,6 +1276,17 @@ impl EditorFlavor {
                 "/bin/code-insiders",
             ],
             Self::Vscodium => &["/vscodium.app/", "/usr/share/codium/codium", "/bin/codium"],
+            Self::VscodiumInsiders => &[
+                "/vscodium - insiders.app/",
+                "/usr/share/codium-insiders/codium-insiders",
+                "/bin/codium-insiders",
+            ],
+            Self::Cursor => &["/cursor.app/", "/usr/share/cursor/cursor", "/bin/cursor"],
+            Self::Windsurf => &[
+                "/windsurf.app/",
+                "/usr/share/windsurf/windsurf",
+                "/bin/windsurf",
+            ],
         }
     }
 }
@@ -1178,6 +1296,9 @@ fn editor_flavor_for_user_data_root(user: &Path) -> Option<EditorFlavor> {
         "Code" => Some(EditorFlavor::Code),
         "Code - Insiders" => Some(EditorFlavor::CodeInsiders),
         "VSCodium" => Some(EditorFlavor::Vscodium),
+        "VSCodium - Insiders" => Some(EditorFlavor::VscodiumInsiders),
+        "Cursor" => Some(EditorFlavor::Cursor),
+        "Windsurf" => Some(EditorFlavor::Windsurf),
         _ => None,
     }
 }
@@ -1377,15 +1498,14 @@ fn set_copilot_archive_in_db(
     Ok(changed)
 }
 
-const COPILOT_ARCHIVE_USAGE: &str =
-    "Usage: --archive-session <session-path> | --unarchive-session <session-path> --provider copilot [--format json] [--output <file>]\n\n\
-Update Copilot VS Code's reversible archive state. The selected session must be\n\
-a local chatSessions or emptyWindowChatSessions JSONL file, and its editor must\n\
-be fully stopped so it cannot overwrite the external state change.";
+const SESSION_ARCHIVE_USAGE: &str =
+    "Usage: --archive-session <selector> | --unarchive-session <selector> --provider <claude|copilot> [--format json] [--output <file>]\n\n\
+Claude requires an exact native session id; Copilot requires the owning local\n\
+chatSessions or emptyWindowChatSessions JSONL path. Each owning editor must be\n\
+fully stopped so it cannot overwrite the external archive state change.";
 
-/// Handle Copilot VS Code archive/unarchive. The session path is deliberately
-/// required: it identifies the exact workspace database without an ambiguous
-/// cross-workspace id scan.
+/// Dispatch archive/unarchive by provider. Copilot keeps its exact owning-path
+/// selector; Claude's global state is keyed by the exact native session id.
 pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
     let flag = if archived {
         "--archive-session"
@@ -1393,18 +1513,41 @@ pub fn run_set_session_archived(args: &[String], archived: bool) -> i32 {
         "--unarchive-session"
     };
     let Some(session_path) = extract_flag_value(args, flag) else {
-        eprintln!("{COPILOT_ARCHIVE_USAGE}");
+        eprintln!("{SESSION_ARCHIVE_USAGE}");
         return 2;
     };
     let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "copilot".to_string());
-    if provider != "copilot" {
-        eprintln!("{flag} supports only the copilot provider (got '{provider}')");
+    if provider != "copilot" && provider != "claude" {
+        eprintln!("{flag} supports only the claude and copilot providers (got '{provider}')");
         return 2;
     }
     let format = extract_flag_value(args, "--format").unwrap_or_else(|| "json".to_string());
     if format != "json" {
         eprintln!("Unsupported --format '{format}' (only 'json' is supported)");
         return 2;
+    }
+    if provider == "claude" {
+        if session_path.is_empty()
+            || !session_path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            eprintln!("Claude archive commands require an exact native session id, not a path or prefix lookup");
+            return 2;
+        }
+        return match set_claude_session_archived(
+            &session_path,
+            archived,
+            claude_global_state_dbs(),
+            Utc::now().timestamp_millis(),
+            ensure_editor_stopped,
+        ) {
+            Ok(outcome) => emit_json(args, &outcome),
+            Err(error) => {
+                eprintln!("Failed to update Claude session archive state: {error}");
+                1
+            }
+        };
     }
     let path = Path::new(&session_path);
     let Some(db) = copilot_workspace_state_db(&session_path) else {
@@ -1533,8 +1676,7 @@ struct SessionWithProjectPath {
     session: ClaudeSession,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_path: Option<String>,
-    /// True when this session was soft-deleted (hidden) in the Claude Code VS
-    /// Code extension. Claude-only; always `false` for other providers. Read
+    /// Legacy Claude archive wire marker. Claude-only; `false` elsewhere. Read
     /// live from the editor's global state — deliberately not cached, since the
     /// hidden list changes independently of the session file's (mtime, size).
     is_hidden: bool,
@@ -1544,7 +1686,8 @@ struct SessionWithProjectPath {
     is_orphan: bool,
     /// True when the provider reports an archived session. For Copilot VS Code,
     /// this comes from `archived:true` in `agentSessions.state.cache`; for Codex,
-    /// it records that the rollout was discovered under `archived_sessions`.
+    /// it records that the rollout was discovered under `archived_sessions`;
+    /// Claude reads membership in the extension's live `hiddenSessionIds`.
     is_archived: bool,
     /// Copilot VS Code only: `pinned:true` in `agentSessions.state.cache`.
     /// Independent of archive/orphan state and `false` for every other surface.
@@ -1601,7 +1744,9 @@ fn wrap_session_listing(
     codex_imports: &HashMap<String, Option<String>>,
 ) -> SessionWithProjectPath {
     let (is_orphan, copilot_archived, is_pinned) = copilot.classify(&session);
+    let claude_archived = provider == "claude" && hidden.contains(&session.actual_session_id);
     let is_archived = copilot_archived
+        || claude_archived
         || (provider == "codex" && codex::is_archived_session_path(Path::new(&session.file_path)));
     let is_imported = codex_imports.contains_key(&session.actual_session_id);
     let imported_from = codex_imports
@@ -1609,7 +1754,7 @@ fn wrap_session_listing(
         .cloned()
         .flatten();
     SessionWithProjectPath {
-        is_hidden: hidden.contains(&session.actual_session_id),
+        is_hidden: claude_archived,
         is_orphan,
         is_archived,
         is_pinned,
@@ -1725,7 +1870,7 @@ fn synthesize_teleport_session(
         project_path,
         is_hidden,
         is_orphan: false,
-        is_archived: false,
+        is_archived: is_hidden,
         is_pinned: false,
         is_teleported: true,
         is_imported: false,
@@ -2154,7 +2299,8 @@ mod tests {
                 "image-artifacts-v1",
                 "codex-session-subagents-v1",
                 "stable-record-ref-v1",
-                "supplemental-history-v1"
+                "supplemental-history-v1",
+                "claude-session-archive-v1"
             ])
         );
         assert_eq!(
@@ -3626,6 +3772,292 @@ mod tests {
             Some(vec!["hidden-1".to_string(), "hidden-2".to_string()])
         );
         assert_eq!(read_hidden_ids(&temp.path().join("missing.vscdb")), None);
+    }
+
+    #[test]
+    fn claude_archive_membership_is_shared_by_listing_and_teleport_metadata() {
+        let temp = TempDir::new().unwrap();
+        let archived = HashSet::from(["archived-session".to_string()]);
+        let row = wrap_session_listing(
+            "claude",
+            session(
+                &temp.path().join("archived-session.jsonl"),
+                "archived-session",
+                None,
+            ),
+            Some("/project".to_string()),
+            &archived,
+            &CopilotClassifier::new("claude"),
+            &HashMap::new(),
+        );
+        assert!(row.is_archived);
+        assert!(
+            row.is_hidden,
+            "legacy consumers retain the previous wire marker"
+        );
+        let stub = synthesize_teleport_session(
+            &temp.path().join("archived-session.jsonl"),
+            Some("cloud-session".to_string()),
+            Some("/project".to_string()),
+            &archived,
+        );
+        assert!(stub.is_archived);
+        assert!(stub.is_hidden);
+        assert!(stub.is_teleported);
+    }
+
+    fn read_claude_state(db: &Path) -> Value {
+        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                [CLAUDE_VSCODE_STATE_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&value).unwrap()
+    }
+
+    #[test]
+    fn claude_archive_preserves_state_and_reports_partial_store_failures() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.vscdb");
+        let unchanged = temp.path().join("unchanged.vscdb");
+        let malformed = temp.path().join("malformed.vscdb");
+        let unrelated = temp.path().join("unrelated.vscdb");
+        create_item_table(
+            &first,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({
+                    "theme":"dark", "hiddenSessionIds":["other"],
+                    "sessionUnarchivedAt":{"other":12}
+                }),
+            )],
+        );
+        create_item_table(
+            &unchanged,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({"hiddenSessionIds":["target"]}),
+            )],
+        );
+        create_item_table(
+            &malformed,
+            &[(CLAUDE_VSCODE_STATE_KEY, json!({"hiddenSessionIds":42}))],
+        );
+        create_item_table(&unrelated, &[("other-extension", json!({"value":1}))]);
+        let outcome = set_claude_session_archived(
+            "target",
+            true,
+            vec![
+                first.clone(),
+                unchanged,
+                malformed.clone(),
+                unrelated,
+                temp.path().join("missing.vscdb"),
+            ],
+            2_000_000_000_000,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(outcome.archived);
+        assert_eq!(outcome.stores_updated, 1);
+        assert_eq!(outcome.stores_unchanged, 1);
+        assert_eq!(outcome.stores_unavailable, 2);
+        assert_eq!(
+            read_claude_state(&first),
+            json!({
+                "theme":"dark", "hiddenSessionIds":["other","target"],
+                "sessionUnarchivedAt":{"other":12}
+            })
+        );
+        assert_eq!(
+            read_claude_state(&malformed),
+            json!({"hiddenSessionIds":42})
+        );
+        assert!(!temp.path().join("missing.vscdb").exists());
+    }
+
+    #[test]
+    fn claude_unarchive_atomically_removes_ids_and_refreshes_native_grace() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("state.vscdb");
+        let now = 2_000_000_000_000_i64;
+        let cutoff = now - 14 * 24 * 60 * 60 * 1000;
+        create_item_table(
+            &db,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({
+                    "hiddenSessionIds":["target","other","target"], "theme":{"value":"dark"},
+                    "sessionUnarchivedAt":{"old":cutoff-1,"boundary":cutoff,"recent":cutoff+1,"fraction":cutoff as f64+0.5}
+                }),
+            )],
+        );
+        assert_eq!(
+            set_claude_archive_in_db(&db, "target", false, now, |_| Ok(())).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            read_claude_state(&db),
+            json!({
+                "hiddenSessionIds":["other"], "theme":{"value":"dark"},
+                "sessionUnarchivedAt":{"target":now,"recent":cutoff+1,"fraction":cutoff as f64+0.5}
+            })
+        );
+        assert_eq!(
+            set_claude_archive_in_db(&db, "target", false, now, |_| Ok(())).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            set_claude_archive_in_db(&db, "target", false, now + 1, |_| Ok(())).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            read_claude_state(&db)["sessionUnarchivedAt"]["target"],
+            now + 1
+        );
+        assert_eq!(
+            set_claude_archive_in_db(&db, "already-active", false, now + 2, |_| Ok(())).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            read_claude_state(&db)["sessionUnarchivedAt"]["already-active"],
+            now + 2
+        );
+    }
+
+    #[test]
+    fn claude_unarchive_rejects_malformed_state_without_any_write() {
+        let temp = TempDir::new().unwrap();
+        for (index, state) in [
+            json!([]),
+            json!({"hiddenSessionIds":["target",42]}),
+            json!({"hiddenSessionIds":["target"],"sessionUnarchivedAt":[]}),
+            json!({"hiddenSessionIds":["target"],"sessionUnarchivedAt":{"other":"unknown"}}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = temp.path().join(format!("malformed-{index}.vscdb"));
+            create_item_table(&db, &[(CLAUDE_VSCODE_STATE_KEY, state.clone())]);
+            assert!(
+                set_claude_archive_in_db(&db, "target", false, 2_000_000_000_000, |_| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(read_claude_state(&db), state);
+        }
+    }
+
+    #[test]
+    fn claude_archive_writer_refuses_live_editor_without_losing_state() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("state.vscdb");
+        let state = json!({"hiddenSessionIds":["other"]});
+        create_item_table(&db, &[(CLAUDE_VSCODE_STATE_KEY, state.clone())]);
+        let error = set_claude_archive_in_db(&db, "target", true, 2_000_000_000_000, |_| {
+            Err("owning editor is running".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "owning editor is running");
+        assert_eq!(read_claude_state(&db), state);
+    }
+
+    #[test]
+    fn claude_archive_reports_locked_store_and_keeps_other_flavors_working() {
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("locked.vscdb");
+        let writable = temp.path().join("writable.vscdb");
+        create_item_table(
+            &locked,
+            &[(
+                CLAUDE_VSCODE_STATE_KEY,
+                json!({"hiddenSessionIds":["other"]}),
+            )],
+        );
+        create_item_table(&writable, &[(CLAUDE_VSCODE_STATE_KEY, json!({}))]);
+        let lock = Connection::open(&locked).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let outcome = set_claude_session_archived(
+            "target",
+            true,
+            vec![locked.clone(), writable.clone()],
+            2_000_000_000_000,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(outcome.stores_updated, 1);
+        assert_eq!(outcome.stores_unavailable, 1);
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(read_hidden_ids(&locked), Some(vec!["other".to_string()]));
+        assert_eq!(read_hidden_ids(&writable), Some(vec!["target".to_string()]));
+    }
+
+    #[test]
+    fn claude_archive_command_rejects_paths_empty_ids_and_invalid_formats_before_access() {
+        for selector in ["", "a/b", r"C:\sessions\target.jsonl", "target session"] {
+            assert_eq!(
+                run_set_session_archived(
+                    &args(&[
+                        "viewer",
+                        "--archive-session",
+                        selector,
+                        "--provider",
+                        "claude"
+                    ]),
+                    true
+                ),
+                2
+            );
+        }
+        assert_eq!(
+            run_set_session_archived(
+                &args(&[
+                    "viewer",
+                    "--unarchive-session",
+                    "target",
+                    "--provider",
+                    "claude",
+                    "--format",
+                    "text"
+                ]),
+                false
+            ),
+            2
+        );
+        assert_eq!(
+            run_set_session_archived(
+                &args(&[
+                    "viewer",
+                    "--archive-session",
+                    "target",
+                    "--provider",
+                    "unknown"
+                ]),
+                true
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn claude_archive_identifies_every_discovered_editor_flavor() {
+        let temp = TempDir::new().unwrap();
+        for (name, expected) in [
+            ("Code", EditorFlavor::Code),
+            ("Code - Insiders", EditorFlavor::CodeInsiders),
+            ("VSCodium", EditorFlavor::Vscodium),
+            ("VSCodium - Insiders", EditorFlavor::VscodiumInsiders),
+            ("Cursor", EditorFlavor::Cursor),
+            ("Windsurf", EditorFlavor::Windsurf),
+        ] {
+            let db = temp
+                .path()
+                .join(name)
+                .join("User/globalStorage/state.vscdb");
+            assert_eq!(editor_flavor_for_state_db_in(&db, &[]), Some(expected));
+        }
     }
 
     #[test]

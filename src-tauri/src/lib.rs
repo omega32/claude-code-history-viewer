@@ -166,15 +166,15 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_backup_sessions(&args));
         }
-        // Claude VS Code's reversible session deletion (`hiddenSessionIds`).
+        // Legacy alias for Claude VS Code's archive marker (`hiddenSessionIds`).
         if args
             .iter()
             .any(|a| a == "--hide-session" || a.starts_with("--hide-session="))
         {
             std::process::exit(headless_dump::run_hide_session(&args));
         }
-        // Copilot VS Code's reversible per-workspace archive state. The two
-        // directions are separate capabilities but share one transactional writer.
+        // Claude global and Copilot per-workspace archive state. Each direction
+        // shares the provider-owned transactional writer.
         if args
             .iter()
             .any(|a| a == "--archive-session" || a.starts_with("--archive-session="))
@@ -435,7 +435,7 @@ mod ime_environment_tests {
         let updates =
             linux_ime_environment_updates(Some("custom-gtk"), Some("@im=custom"), Some("ibus"));
 
-        assert!(updates.is_empty());
+        assert_eq!(updates, Vec::<(&str, &str)>::new());
     }
 
     #[test]
@@ -449,7 +449,7 @@ mod ime_environment_tests {
     fn linux_ime_environment_does_nothing_without_ibus_signal() {
         let updates = linux_ime_environment_updates(None, None, None);
 
-        assert!(updates.is_empty());
+        assert_eq!(updates, Vec::<(&str, &str)>::new());
     }
 }
 
