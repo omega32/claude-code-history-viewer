@@ -39,7 +39,8 @@ use crate::commands::multi_provider::{
     finalize_loaded_messages, load_provider_messages, load_provider_sessions, scan_all_projects,
 };
 use crate::models::{ClaudeMessage, ClaudeSession};
-use crate::providers::{claude, codex, copilot, copilot_cli, vscode, SessionSnapshotLoad};
+use crate::providers::{claude, codex, copilot, copilot_cli, hermes, vscode, SessionSnapshotLoad};
+use crate::utils::{inspect_path_without_aliases, is_symlink_or_reparse};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -207,6 +208,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "list-sessions",
             "list-session-subagents",
             "list-backup-sessions",
+            "hermes-backup-sources",
             "session-metadata",
             "hide-session",
             "archive-session",
@@ -220,6 +222,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "stable-record-ref-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
+            "hermes-backup-v1",
         ],
     };
     emit_json(args, &caps)
@@ -244,11 +247,12 @@ Return the unchanged ordinary Codex projection as primary plus independently\n\
 certified superseded paginated carrier tails. Any uncertain supplemental proof\n\
 fails the command without changing the established --dump-session contract.";
 
-const BACKUP_DUMP_USAGE: &str = "Usage: --dump-backup-session <relative-path> --backup-root <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
+const BACKUP_DUMP_USAGE: &str = "Usage: --dump-backup-session <relative-path> --backup-root <data-root> --provider <claude|codex|copilot|hermes> [--backup-session-id <native-id>] [--format json] [--output <file>]\n\n\
 Normalize one immutable session carrier confined beneath an explicit verified\n\
-backup payload. This command never discovers or consults current provider roots.";
+backup payload. Hermes requires --backup-session-id. This command never discovers\n\
+or consults current provider roots.";
 
-const BACKUP_LIST_USAGE: &str = "Usage: --list-backup-sessions <data-root> --provider <claude|codex|copilot> [--format json] [--output <file>]\n\n\
+const BACKUP_LIST_USAGE: &str = "Usage: --list-backup-sessions <data-root> --provider <claude|codex|copilot|hermes> [--format json] [--output <file>]\n\n\
 List sessions only from one explicit verified backup payload. The payload uses\n\
 ccmsg's provider-neutral logical layout; no live provider root or index is read.";
 
@@ -548,6 +552,24 @@ pub fn run_dump_session_snapshot(args: &[String]) -> i32 {
     }
 }
 
+pub fn run_hermes_backup_sources(args: &[String]) -> i32 {
+    match hermes::backup_sources() {
+        Ok(sources) => emit_json(
+            args,
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "hermes-backup-sources",
+                "provider": "hermes",
+                "sources": sources,
+            }),
+        ),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn canonical_backup_root(raw: &str) -> Result<PathBuf, String> {
     let root = PathBuf::from(raw);
     if !root.is_absolute() {
@@ -555,7 +577,7 @@ fn canonical_backup_root(raw: &str) -> Result<PathBuf, String> {
     }
     let metadata = std::fs::symlink_metadata(&root)
         .map_err(|error| format!("Cannot inspect backup payload root: {error}"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || is_symlink_or_reparse(&metadata) {
         return Err("Backup payload root must be a regular non-symlink directory".to_string());
     }
     root.canonicalize()
@@ -589,7 +611,7 @@ fn confined_backup_file(root: &Path, raw_relative: &str) -> Result<PathBuf, Stri
         current.push(part);
         let metadata = std::fs::symlink_metadata(&current)
             .map_err(|error| format!("Cannot inspect backup session path: {error}"))?;
-        if metadata.file_type().is_symlink() {
+        if is_symlink_or_reparse(&metadata) {
             return Err("Backup session path contains a symlink".to_string());
         }
     }
@@ -627,6 +649,87 @@ fn logical_backup_path(root: &Path, path: &Path) -> Option<String> {
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
 }
 
+fn hermes_backup_database_path(logical: &str) -> bool {
+    let parts: Vec<_> = logical.split('/').collect();
+    match parts.as_slice() {
+        ["default", "state.db"] => true,
+        ["profiles", profile, "state.db"] => hermes_backup_profile_segment(profile),
+        _ => false,
+    }
+}
+
+fn hermes_backup_profile_segment(profile: &str) -> bool {
+    let Ok(decoded) = urlencoding::decode(profile) else {
+        return false;
+    };
+    !decoded.is_empty()
+        && decoded != "."
+        && decoded != ".."
+        && !decoded.contains(['/', '\\', '\0'])
+        && urlencoding::encode(&decoded) == profile
+}
+
+fn hermes_backup_databases(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut databases = Vec::new();
+    let mut identities = HashSet::new();
+    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|e| format!("Cannot walk Hermes backup payload: {e}"))?;
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if is_symlink_or_reparse(&metadata) {
+            return Err(
+                "Hermes backup payload contains a symbolic link or reparse point".to_string(),
+            );
+        }
+        let logical =
+            logical_backup_path(root, entry.path()).ok_or("Hermes backup path escaped its root")?;
+        if metadata.is_dir() {
+            let parts: Vec<_> = logical.split('/').collect();
+            if !matches!(parts.as_slice(), ["default" | "profiles"])
+                && !matches!(parts.as_slice(), ["profiles", profile] if hermes_backup_profile_segment(profile))
+            {
+                return Err(format!("Unsupported Hermes backup directory: {logical}"));
+            }
+        } else if metadata.is_file() && hermes_backup_database_path(&logical) {
+            let path = confined_backup_file(root, &logical)?;
+            let identity = if cfg!(windows) {
+                path.to_string_lossy().replace('\\', "/").to_lowercase()
+            } else {
+                path.to_string_lossy().to_string()
+            };
+            if !identities.insert(identity) {
+                return Err("Hermes backup payload contains aliased databases".to_string());
+            }
+            databases.push(path);
+        } else {
+            return Err(format!(
+                "Unsupported Hermes backup file or sidecar: {logical}"
+            ));
+        }
+    }
+    databases.sort();
+    Ok(databases)
+}
+
+fn list_hermes_backup_sessions(root: &Path) -> Result<Vec<SessionWithProjectPath>, String> {
+    let mut sessions = Vec::new();
+    for database in hermes_backup_databases(root)? {
+        for listed in hermes::load_offline_sessions(&database)? {
+            let mut row =
+                offline_session(listed.session, Some(listed.project_path), listed.archived);
+            row.is_hidden = listed.hidden;
+            row.is_pinned = listed.pinned;
+            sessions.push(row);
+        }
+    }
+    sessions.sort_by(|a, b| {
+        b.session
+            .last_message_time
+            .cmp(&a.session.last_message_time)
+            .then(a.session.file_path.cmp(&b.session.file_path))
+    });
+    Ok(sessions)
+}
+
 fn is_json_or_jsonl(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -641,6 +744,10 @@ fn list_backup_sessions(
     provider: &str,
     root: &Path,
 ) -> Result<Vec<SessionWithProjectPath>, String> {
+    if provider == "hermes" {
+        inspect_path_without_aliases(root)?;
+        return list_hermes_backup_sessions(root);
+    }
     if !matches!(provider, "claude" | "codex" | "copilot") {
         return Err(format!("Unsupported backup provider: {provider}"));
     }
@@ -760,8 +867,13 @@ pub fn run_list_backup_sessions(args: &[String]) -> i32 {
         return 2;
     };
     let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
-    let result =
-        canonical_backup_root(&raw_root).and_then(|root| list_backup_sessions(&provider, &root));
+    let result = (|| {
+        if provider == "hermes" {
+            inspect_path_without_aliases(Path::new(&raw_root))?;
+        }
+        let root = canonical_backup_root(&raw_root)?;
+        list_backup_sessions(&provider, &root)
+    })();
     match result {
         Ok(sessions) => emit_json(args, &sessions),
         Err(error) => {
@@ -783,7 +895,17 @@ pub fn run_dump_backup_session(args: &[String]) -> i32 {
         return 2;
     };
     let provider = extract_flag_value(args, "--provider").unwrap_or_else(|| "claude".to_string());
-    let result = canonical_backup_root(&raw_root).and_then(|root| {
+    let hermes_id =
+        extract_flag_value(args, "--backup-session-id").filter(|id| !id.trim().is_empty());
+    if provider == "hermes" && hermes_id.is_none() {
+        eprintln!("{BACKUP_DUMP_USAGE}");
+        return 2;
+    }
+    let result = (|| {
+        if provider == "hermes" {
+            inspect_path_without_aliases(Path::new(&raw_root))?;
+        }
+        let root = canonical_backup_root(&raw_root)?;
         let path = confined_backup_file(&root, &relative)?;
         let messages = match provider.as_str() {
             "claude" => {
@@ -798,10 +920,23 @@ pub fn run_dump_backup_session(args: &[String]) -> i32 {
                 copilot_cli::load_offline_messages(&path)
             }
             "copilot" => vscode::load_offline_messages(&path),
+            "hermes" => {
+                if !hermes_backup_databases(&root)?.contains(&path) {
+                    return Err(
+                        "Hermes backup database is outside the supported layout".to_string()
+                    );
+                }
+                hermes::load_offline_messages(
+                    &path,
+                    hermes_id
+                        .as_deref()
+                        .ok_or("Hermes backup requires a native session ID")?,
+                )
+            }
             _ => Err(format!("Unsupported backup provider: {provider}")),
         }?;
         Ok(finalize_loaded_messages(messages))
-    });
+    })();
     match result {
         Ok(messages) => emit_json(args, &messages),
         Err(error) => {
@@ -1676,9 +1811,9 @@ struct SessionWithProjectPath {
     session: ClaudeSession,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_path: Option<String>,
-    /// Legacy Claude archive wire marker. Claude-only; `false` elsewhere. Read
-    /// live from the editor's global state — deliberately not cached, since the
-    /// hidden list changes independently of the session file's (mtime, size).
+    /// Claude's legacy archive wire marker, or Hermes's native hidden flag.
+    /// Live Claude editor state is deliberately not cached because it changes
+    /// independently of the session carrier's fingerprint.
     is_hidden: bool,
     /// Copilot VS Code only: the session's file is on disk but its id has aged
     /// out of the workspace's 50-entry `chat.ChatSessionStore.index` (VS Code no
@@ -1687,10 +1822,11 @@ struct SessionWithProjectPath {
     /// True when the provider reports an archived session. For Copilot VS Code,
     /// this comes from `archived:true` in `agentSessions.state.cache`; for Codex,
     /// it records that the rollout was discovered under `archived_sessions`;
-    /// Claude reads membership in the extension's live `hiddenSessionIds`.
+    /// Claude reads membership in the extension's live `hiddenSessionIds`, and
+    /// Hermes reports native `archived` or `auto_archived` database state.
     is_archived: bool,
-    /// Copilot VS Code only: `pinned:true` in `agentSessions.state.cache`.
-    /// Independent of archive/orphan state and `false` for every other surface.
+    /// Copilot VS Code `pinned:true` in `agentSessions.state.cache`, or Hermes's
+    /// native pinned flag. Independent of archive/orphan state.
     is_pinned: bool,
     /// Claude only: this local session was "teleported" — its conversation was
     /// relocated to a cloud (web) session and the local `.jsonl` emptied to a
@@ -2310,7 +2446,8 @@ mod tests {
                 "codex-session-subagents-v1",
                 "stable-record-ref-v1",
                 "supplemental-history-v1",
-                "claude-session-archive-v1"
+                "claude-session-archive-v1",
+                "hermes-backup-v1"
             ])
         );
         assert_eq!(
@@ -2323,6 +2460,7 @@ mod tests {
                 "list-sessions",
                 "list-session-subagents",
                 "list-backup-sessions",
+                "hermes-backup-sources",
                 "session-metadata",
                 "hide-session",
                 "archive-session",
@@ -2660,6 +2798,158 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dump_output).unwrap()).unwrap();
         assert_eq!(dumped.len(), 2);
         assert_eq!(dumped[0]["sessionId"], "backup-session");
+    }
+
+    fn write_hermes_backup_store(path: &Path, id: &str, cwd: Option<&str>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, model_config TEXT, started_at REAL, end_reason TEXT, parent_session_id TEXT, cwd TEXT, title TEXT, title_source TEXT, hidden INTEGER, archived INTEGER, pinned INTEGER);
+            CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT, tool_name TEXT, timestamp REAL, active INTEGER DEFAULT 1, compacted INTEGER DEFAULT 0, display_order INTEGER);").unwrap();
+        db.execute("INSERT INTO sessions VALUES (?1, 'desktop', 'gpt-test', '{\"provider\":\"openai-codex\"}', 100, NULL, NULL, ?2, 'Backup title', 'user', 1, 1, 1)", (id, cwd)).unwrap();
+        db.execute("INSERT INTO messages (session_id, role, content, timestamp, display_order) VALUES (?1, 'user', 'Backup prompt', 100, 1)", [id]).unwrap();
+        db.execute("INSERT INTO messages (session_id, role, content, timestamp, display_order, tool_calls) VALUES (?1, 'assistant', '', 101, 2, ?2)", (id, r#"[{"id":"call-1","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"echo hello\"}"}}]"#)).unwrap();
+        db.execute("INSERT INTO messages (session_id, role, content, timestamp, display_order, tool_call_id, tool_name) VALUES (?1, 'tool', 'hello', 102, 3, 'call-1', 'terminal')", [id]).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn hermes_offline_backup_lists_profiles_and_dumps_with_an_explicit_native_id() {
+        let temp = TempDir::new().unwrap();
+        let live = temp.path().join("unavailable-live-hermes");
+        let _home = EnvVarGuard::set("HERMES_HOME", &live);
+        let payload = temp.path().join("payload");
+        write_hermes_backup_store(&payload.join("default/state.db"), "native-id", None);
+        write_hermes_backup_store(
+            &payload.join("profiles/work%20space/state.db"),
+            "native-id",
+            Some("/recorded/project"),
+        );
+        let listed = list_backup_sessions("hermes", &payload.canonicalize().unwrap()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .all(|row| row.session.actual_session_id == "native-id"));
+        assert_ne!(listed[0].session.file_path, listed[1].session.file_path);
+        assert!(listed
+            .iter()
+            .any(|row| row.project_path.as_deref() == Some("/recorded/project")));
+        assert!(listed.iter().any(|row| row
+            .project_path
+            .as_ref()
+            .is_some_and(|path| path.starts_with("hermes://"))));
+        assert!(listed
+            .iter()
+            .all(|row| row.is_hidden && row.is_archived && row.is_pinned));
+        let output = temp.path().join("dump.json");
+        let argv = args(&[
+            "viewer",
+            "--dump-backup-session",
+            "default/state.db",
+            "--backup-root",
+            payload.to_str().unwrap(),
+            "--provider",
+            "hermes",
+            "--backup-session-id",
+            "native-id",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_backup_session(&argv), 0);
+        let dumped: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(dumped.len(), 2);
+        assert_eq!(dumped[0]["content"], "Backup prompt");
+        assert_eq!(
+            dumped[1]["content"][0]["id"],
+            dumped[1]["content"][1]["tool_use_id"]
+        );
+        assert_eq!(dumped[1]["inference"]["modelProvider"], "openai-codex");
+        assert_eq!(dumped[1]["provider"], "hermes");
+        assert_eq!(
+            run_dump_backup_session(&args(&[
+                "viewer",
+                "--dump-backup-session",
+                "default/state.db",
+                "--backup-root",
+                payload.to_str().unwrap(),
+                "--provider",
+                "hermes"
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hermes_backup_source_command_emits_the_versioned_inventory_without_opening_databases() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("profiles/work space")).unwrap();
+        std::fs::write(home.join("state.db"), "opaque bytes").unwrap();
+        std::fs::write(
+            home.join("profiles/work space/state.db"),
+            "opaque profile bytes",
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HERMES_HOME", &home);
+        let output = temp.path().join("inventory.json");
+        assert_eq!(
+            run_hermes_backup_sources(&args(&[
+                "viewer",
+                "--hermes-backup-sources",
+                "--output",
+                output.to_str().unwrap()
+            ])),
+            0
+        );
+        let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["kind"], "hermes-backup-sources");
+        assert_eq!(value["provider"], "hermes");
+        assert_eq!(value["sources"].as_array().unwrap().len(), 2);
+        assert_eq!(value["sources"][0]["id"], "default");
+        assert_eq!(
+            value["sources"][1]["relativePath"],
+            "profiles/work%20space/state.db"
+        );
+    }
+
+    #[test]
+    fn hermes_offline_backup_keeps_compression_ancestry_inside_one_database() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("payload/default/state.db");
+        write_hermes_backup_store(&path, "parent", Some("/recorded/project"));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("UPDATE sessions SET end_reason='compression' WHERE id='parent';
+            INSERT INTO sessions (id, source, started_at, parent_session_id) VALUES ('child', 'cli', 103, 'parent');
+            INSERT INTO messages (session_id, role, content, timestamp, display_order) VALUES ('child', 'assistant', 'Child reply', 103, 1);").unwrap();
+        drop(db);
+        let messages = hermes::load_offline_messages(&path, "child").unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, Some(json!("Backup prompt")));
+        assert_eq!(messages[3].content, Some(json!("Child reply")));
+        assert!(messages.iter().all(|message| message.session_id == "child"));
+        let db = Connection::open(&path).unwrap();
+        db.execute("DELETE FROM sessions WHERE id='parent'", [])
+            .unwrap();
+        drop(db);
+        assert!(hermes::load_offline_messages(&path, "child")
+            .unwrap_err()
+            .contains("parent session is missing"));
+    }
+
+    #[test]
+    fn hermes_offline_backup_rejects_unrecognized_layout_and_sidecars() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("payload");
+        write_hermes_backup_store(&payload.join("default/state.db"), "s", None);
+        std::fs::write(payload.join("default/state.db-wal"), []).unwrap();
+        assert!(list_backup_sessions("hermes", &payload).is_err());
+        std::fs::remove_file(payload.join("default/state.db-wal")).unwrap();
+        std::fs::write(payload.join("unrecognized.json"), "{}").unwrap();
+        assert!(list_backup_sessions("hermes", &payload).is_err());
+        std::fs::remove_file(payload.join("unrecognized.json")).unwrap();
+        write_hermes_backup_store(&payload.join("profiles/%2e%2e/state.db"), "s", None);
+        assert!(list_backup_sessions("hermes", &payload).is_err());
     }
 
     #[test]

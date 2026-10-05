@@ -1,0 +1,15 @@
+# Context
+
+The existing Hermes provider owns native SQLite discovery and display normalization; its prior source evidence and tests are in `../2026-10-05-hermes-provider/`. This is the separately requested backup capability anticipated by that specification, not a change to ordinary Hermes session discovery or PowerPoint support.
+
+The existing headless backup protocol confines reads to an explicit verified payload, but assumes file-carried session identity for Claude, Codex and Copilot. Hermes retains several sessions in one database, so its dump contract adds an explicit native session ID while retaining the payload-relative carrier argument. The advertised `hermes-backup-v1` feature distinguishes implementations with strict Hermes inventory and offline support.
+
+The repository references `src-tauri/CLAUDE.md`, but that file is absent in this checkout. Root `CLAUDE.md` and the delegated Rust architect workflow govern this implementation. The harness-kit plugin is unavailable; the specification follows its documented file structure directly. Validation uses temporary databases and a single Rust test thread. No live source, settings, schedule or user backup is mutated by this work.
+
+Integration rebuilt the frontend and release executable at 1.28.0 and ccmsg at 7.142.0. Isolated plain ccmsg capture published and deeply verified directory and `tar.gz` snapshots of the installed Hermes database, then recovered its exact native session ID/title with complete offline tool-query coverage. Source database/WAL and actual ccmsg configuration hashes were unchanged. Native inventory and offline listing both rejected real Windows junction fixtures with exit 1; the target file remained unchanged. The owning ccmsg verification record is `docs/providers/hermes-backup.md`. Windows CLI execution was verified; no rendered GUI or other-platform execution is claimed.
+
+## Verification
+
+Tests-first discovery failed on the intended unimplemented stub before native implementation. Final focused verification passed 17 Hermes provider tests, 46 headless protocol tests and five targeted Codex confinement tests, all with one test thread. The tests cover opaque source inventory, independent profile stores with duplicate native IDs, unknown and recorded working directories, native lifecycle flags, Codex inference attribution, shared tool finalization, compression ancestry, missing explicit session IDs, unsupported schema/corruption, SQLite sidecars, encoded layout rejection and an unavailable live Hermes home. Existing Claude, Codex and Copilot offline tests remain green.
+
+Formatting, diff whitespace checks and `cargo clippy --all-targets --all-features -- -D warnings` passed, including after release metadata synchronized to 1.28.0. Windows immutable SQLite loading was exercised through the public offline dump; symlink-specific tests may skip when creating symlinks is unavailable. Production capture/read verification, a real Windows junction refusal, release versions and the required independent change verification were completed by the integrating ccmsg task. No GUI or other operating-system execution is claimed.

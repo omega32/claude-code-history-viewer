@@ -2,10 +2,11 @@
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, InferenceMetadata};
 use crate::providers::ProviderInfo;
-use crate::utils::build_provider_message;
+use crate::utils::{build_provider_message, inspect_path_without_aliases, is_symlink_or_reparse};
 use base64::Engine;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -54,8 +55,160 @@ const MESSAGE_COLUMNS: &[&str] = &[
     "tool_call_uids",
 ];
 
-fn homes() -> Vec<PathBuf> {
-    let home = std::env::var("HERMES_HOME")
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackupSource {
+    pub id: String,
+    pub root: String,
+    pub database_path: String,
+    pub relative_path: String,
+}
+
+pub(crate) fn backup_sources() -> Result<Vec<BackupSource>, String> {
+    match selected_home() {
+        Some(home) => backup_sources_in_home(&home),
+        None => Err("Cannot resolve the selected Hermes home".to_string()),
+    }
+}
+
+fn backup_source(
+    root: &Path,
+    id: String,
+    relative_path: String,
+) -> Result<Option<BackupSource>, String> {
+    let database = root.join("state.db");
+    let Some(metadata) = inspect_path_without_aliases(&database)? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Err(format!(
+            "Hermes database must be a regular file: {}",
+            database.display()
+        ));
+    }
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let database = database.canonicalize().map_err(|e| e.to_string())?;
+    if database.parent() != Some(root.as_path()) {
+        return Err("Hermes database escaped its selected root".to_string());
+    }
+    Ok(Some(BackupSource {
+        id,
+        root: root
+            .to_str()
+            .ok_or("Hermes root is not valid UTF-8")?
+            .to_string(),
+        database_path: database
+            .to_str()
+            .ok_or("Hermes database path is not valid UTF-8")?
+            .to_string(),
+        relative_path,
+    }))
+}
+
+fn backup_sources_in_home(home: &Path) -> Result<Vec<BackupSource>, String> {
+    let Some(metadata) = inspect_path_without_aliases(home)? else {
+        return Ok(Vec::new());
+    };
+    if !metadata.is_dir() {
+        return Err("Hermes home must be a regular directory".to_string());
+    }
+    let mut sources = Vec::new();
+    if let Some(source) =
+        backup_source(home, "default".to_string(), "default/state.db".to_string())?
+    {
+        sources.push(source);
+    }
+    let profiles = home.join("profiles");
+    if let Some(metadata) = inspect_path_without_aliases(&profiles)? {
+        if !metadata.is_dir() {
+            return Err("Hermes profiles must be a regular directory".to_string());
+        }
+        let entries = std::fs::read_dir(&profiles)
+            .map_err(|e| format!("Cannot enumerate Hermes profiles: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Cannot inspect Hermes profile: {e}"))?;
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if is_symlink_or_reparse(&metadata) {
+                return Err("Hermes profile contains a symbolic link or reparse point".to_string());
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or("Hermes profile name is not valid UTF-8")?;
+            let id = format!("profile-{:x}", Sha256::digest(name.as_bytes()));
+            if let Some(source) = backup_source(
+                &entry.path(),
+                id,
+                format!("profiles/{}/state.db", urlencoding::encode(name)),
+            )? {
+                sources.push(source);
+            }
+        }
+    }
+    sources.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let mut paths = HashSet::new();
+    for source in &sources {
+        let identity = if cfg!(windows) {
+            source.database_path.replace('\\', "/").to_lowercase()
+        } else {
+            source.database_path.clone()
+        };
+        if !paths.insert(identity) {
+            return Err("Hermes backup sources contain aliased databases".to_string());
+        }
+    }
+    Ok(sources)
+}
+
+pub(crate) struct OfflineSession {
+    pub session: ClaudeSession,
+    pub project_path: String,
+    pub hidden: bool,
+    pub archived: bool,
+    pub pinned: bool,
+}
+
+pub(crate) fn load_offline_sessions(path: &Path) -> Result<Vec<OfflineSession>, String> {
+    let conn = open_offline_db(path)?;
+    let native = rows(&conn, "sessions", SESSION_COLUMNS, None)?;
+    let sessions = sessions_in_conn(&conn, path, None, false)?;
+    sessions
+        .into_iter()
+        .map(|session| {
+            let row = native
+                .iter()
+                .find(|row| text(row, "id") == session.actual_session_id)
+                .ok_or("Hermes session metadata disappeared")?;
+            let cwd = text(row, "cwd");
+            Ok(OfflineSession {
+                project_path: if cwd.is_empty() {
+                    selector(path, "project", "")
+                } else {
+                    cwd.to_string()
+                },
+                hidden: flag(row, "hidden"),
+                archived: flag(row, "archived") || flag(row, "auto_archived"),
+                pinned: flag(row, "pinned"),
+                session,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn load_offline_messages(path: &Path, id: &str) -> Result<Vec<ClaudeMessage>, String> {
+    if id.trim().is_empty() || id.contains('\0') {
+        return Err("Hermes backup requires an explicit nonempty native session ID".to_string());
+    }
+    let conn = open_offline_db(path)?;
+    let native = rows(&conn, "sessions", SESSION_COLUMNS, None)?;
+    messages_in_conn(&conn, &native, id)
+}
+
+fn selected_home() -> Option<PathBuf> {
+    std::env::var("HERMES_HOME")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|value| {
@@ -73,9 +226,11 @@ fn homes() -> Vec<PathBuf> {
             } else {
                 dirs::home_dir().map(|p| p.join(format!(".hermes{suffix}")))
             }
-        });
-    let Some(home) = home else { return Vec::new() };
-    stores_in_home(&home)
+        })
+}
+
+fn homes() -> Vec<PathBuf> {
+    selected_home().map_or_else(Vec::new, |home| stores_in_home(&home))
 }
 
 fn expand_home(
@@ -160,12 +315,54 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn rows(
-    conn: &Connection,
-    table: &str,
-    wanted: &[&str],
-    session: Option<&str>,
-) -> Result<Vec<Value>, String> {
+fn open_offline_db(path: &Path) -> Result<Connection, String> {
+    let metadata =
+        inspect_path_without_aliases(path)?.ok_or("Hermes backup database is missing")?;
+    if !metadata.is_file() {
+        return Err("Hermes backup database must be a regular file".to_string());
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        if inspect_path_without_aliases(Path::new(&sidecar))?.is_some() {
+            return Err(
+                "Hermes backup database must be standalone without SQLite sidecars".to_string(),
+            );
+        }
+    }
+    let uri = format!(
+        "file:{}?immutable=1",
+        urlencoding::encode(
+            path.to_str()
+                .ok_or("Hermes backup path is not valid UTF-8")?
+        )
+    );
+    // Published backups are standalone snapshots: immutable prevents sidecar creation or live WAL consultation.
+    let conn = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| format!("Cannot open Hermes backup database: {e}"))?;
+    conn.execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    let mut check = conn
+        .prepare("PRAGMA quick_check")
+        .map_err(|e| e.to_string())?;
+    let results = check
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if results != ["ok"] {
+        return Err("Hermes backup database failed SQLite quick_check".to_string());
+    }
+    drop(check);
+    schema_columns(&conn, "sessions")?;
+    schema_columns(&conn, "messages")?;
+    Ok(conn)
+}
+
+fn schema_columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
     let mut schema = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| e.to_string())?;
@@ -179,9 +376,19 @@ fn rows(
     } else {
         &["id", "session_id", "role", "content", "timestamp"]
     };
-    if required.iter().any(|c| !available.contains(*c)) {
+    if required.iter().any(|column| !available.contains(*column)) {
         return Err(format!("Unsupported Hermes {table} schema"));
     }
+    Ok(available)
+}
+
+fn rows(
+    conn: &Connection,
+    table: &str,
+    wanted: &[&str],
+    session: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let available = schema_columns(conn, table)?;
     let columns: Vec<&str> = wanted
         .iter()
         .copied()
@@ -886,6 +1093,103 @@ mod tests {
             INSERT INTO messages (session_id, role, content, timestamp, display_order) VALUES ('s', 'user', 'Hello', 100, 1);
             INSERT INTO messages (session_id, role, content, timestamp, display_order) VALUES ('s', 'assistant', 'Response', 102, 2);").unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn backup_inventory_covers_default_and_profiles_without_opening_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.db"), "not opened by discovery").unwrap();
+        let profile = dir.path().join("profiles/work space");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("state.db"), "not opened by discovery").unwrap();
+        let stores = backup_sources_in_home(dir.path()).unwrap();
+        assert_eq!(stores.len(), 2);
+        assert_eq!(stores[0].id, "default");
+        assert_eq!(stores[0].relative_path, "default/state.db");
+        assert_eq!(
+            stores[1].id,
+            format!("profile-{:x}", Sha256::digest(b"work space"))
+        );
+        assert_eq!(stores[1].relative_path, "profiles/work%20space/state.db");
+        assert_eq!(
+            stores[1].root,
+            profile.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(backup_sources_in_home(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_file(profile.join("state.db")).unwrap();
+        std::fs::create_dir(profile.join("state.db")).unwrap();
+        assert!(backup_sources_in_home(dir.path()).is_err());
+    }
+
+    #[test]
+    fn offline_backup_reads_standalone_store_and_native_flags_without_sidecars() {
+        let (dir, db) = fixture();
+        db.execute_batch("ALTER TABLE sessions ADD hidden INTEGER; ALTER TABLE sessions ADD archived INTEGER; ALTER TABLE sessions ADD pinned INTEGER;
+            UPDATE sessions SET hidden=1, archived=1, pinned=1;
+            PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+        drop(db);
+        let path = dir.path().join("state.db");
+        let before = std::fs::read(&path).unwrap();
+        let listed = load_offline_sessions(&path).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session.actual_session_id, "s");
+        assert!(listed[0].project_path.starts_with("hermes://"));
+        assert!(listed[0].hidden && listed[0].archived && listed[0].pinned);
+        let messages = load_offline_messages(&path, "s").unwrap();
+        assert_eq!(messages[0].content, Some(json!("Hello")));
+        assert_eq!(
+            messages[1]
+                .inference
+                .as_ref()
+                .unwrap()
+                .model_provider
+                .as_deref(),
+            Some("openai-codex")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!dir.path().join("state.db-shm").exists());
+        assert!(load_offline_messages(&path, "").is_err());
+        std::fs::write(dir.path().join("state.db-wal"), []).unwrap();
+        assert!(load_offline_sessions(&path).is_err());
+    }
+
+    #[test]
+    fn offline_backup_refuses_corrupt_or_unsupported_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        std::fs::write(&path, "not a SQLite database").unwrap();
+        assert!(load_offline_sessions(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE sessions(id TEXT, started_at REAL); CREATE TABLE messages(id INTEGER, role TEXT, content TEXT, timestamp REAL);").unwrap();
+        drop(db);
+        assert!(load_offline_sessions(&path)
+            .err()
+            .unwrap()
+            .contains("Unsupported Hermes messages schema"));
+    }
+
+    #[test]
+    fn backup_inventory_rejects_symlink_or_reparse_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("state.db"), "opaque bytes").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, home.join("profiles")).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(&real, home.join("profiles")).is_err() {
+                return;
+            }
+        }
+        assert!(backup_sources_in_home(&home)
+            .unwrap_err()
+            .contains("symbolic link or reparse point"));
     }
 
     #[test]

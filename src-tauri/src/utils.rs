@@ -12,6 +12,57 @@ const ESTIMATED_BYTES_PER_LINE: usize = 500;
 /// Average bytes per message for file size estimation
 const AVERAGE_MESSAGE_SIZE_BYTES: f64 = 1000.0;
 
+pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn inspect_path_without_aliases(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    if !path.is_absolute() {
+        return Err("Path must be absolute".to_string());
+    }
+    let mut current = std::path::PathBuf::new();
+    let mut last = None;
+    for component in path.components() {
+        if matches!(component, Component::CurDir | Component::ParentDir) {
+            return Err("Path must not contain traversal components".to_string());
+        }
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect path {}: {error}",
+                    current.display()
+                ))
+            }
+        };
+        if is_symlink_or_reparse(&metadata) {
+            return Err(format!(
+                "Path contains a symbolic link or reparse point: {}",
+                current.display()
+            ));
+        }
+        last = Some(metadata);
+    }
+    Ok(last)
+}
+
 /// Find line boundaries in a memory-mapped buffer using memchr (SIMD-accelerated)
 /// Returns a vector of (start, end) byte positions for each line
 /// Empty lines are skipped

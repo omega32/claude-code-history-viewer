@@ -7,7 +7,7 @@ use crate::models::{
 };
 use crate::utils::{
     build_provider_message, estimate_message_count_from_size, find_line_ranges,
-    search_json_value_case_insensitive,
+    is_symlink_or_reparse, search_json_value_case_insensitive,
 };
 use base64::prelude::{Engine as _, BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -2710,22 +2710,6 @@ pub(crate) fn load_session_subagent_relations(
         }
     }
     Ok(descendants)
-}
-
-fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
 }
 
 /// Load sessions for a Codex project (filtered by cwd)

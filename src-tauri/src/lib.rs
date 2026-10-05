@@ -166,6 +166,9 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_list_backup_sessions(&args));
         }
+        if args.iter().any(|a| a == "--hermes-backup-sources") {
+            std::process::exit(headless_dump::run_hermes_backup_sources(&args));
+        }
         // Legacy alias for Claude VS Code's archive marker (`hiddenSessionIds`).
         if args
             .iter()
