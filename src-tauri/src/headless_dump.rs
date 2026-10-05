@@ -1743,9 +1743,19 @@ fn wrap_session_listing(
     copilot: &CopilotClassifier,
     codex_imports: &HashMap<String, Option<String>>,
 ) -> SessionWithProjectPath {
-    let (is_orphan, copilot_archived, is_pinned) = copilot.classify(&session);
+    let (is_orphan, copilot_archived, copilot_pinned) = copilot.classify(&session);
+    let (hermes_hidden, hermes_archived, hermes_pinned) = if provider == "hermes" {
+        crate::providers::hermes::lifecycle(&session.file_path).unwrap_or_else(|error| {
+            log::warn!("Hermes lifecycle read failed: {error}");
+            (false, false, false)
+        })
+    } else {
+        (false, false, false)
+    };
+    let is_pinned = copilot_pinned || hermes_pinned;
     let claude_archived = provider == "claude" && hidden.contains(&session.actual_session_id);
     let is_archived = copilot_archived
+        || hermes_archived
         || claude_archived
         || (provider == "codex" && codex::is_archived_session_path(Path::new(&session.file_path)));
     let is_imported = codex_imports.contains_key(&session.actual_session_id);
@@ -1754,7 +1764,7 @@ fn wrap_session_listing(
         .cloned()
         .flatten();
     SessionWithProjectPath {
-        is_hidden: claude_archived,
+        is_hidden: claude_archived || hermes_hidden,
         is_orphan,
         is_archived,
         is_pinned,

@@ -38,6 +38,7 @@ pub async fn scan_all_projects(
             "pearai".to_string(),
             "copilot".to_string(),
             "powerpoint".to_string(),
+            "hermes".to_string(),
             "gemini".to_string(),
             "goose".to_string(),
             "kimi".to_string(),
@@ -150,6 +151,7 @@ pub async fn scan_all_projects(
         ("llm", providers::llm::scan_projects),
         ("copilot", providers::copilot::scan_projects),
         ("powerpoint", providers::powerpoint::scan_projects),
+        ("hermes", providers::hermes::scan_projects),
     ];
 
     // Spawn every enabled scanner up front so they run concurrently on the
@@ -321,6 +323,7 @@ pub async fn load_provider_sessions(
         "pearai" => providers::pearai::load_sessions(&project_path, exclude),
         "copilot" => providers::copilot::load_sessions(&project_path, exclude),
         "powerpoint" => providers::powerpoint::load_sessions(&project_path, exclude),
+        "hermes" => providers::hermes::load_sessions(&project_path, exclude),
         "gemini" => providers::gemini::load_sessions(&project_path, exclude),
         "goose" => providers::goose::load_sessions(&project_path, exclude),
         "kimi" => providers::kimi::load_sessions(&project_path, exclude),
@@ -434,6 +437,7 @@ fn load_non_claude_messages(
         "pearai" => providers::pearai::load_messages(session_path),
         "copilot" => providers::copilot::load_messages(session_path),
         "powerpoint" => providers::powerpoint::load_messages(session_path),
+        "hermes" => providers::hermes::load_messages(session_path),
         "gemini" => providers::gemini::load_messages(session_path),
         "goose" => providers::goose::load_messages(session_path),
         "kimi" => providers::kimi::load_messages(session_path),

@@ -8,7 +8,7 @@
 // Provider Types
 // ============================================================================
 
-export type ProviderId = "aider" | "amazonq" | "antigravity" | "claude" | "cline" | "codebuddy" | "codex" | "continue" | "copilot" | "crush" | "cursor" | "cursor-agent" | "forgecode" | "gemini" | "goose" | "kimi" | "kiro" | "llm" | "ompi" | "opencode" | "openhands" | "openinterpreter" | "pearai" | "pi" | "qwen" | "trae" | "vibe" | "zed";
+export type ProviderId = "aider" | "amazonq" | "antigravity" | "claude" | "cline" | "codebuddy" | "codex" | "continue" | "copilot" | "crush" | "cursor" | "cursor-agent" | "forgecode" | "gemini" | "goose" | "hermes" | "kimi" | "kiro" | "llm" | "ompi" | "opencode" | "openhands" | "openinterpreter" | "pearai" | "pi" | "powerpoint" | "qwen" | "trae" | "vibe" | "zed";
 
 export interface ProviderInfo {
   id: ProviderId;
@@ -56,7 +56,7 @@ export interface ClaudeProject {
   /** Provider identifier (claude, codex, opencode) */
   provider?: ProviderId;
   /** Storage type (json, jsonl, sqlite) */
-  storage_type?: "json" | "jsonl" | "sqlite";
+  storage_type?: "json" | "jsonl" | "sqlite" | "indexeddb";
   /** Label for custom Claude directory source (e.g., "Personal") */
   custom_directory_label?: string;
 }
@@ -92,16 +92,17 @@ export interface ClaudeSession {
   /** Provider identifier (claude, codex, opencode) */
   provider?: ProviderId;
   /** Storage type (json, jsonl, sqlite) */
-  storage_type?: "json" | "jsonl" | "sqlite";
+  storage_type?: "json" | "jsonl" | "sqlite" | "indexeddb";
   /**
-   * Originating client/surface for the session. Raw value from the JSONL
-   * `entrypoint` field. Known values:
+   * Recorded originating client/surface for the session. Known values:
    *   * Claude:  "cli" / "claude-vscode" / "claude-desktop"
    *   * Copilot: "copilot-cli" / "copilot-desktop" / "copilot-vscode"
+   *   * Hermes: "hermes-cli" / "hermes-desktop" (other sources remain raw)
+   *   * PowerPoint: "claude-powerpoint"
    * Undefined for providers that don't stamp the field, or older sessions.
    */
   entrypoint?: string;
-  /** Parent session id for a provider-reported fork (currently Codex). */
+  /** Parent session id for a provider-reported explicit fork (Codex or Hermes). */
   forked_from_id?: string;
   /** Structurally authenticated child-agent identity and spawn boundary. */
   subagent_provenance?: SubagentProvenance;

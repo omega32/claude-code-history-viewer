@@ -54,6 +54,7 @@ describe("providers utils", () => {
       "forgecode",
       "gemini",
       "goose",
+      "hermes",
       "kimi",
       "kiro",
       "llm",
@@ -71,6 +72,10 @@ describe("providers utils", () => {
   });
 
   it("knows which providers support conversation breakdown", () => {
+    expect(getProviderId("hermes")).toBe("hermes");
+    expect(supportsNativeRename("hermes")).toBe(false);
+    expect(supportsSessionDeletion("hermes")).toBe(false);
+    expect(getResumeCommand("hermes", "session-id")).toBeNull();
     expect(supportsConversationBreakdown("claude")).toBe(true);
     expect(supportsConversationBreakdown("antigravity")).toBe(true);
     expect(supportsConversationBreakdown("forgecode")).toBe(true);

@@ -77,14 +77,13 @@ pub struct ClaudeSession {
     /// Storage type (json, sqlite)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_type: Option<String>,
-    /// Originating client for Claude Code sessions: "cli" / "claude-vscode" / "claude-desktop".
-    /// `None` for non-Claude providers or sessions predating the entrypoint field.
+    /// Provider-recorded originating client/surface; absent when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
     /// Parent session id for an explicitly forked session.
     ///
-    /// Codex supplies this as `session_meta.payload.forked_from_id`. Other
-    /// providers and native sessions leave it absent.
+    /// Codex supplies this as `session_meta.payload.forked_from_id`; Hermes
+    /// supplies it only for an explicit native branch/reset boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<String>,
     /// Provider-authenticated provenance for a spawned sub-agent session.

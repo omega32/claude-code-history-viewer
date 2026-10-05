@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Hermes native provider:** `src-tauri/src/providers/hermes.rs` owns read-only `state.db` discovery and display-history normalization, independently of the inference backend. Use the existing normalized provider/listing/dump pipeline; do not invoke Hermes's database initializer or inherit another provider's lifecycle writers, snapshot cursor or stable-record certification. The owning specification and source evidence are in `specs/2026-10-05-hermes-provider/`.
+
 If the user's prompt starts with “EP:”, then the user wants to enhance the prompt. Read the PROMPT_ENHANCER.md file and follow the guidelines to enhance the user's prompt. Show the user the enhancement and get their permission to run it before taking action on the enhanced prompt.
 
 The enhanced prompts will follow the language of the original prompt (e.g., Korean prompt input will output Korean prompt enhancements, English prompt input will output English prompt enhancements, etc.)

@@ -130,6 +130,8 @@
   "common.provider.forgecode": "ForgeCode",
   "common.provider.gemini": "Gemini CLI",
   "common.provider.goose": "Goose",
+  "common.provider.hermes": "Hermes",
+  "common.provider.powerpoint": "Claude for PowerPoint",
   "common.provider.kimi": "Kimi CLI",
   "common.provider.detectError": "Failed to detect providers. Using Claude only.",
   "common.provider.antigravity": "Antigravity",

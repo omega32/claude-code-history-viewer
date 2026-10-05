@@ -18,6 +18,7 @@ pub mod cursor_agent;
 pub mod forgecode;
 pub mod gemini;
 pub mod goose;
+pub mod hermes;
 pub mod kimi;
 pub mod kiro;
 pub mod llm;
@@ -85,6 +86,7 @@ pub enum ProviderId {
     CursorAgent,
     Gemini,
     Goose,
+    Hermes,
     Kimi,
     ForgeCode,
     Kiro,
@@ -129,6 +131,7 @@ impl ProviderId {
             Self::CursorAgent => "cursor-agent",
             Self::Gemini => "gemini",
             Self::Goose => "goose",
+            Self::Hermes => "hermes",
             Self::Kimi => "kimi",
             Self::ForgeCode => "forgecode",
             Self::Kiro => "kiro",
@@ -163,6 +166,7 @@ impl ProviderId {
             "cursor-agent" => Some(Self::CursorAgent),
             "gemini" => Some(Self::Gemini),
             "goose" => Some(Self::Goose),
+            "hermes" => Some(Self::Hermes),
             "kimi" => Some(Self::Kimi),
             "forgecode" => Some(Self::ForgeCode),
             "kiro" => Some(Self::Kiro),
@@ -198,6 +202,7 @@ impl ProviderId {
             Self::CursorAgent => "Cursor Agent",
             Self::Gemini => "Gemini CLI",
             Self::Goose => "Goose",
+            Self::Hermes => "Hermes",
             Self::Kimi => "Kimi CLI",
             Self::ForgeCode => "ForgeCode",
             Self::Kiro => "Kiro CLI",
@@ -315,6 +320,9 @@ pub fn detect_providers() -> Vec<ProviderInfo> {
         providers.push(info);
     }
     if let Some(info) = powerpoint::detect() {
+        providers.push(info);
+    }
+    if let Some(info) = hermes::detect() {
         providers.push(info);
     }
 
