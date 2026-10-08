@@ -57,7 +57,7 @@ impl Default for MetadataState {
 
 /// Get the metadata folder path (~/.claude-history-viewer)
 fn get_metadata_folder() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer"))
 }
 

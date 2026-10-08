@@ -374,7 +374,7 @@ fn is_antigravity_path(path: &str) -> bool {
 /// Whether `path` lies under `~/.codebuddy/projects/`. Anchored detection avoids
 /// false positives from arbitrary substrings (e.g. `/work/foo.codebuddy-test`).
 fn is_codebuddy_path(path: &str) -> bool {
-    let Some(home) = crate::profile_paths::home_dir() else {
+    let Some(home) = dirs::home_dir() else {
         return false;
     };
     is_codebuddy_path_under(path, &home)

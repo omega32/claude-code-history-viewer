@@ -26,7 +26,7 @@ pub fn get_base_path() -> Option<String> {
             return Some(val);
         }
     }
-    crate::profile_paths::home_dir().map(|h| h.join(".gemini").to_string_lossy().to_string())
+    dirs::home_dir().map(|h| h.join(".gemini").to_string_lossy().to_string())
 }
 
 /// Scan for all Gemini CLI projects from a specific base path.

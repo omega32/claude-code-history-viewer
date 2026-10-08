@@ -290,6 +290,54 @@ where
 mod tests {
     use super::*;
 
+    mod upstream_style {
+        use dirs::home_dir as resolve_home;
+        use std::path::PathBuf;
+
+        pub fn directories() -> [Option<PathBuf>; 8] {
+            [
+                resolve_home(),
+                dirs::data_dir(),
+                dirs::data_local_dir(),
+                dirs::config_dir(),
+                dirs::cache_dir(),
+                dirs::download_dir(),
+                dirs::document_dir(),
+                dirs::desktop_dir(),
+            ]
+        }
+    }
+
+    #[test]
+    fn directory_compatibility_fails_closed_without_a_scope() {
+        assert!(upstream_style::directories().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn directory_compatibility_resolves_nested_imports_inside_the_owned_scope() {
+        let profile = TestProfile::new().unwrap();
+        let expected = [
+            profile.path().to_path_buf(),
+            profile.path().join(".test-data"),
+            profile.path().join(".test-local-data"),
+            profile.path().join(".test-config"),
+            profile.path().join(".test-cache"),
+            profile.path().join("Downloads"),
+            profile.path().join("Documents"),
+            profile.path().join("Desktop"),
+        ]
+        .map(Some);
+
+        assert_eq!(upstream_style::directories(), expected);
+        assert!(std::thread::spawn(upstream_style::directories)
+            .join()
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+        drop(profile);
+        assert!(upstream_style::directories().iter().all(Option::is_none));
+    }
+
     #[test]
     fn native_directory_dispatch_preserves_the_native_result() {
         let native: fn() -> Option<PathBuf> = || Some(PathBuf::from("native-directory-sentinel"));

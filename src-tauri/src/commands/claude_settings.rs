@@ -41,19 +41,19 @@ pub struct AllMCPServers {
 
 /// Get the user settings path (~/.claude/settings.json)
 fn get_user_settings_path() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude").join("settings.json"))
 }
 
 /// Get the user MCP settings path (~/.claude/.mcp.json)
 fn get_user_mcp_path() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude").join(".mcp.json"))
 }
 
 /// Get the main Claude config path (~/.claude.json) - the official config file
 fn get_claude_json_path() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude.json"))
 }
 
@@ -596,7 +596,7 @@ pub(crate) fn validate_dialog_path(path: &Path) -> Result<(), String> {
 /// `Ok(())` if path is safe, error message if not
 #[cfg(feature = "webui-server")]
 pub(crate) fn is_safe_path(path: &Path) -> Result<(), String> {
-    let home_raw = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home_raw = dirs::home_dir().ok_or("Could not find home directory")?;
     // Canonicalize home to resolve symlinks (e.g. macOS /var → /private/var)
     let home = home_raw.canonicalize().unwrap_or_else(|_| home_raw.clone());
     let home = strip_windows_prefix(&home);
@@ -604,9 +604,9 @@ pub(crate) fn is_safe_path(path: &Path) -> Result<(), String> {
     // Fall back to home-relative paths when the API returns None.
     let mut allowed_dirs = vec![home.join(".claude-history-viewer").join("exports")];
     for (api_dir, fallback_name) in [
-        (crate::profile_paths::download_dir(), "Downloads"),
-        (crate::profile_paths::document_dir(), "Documents"),
-        (crate::profile_paths::desktop_dir(), "Desktop"),
+        (dirs::download_dir(), "Downloads"),
+        (dirs::document_dir(), "Documents"),
+        (dirs::desktop_dir(), "Desktop"),
     ] {
         let resolved = api_dir.unwrap_or_else(|| home.join(fallback_name));
         let resolved =

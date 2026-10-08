@@ -1,7 +1,7 @@
 //! `llm` provider (Simon Willison's `llm` CLI, `github.com/simonw/llm`).
 //!
 //! Reads the `SQLite` log at `<app-dir>/logs.db` where `<app-dir>` =
-//! `click.get_app_dir("io.datasette.llm")` (which matches `crate::profile_paths::config_dir()`
+//! `click.get_app_dir("io.datasette.llm")` (which matches `dirs::config_dir()`
 //! on every OS) — overridable via `LLM_USER_PATH`. Logging is on by default.
 //!
 //! `llm` has no project/`cwd` concept, so everything is surfaced under one
@@ -32,11 +32,7 @@ fn get_db_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p).join("logs.db"));
         }
     }
-    Some(
-        crate::profile_paths::config_dir()?
-            .join("io.datasette.llm")
-            .join("logs.db"),
-    )
+    Some(dirs::config_dir()?.join("io.datasette.llm").join("logs.db"))
 }
 
 /// Detect an `llm` installation (only when the logs DB exists).

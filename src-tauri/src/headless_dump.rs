@@ -1046,7 +1046,7 @@ const CLAUDE_VSCODE_STATE_KEY: &str = "Anthropic.claude-code";
 /// `state.vscdb` paths for every installed editor flavor that can host the
 /// Claude Code extension (stock VS Code, its insiders/OSS builds, and the forks).
 fn claude_global_state_dbs() -> Vec<PathBuf> {
-    let Some(home) = crate::profile_paths::home_dir() else {
+    let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
     const FLAVORS: [&str; 6] = [

@@ -140,7 +140,7 @@ fn global_dir_for(f: &Family) -> Option<PathBuf> {
             }
         }
     }
-    Some(crate::profile_paths::home_dir()?.join(f.home_subdir))
+    Some(dirs::home_dir()?.join(f.home_subdir))
 }
 
 /// Base path (`<global-dir>/sessions`); `None` unless the directory exists.

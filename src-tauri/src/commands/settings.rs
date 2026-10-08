@@ -39,7 +39,7 @@ pub struct PresetInput {
 
 /// Get the presets folder path (~/.claude-history-viewer/presets)
 fn get_presets_folder() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer").join("presets"))
 }
 

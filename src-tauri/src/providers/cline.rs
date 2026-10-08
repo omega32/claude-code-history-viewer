@@ -267,7 +267,7 @@ fn get_all_base_paths() -> Vec<(PathBuf, String)> {
         ("Codium", "VSCodium"),
     ];
 
-    if let Some(home) = crate::profile_paths::home_dir() {
+    if let Some(home) = dirs::home_dir() {
         let app_support = home.join("Library/Application Support");
 
         for (editor_dir, editor_label) in editors {
@@ -288,7 +288,7 @@ fn get_all_base_paths() -> Vec<(PathBuf, String)> {
 
     // Linux: ~/.config/<editor>/User/globalStorage/
     #[cfg(target_os = "linux")]
-    if let Some(config) = crate::profile_paths::config_dir() {
+    if let Some(config) = dirs::config_dir() {
         for (editor_dir, editor_label) in editors {
             let global_storage = config.join(editor_dir).join("User/globalStorage");
             if !global_storage.is_dir() {

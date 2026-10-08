@@ -215,7 +215,7 @@ fn selected_home() -> Option<PathBuf> {
             expand_home(
                 &value,
                 |name| crate::profile_paths::env::var(name).ok(),
-                crate::profile_paths::home_dir().as_deref(),
+                dirs::home_dir().as_deref(),
                 &std::env::current_dir().unwrap_or_default(),
             )
         })
@@ -223,9 +223,9 @@ fn selected_home() -> Option<PathBuf> {
             let suffix =
                 crate::profile_paths::env::var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
             if cfg!(windows) {
-                crate::profile_paths::data_local_dir().map(|p| p.join(format!("hermes{suffix}")))
+                dirs::data_local_dir().map(|p| p.join(format!("hermes{suffix}")))
             } else {
-                crate::profile_paths::home_dir().map(|p| p.join(format!(".hermes{suffix}")))
+                dirs::home_dir().map(|p| p.join(format!(".hermes{suffix}")))
             }
         })
 }

@@ -36,13 +36,13 @@ const UNKNOWN_WORKSPACE: &str = "unknown";
 
 fn get_db_path() -> Option<PathBuf> {
     // Mirror Zed's own `paths::data_dir()`. macOS uses ~/Library/Application
-    // Support (== crate::profile_paths::data_dir); Linux/FreeBSD and Windows use the *local*
-    // data dir (XDG_DATA_HOME / %LOCALAPPDATA%, == crate::profile_paths::data_local_dir), NOT
+    // Support (== dirs::data_dir); Linux/FreeBSD and Windows use the *local*
+    // data dir (XDG_DATA_HOME / %LOCALAPPDATA%, == dirs::data_local_dir), NOT
     // the roaming dir. The app folder is lowercase "zed" only on Linux/FreeBSD.
     let base = if cfg!(target_os = "macos") {
-        crate::profile_paths::data_dir()?
+        dirs::data_dir()?
     } else {
-        crate::profile_paths::data_local_dir()?
+        dirs::data_local_dir()?
     };
     let app_name = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
         "zed"

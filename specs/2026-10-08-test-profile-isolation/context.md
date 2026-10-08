@@ -46,3 +46,25 @@ The monitored scope is exactly Claude's `settings.json`, all files under `.claud
 ## Completion
 
 Independent architecture, change and claim reviews reconciled the final source, workflow contracts and measured evidence. The supported test boundary, local gates and documentation are complete; normal application path dispatch is preserved by source review, compilation and the native-dispatch sentinel regression, without claiming a live KnownFolder comparison. Version parity is 1.29.1 across package, Cargo manifest/lock and Tauri configuration. No commit, release publication or live diagnostic was performed.
+
+## Upstream merge compatibility follow-up
+
+The user identified the recurring merge/rebase cost of the 77-file hardening change, subsequently committed as `4c53fef`. A clean baseline at that commit and the original index digest are retained in ignored `scratch/profile-compatibility/baseline.json`. The follow-up refines the existing isolation architecture rather than changing its compile-time activation or fixture ownership model; [the original ADR](../../docs/adr/0001-test-profile-isolation.md) owns the compatibility decision.
+
+A root extern alias and eight crate-private reexports restore 83 directory references across 44 library files to upstream `dirs::` spelling. Comparing the complete hardening delta against `16a5bbc`, the affected-file footprint falls from 77 to 64, with 13 files restored completely. This measures source overlap, not a guarantee that a future upstream merge has no conflicts. No per-module compatibility imports, standard-library/Tauri facade or new dependency is introduced; explicit environment, owned-worker, managed-settings, WSL and external-target boundaries remain intact.
+
+The source preflight certifies the root declaration/export set and the sole reviewed native dependency declaration, limits accepted compatibility members to the eight functions, and rejects competing aliases, raw-identifier bindings, qualified foreign namespaces and separate-target use. Tests reproduced certification gaps before their corrections, including a JSON-macro value whose preceding single colon initially caused a false refusal. Nested Rust tests first failed to compile without the alias, then passed with scoped and missing-context behavior. A separate compile-only canary with the same root alias and real Clippy rules rejected direct native, renamed native and ambient environment function references without executing them.
+
+Version decision: 1.29.1 → 1.29.2, a compatible runtime refactor under the existing version policy. The canonical package version was advanced once and synchronized with the repository helper.
+
+Final local validation is retained under ignored `scratch/profile-compatibility/`:
+
+- `corepack pnpm test:rust:check`: strict TypeScript compilation and **173/173** runner/preflight checks passed (`runner-green.log`). The two new Rust compatibility regressions also passed in the focused run (`rust-green.log`).
+- `corepack pnpm test:rust`: **1,135 passed, zero failed, nine live diagnostics ignored**: 1,125 unit tests and ten fixture integrations (`rust-full.log`).
+- `corepack pnpm test:rust nextest --profile ci --features webui-server`: **1,176 passed, zero failed, nine live diagnostics skipped** (`nextest-webui.log`). The configured JUnit artifact at `src-tauri/target/test-isolated/nextest/ci/junit.xml` independently contains 1,176 cases, zero failures and zero errors (`junit-summary.json`). As before, this local Windows run does not establish Unix-only or remote CI results.
+- Native `cargo clippy --all-targets --all-features -- -D warnings`, isolated `corepack pnpm test:rust clippy`, `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` and `git diff --check` passed. The compile-only canary produced the expected three Clippy refusals (`clippy-native.log`, `clippy-isolated.log`, `clippy-bypass.log`).
+- Mechanical comparison against `4c53fef` confirms that all 43 restored files outside the crate root differ only by the directory-reference replacement and Rust formatting (`mechanical-restoration.json`); the root alias and adapter regressions were reviewed separately. Package, Cargo manifest/lock and Tauri version parity is 1.29.2.
+
+The **20:50:06–21:02:43 UTC** comparison found **all 1,247 monitored files unchanged**, with zero additions, removals or changed SHA-256 digests, byte lengths or exact last-write timestamps (`protected-before.json`, `protected-after.json`, `protected-comparison.json`). Its scope remains exactly Claude's `settings.json`, viewer data and the top-level Codex viewer-cache files described above; it does not establish a whole-profile filesystem sandbox. No live diagnostic, upstream merge/rebase, release publication or Git commit was performed.
+
+Independent architecture, change and claim reviews found no remaining material findings. Final Git verification retained baseline HEAD `4c53fef` and the exact original index digest, with no staged paths (`final-state.json`).

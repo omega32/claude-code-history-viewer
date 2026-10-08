@@ -1551,7 +1551,7 @@ pub fn get_base_path() -> Option<String> {
     }
 
     // Default: ~/.codex
-    let home = crate::profile_paths::home_dir()?;
+    let home = dirs::home_dir()?;
     let codex_path = home.join(".codex");
     if codex_path.exists() {
         Some(codex_path.to_string_lossy().to_string())

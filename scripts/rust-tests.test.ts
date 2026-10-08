@@ -331,6 +331,100 @@ function boundaryFixture(context: TestContext) {
 
 const firstProfileGuard = 'let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new().expect("fixture profile");';
 const firstLiveAssertion = "assert!(claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled());";
+const directoryCompatibility = `
+  extern crate self as dirs;
+  pub(crate) use crate::profile_paths::{
+    cache_dir, config_dir, data_dir, data_local_dir, desktop_dir, document_dir, download_dir, home_dir,
+  };
+`;
+
+test("source preflight permits certified upstream-style directory calls and imports in library modules", (context) => {
+  const fixture = boundaryFixture(context);
+  fixture.write("src/lib.rs", directoryCompatibility);
+  fixture.write("Cargo.toml", '[dependencies]\nnative_dirs = { package = "dirs", version = "5.0" }\n');
+  fixture.write("src/providers/nested.rs", `
+    use dirs::home_dir as resolve_home;
+    use dirs::{config_dir as resolve_config, cache_dir};
+    fn profile() {
+      let _ = dirs::data_local_dir(); let _ = resolve_home(); let _ = resolve_config(); let _ = cache_dir();
+      let _ = serde_json::json!({ "cwd": dirs::home_dir() });
+    }
+  `);
+
+  assert.doesNotThrow(() => checkTestBoundary(fixture.root));
+});
+
+for (const [name, root] of [
+  ["missing alias", directoryCompatibility.replace("extern crate self as dirs;", "")],
+  ["nested alias", `mod nested { ${directoryCompatibility} }`],
+  ["foreign alias", directoryCompatibility.replace("crate self", "crate native_dirs")],
+  ["missing export", directoryCompatibility.replace("home_dir,", "")],
+  ["extra export", directoryCompatibility.replace("home_dir,", "home_dir, other,")],
+  ["duplicate export", directoryCompatibility.replace("home_dir,", "home_dir, home_dir,")],
+  ["renamed export", directoryCompatibility.replace("home_dir,", "home_dir as native_home,")],
+  ["foreign exports", directoryCompatibility.replace("crate::profile_paths", "native_dirs")],
+]) {
+  test(`source preflight rejects uncertified directory compatibility: ${name}`, (context) => {
+    const fixture = boundaryFixture(context);
+    fixture.write("src/lib.rs", root);
+    fixture.write("src/provider.rs", "fn profile() { let _ = dirs::home_dir(); }");
+    assert.throws(() => checkTestBoundary(fixture.root));
+  });
+}
+
+for (const source of [
+  "use other::dirs;", "use other::{dirs};", "use other as dirs;",
+  "extern crate other as dirs;", "mod dirs {}", "type dirs = Other;",
+  "use other as r#dirs;", "mod r#dirs {}", "use other::{r#dirs};",
+]) {
+  test(`source preflight rejects a competing directory namespace: ${source}`, (context) => {
+    const fixture = boundaryFixture(context);
+    fixture.write("src/lib.rs", directoryCompatibility);
+    fixture.write("src/provider.rs", `${source} fn profile() { let _ = dirs::home_dir(); }`);
+    assert.throws(() => checkTestBoundary(fixture.root));
+  });
+}
+
+for (const target of ["src/main.rs", "src/bin/extra.rs", "examples/probe.rs", "benches/probe.rs", "tests/probe.rs"]) {
+  test(`source preflight rejects library-only directory compatibility in ${target}`, (context) => {
+    const fixture = boundaryFixture(context);
+    fixture.write("src/lib.rs", directoryCompatibility);
+    fixture.write(target, "fn profile() { let _ = dirs::home_dir(); }");
+    assert.throws(() => checkTestBoundary(fixture.root));
+  });
+}
+
+for (const dependency of [
+  '[dependencies]\ndirs = "5.0"', '[dependencies]\n"dirs" = "5.0"',
+  '[dependencies.dirs]\nversion = "5.0"', 'dependencies = { dirs = "5.0" }',
+  '[dependencies]\nother_dirs = { package = "dirs", version = "5.0" }',
+  '[dependencies.other_dirs]\npackage = "dirs"\nversion = "5.0"',
+  '[dependencies.other_dirs]\n"package" = "dirs"\nversion = "5.0"',
+]) {
+  test(`source preflight rejects a competing native dependency: ${dependency}`, (context) => {
+    const fixture = boundaryFixture(context);
+    fixture.write("src/lib.rs", directoryCompatibility);
+    fixture.write("Cargo.toml", `${dependency}\n`);
+    assert.throws(() => checkTestBoundary(fixture.root));
+  });
+}
+
+for (const source of [
+  'fn bypass() { let _ = dirs::profile_paths::home_dir(); }',
+  'use dirs::*;', 'use dirs::{home_dir, other};',
+  'fn bypass() { let _ = other::dirs::home_dir(); }',
+  'fn bypass() { let _ = other :: dirs::home_dir(); }',
+  'fn bypass() { let _ = r#dirs::home_dir(); }',
+  'use other::{dirs::home_dir};',
+  'use other::{dirs::{home_dir as resolve_home}};',
+]) {
+  test(`source preflight limits compatibility to the eight directory functions: ${source}`, (context) => {
+    const fixture = boundaryFixture(context);
+    fixture.write("src/lib.rs", directoryCompatibility);
+    fixture.write("src/provider.rs", source);
+    assert.throws(() => checkTestBoundary(fixture.root));
+  });
+}
 
 test("source preflight permits the shared native adapter and an exact first fixture guard", (context) => {
   const fixture = boundaryFixture(context);

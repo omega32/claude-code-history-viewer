@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type Mode = 'test' | 'nextest' | 'coverage' | 'clippy' | 'live';
@@ -204,6 +204,44 @@ function checkEnvironmentSyntax(source: string, path: string): void {
   }
 }
 
+const directoryFunctions = new Set([
+  'home_dir', 'data_dir', 'data_local_dir', 'config_dir',
+  'cache_dir', 'download_dir', 'document_dir', 'desktop_dir',
+]);
+
+function directoryCompatibilityPrefix(code: string): string | undefined {
+  const prefix = /^\s*extern\s+crate\s+self\s+as\s+dirs\s*;\s*(?:#\s*\[\s*allow\s*\(\s*unused_imports\s*\)\s*\]\s*)?pub\s*\(\s*crate\s*\)\s+use\s+crate\s*::\s*profile_paths\s*::\s*\{([^{}]*)\}\s*;/.exec(code);
+  if (!prefix) return undefined;
+  const names = prefix[1]!.split(',').map(name => name.trim()).filter(Boolean);
+  return names.length === directoryFunctions.size && new Set(names).size === names.length
+    && names.every(name => directoryFunctions.has(name)) ? prefix[0] : undefined;
+}
+
+function withoutDirectoryCompatibility(code: string): string {
+  return code.replace(/\bdirs\s*::\s*(\w+|\{[^{}]*\})/g, (original: string, member: string, offset: number) => {
+    if (code.slice(0, offset).trimEnd().endsWith('::') || code[offset - 1] === '#') return original;
+    const names = member.startsWith('{')
+      ? member.slice(1, -1).split(',').map(name => name.trim()).filter(Boolean)
+      : [member];
+    return names.length > 0 && names.every(name => {
+      const imported = /^(\w+)(?:\s+as\s+\w+)?$/.exec(name);
+      return imported !== null && directoryFunctions.has(imported[1]!);
+    }) ? 'scoped_profile_directory' : original;
+  });
+}
+
+function checkDirectoryBindings(code: string, path: string): void {
+  code = code.replace(/\br#dirs\b/g, 'dirs');
+  if (/\b(?:mod|type|struct|enum|trait|fn|const|static)\s+dirs\b|\bextern\s+crate\s+dirs\b|\b(?:extern\s+crate|use)\b[^;]*\bas\s+dirs\b/.test(code)) {
+    throw new Error(`Competing directory compatibility binding: ${path}`);
+  }
+  for (const statement of code.matchAll(/\buse\b[^;]*;/g)) {
+    if (/\bdirs\b/.test(statement[0]) && !/^use\s+dirs\s*::/.test(statement[0])) {
+      throw new Error(`Competing directory compatibility import: ${path}`);
+    }
+  }
+}
+
 function rustFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
     const path = join(directory, entry.name);
@@ -214,12 +252,29 @@ function rustFiles(directory: string): string[] {
 
 export function checkTestBoundary(repositoryRoot: string): void {
   const sourceRoot = join(repositoryRoot, 'src-tauri', 'src');
+  const libraryRoot = join(sourceRoot, 'lib.rs');
+  const libraryCode = existsSync(libraryRoot) ? rustCode(readFileSync(libraryRoot, 'utf8')) : '';
+  const compatibilityPrefix = directoryCompatibilityPrefix(libraryCode);
+  const manifestPath = join(repositoryRoot, 'src-tauri', 'Cargo.toml');
+  if (existsSync(manifestPath)) {
+    const manifest = readFileSync(manifestPath, 'utf8').replace(/^\s*#.*$/gm, '');
+    const withoutNativeDependency = manifest.replace(/^\s*native_dirs\s*=\s*\{[^}\r\n]*\}\s*(?:#.*)?$/m, dependency =>
+      /\bpackage\s*=\s*["']dirs["']/.test(dependency) ? '' : dependency);
+    if (/\bdirs\b/.test(withoutNativeDependency)) {
+      throw new Error('The dirs package must use only the reviewed native_dirs dependency; dirs belongs to the library compatibility boundary.');
+    }
+  }
   const targets = [sourceRoot, join(repositoryRoot, 'src-tauri', 'examples'), join(repositoryRoot, 'src-tauri', 'benches')];
   for (const path of targets.filter(existsSync).flatMap(rustFiles)) {
     if (path === join(sourceRoot, 'profile_paths.rs')) continue;
     const source = readFileSync(path, 'utf8');
     checkEnvironmentSyntax(source, path);
-    const code = outsideProfileAdapter(rustCode(source));
+    let code = outsideProfileAdapter(rustCode(source));
+    if (path === libraryRoot && compatibilityPrefix !== undefined) code = code.slice(compatibilityPrefix.length);
+    checkDirectoryBindings(code, path);
+    const libraryModule = path.startsWith(sourceRoot + sep);
+    const separateTarget = path === join(sourceRoot, 'main.rs') || path.startsWith(join(sourceRoot, 'bin') + sep);
+    if (compatibilityPrefix !== undefined && libraryModule && !separateTarget) code = withoutDirectoryCompatibility(code);
     if (/\bnative_dirs\b|\bdirs\s*::|\b(?:std\s*::\s*)?env\s*::\s*(?:var|var_os|vars|vars_os|set_var|remove_var|home_dir)\b|\buse\s+std\s*::\s*env\b|\b(?:allow|expect)\s*\([^)]*\bdisallowed_methods\b/.test(code)) {
       throw new Error(`Native profile/environment bypass outside profile_paths.rs: ${path}`);
     }

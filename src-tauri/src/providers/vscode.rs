@@ -85,7 +85,7 @@ fn get_user_data_roots() -> Vec<UserDataRoot> {
             label: "VS Code",
         }];
     }
-    let Some(home) = crate::profile_paths::home_dir() else {
+    let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
 

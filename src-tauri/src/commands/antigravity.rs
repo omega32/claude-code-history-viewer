@@ -35,7 +35,7 @@ static MODEL_ALIAS_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(||
 
 /// 定位 antigravity 根目录：`~/.gemini/antigravity`
 pub fn get_antigravity_root() -> Option<PathBuf> {
-    crate::profile_paths::home_dir().map(|h| h.join(".gemini").join("antigravity"))
+    dirs::home_dir().map(|h| h.join(".gemini").join("antigravity"))
 }
 
 /// Resolves the antigravity root directory, with fallback discovery logic.
@@ -104,25 +104,23 @@ pub fn get_antigravity_rpc_cache_root(root: &Path) -> PathBuf {
 
 /// Discovers external state directories across platform-specific config locations.
 ///
-/// On macOS searches `~/Library/Application Support`; on Windows `crate::profile_paths::data_dir()`;
+/// On macOS searches `~/Library/Application Support`; on Windows `dirs::data_dir()`;
 /// on Linux checks `~/.config` and platform config dirs. Looks for directories
 /// containing a `monitor-state.json` file in their global storage subdirectory.
 fn discover_external_state_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let bases = if cfg!(target_os = "macos") {
-        crate::profile_paths::home_dir()
+        dirs::home_dir()
             .map(|home| vec![home.join("Library").join("Application Support")])
             .unwrap_or_default()
     } else if cfg!(target_os = "windows") {
-        crate::profile_paths::data_dir()
-            .map(|dir| vec![dir])
-            .unwrap_or_default()
+        dirs::data_dir().map(|dir| vec![dir]).unwrap_or_default()
     } else {
         let mut candidates = Vec::new();
-        if let Some(config_dir) = crate::profile_paths::config_dir() {
+        if let Some(config_dir) = dirs::config_dir() {
             candidates.push(config_dir);
         }
-        if let Some(home) = crate::profile_paths::home_dir() {
+        if let Some(home) = dirs::home_dir() {
             let fallback = home.join(".config");
             if !candidates.iter().any(|candidate| candidate == &fallback) {
                 candidates.push(fallback);

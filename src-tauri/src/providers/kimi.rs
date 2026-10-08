@@ -43,7 +43,7 @@ pub fn get_base_path() -> Option<String> {
         }
     }
 
-    let default = crate::profile_paths::home_dir()?.join(".kimi");
+    let default = dirs::home_dir()?.join(".kimi");
     if default.exists() {
         let normalized = default.canonicalize().unwrap_or(default);
         Some(normalized.to_string_lossy().to_string())
@@ -740,10 +740,7 @@ mod tests {
         let _home = crate::test_utils::TestHome::new();
         let _share = EnvVarGuard::remove("KIMI_SHARE_DIR");
         let _home_env = EnvVarGuard::remove("KIMI_HOME");
-        assert!(!crate::profile_paths::home_dir()
-            .unwrap()
-            .join(".kimi")
-            .exists());
+        assert!(!dirs::home_dir().unwrap().join(".kimi").exists());
         assert!(get_base_path().is_none());
     }
 }

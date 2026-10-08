@@ -366,16 +366,8 @@ mod tests {
     #[test]
     fn test_profile_guard_does_not_leak_to_an_unrelated_thread() {
         let home = TestHome::new();
-        assert_eq!(
-            crate::profile_paths::home_dir().as_deref(),
-            Some(home.path())
-        );
-        assert_eq!(
-            std::thread::spawn(crate::profile_paths::home_dir)
-                .join()
-                .unwrap(),
-            None
-        );
+        assert_eq!(dirs::home_dir().as_deref(), Some(home.path()));
+        assert_eq!(std::thread::spawn(dirs::home_dir).join().unwrap(), None);
     }
 
     #[test]
@@ -384,31 +376,22 @@ mod tests {
             crate::profile_paths::env::var_os("HOME"),
             crate::profile_paths::env::var_os("USERPROFILE"),
         );
-        let original_home = crate::profile_paths::home_dir();
+        let original_home = dirs::home_dir();
         assert!(
             original_home.is_none(),
             "test home requires an explicit guard"
         );
         let outer = TestHome::new();
-        assert_eq!(
-            crate::profile_paths::home_dir().as_deref(),
-            Some(outer.path())
-        );
+        assert_eq!(dirs::home_dir().as_deref(), Some(outer.path()));
         let result = std::panic::catch_unwind(|| {
             let inner = TestHome::new();
-            assert_eq!(
-                crate::profile_paths::home_dir().as_deref(),
-                Some(inner.path())
-            );
+            assert_eq!(dirs::home_dir().as_deref(), Some(inner.path()));
             panic!("exercise unwinding");
         });
         assert!(result.is_err());
-        assert_eq!(
-            crate::profile_paths::home_dir().as_deref(),
-            Some(outer.path())
-        );
+        assert_eq!(dirs::home_dir().as_deref(), Some(outer.path()));
         drop(outer);
-        assert_eq!(crate::profile_paths::home_dir(), original_home);
+        assert_eq!(dirs::home_dir(), original_home);
         assert_eq!(
             (
                 crate::profile_paths::env::var_os("HOME"),

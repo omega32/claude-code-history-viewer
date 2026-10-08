@@ -122,7 +122,7 @@ pub fn get_base_path() -> Option<String> {
             return Some(env);
         }
     }
-    let home = crate::profile_paths::home_dir()?;
+    let home = dirs::home_dir()?;
     let candidate = home.join(".copilot");
     if candidate.is_dir() {
         Some(candidate.to_string_lossy().to_string())

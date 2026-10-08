@@ -37,7 +37,7 @@ pub(crate) fn is_safe_session_path(path: &std::path::Path) -> Result<(), String>
             .unwrap_or_else(|| p.to_path_buf())
     }
 
-    let home_raw = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home_raw = dirs::home_dir().ok_or("Could not find home directory")?;
     let home = home_raw.canonicalize().unwrap_or_else(|_| home_raw.clone());
     let home = strip_windows_prefix(&home);
 

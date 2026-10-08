@@ -7,6 +7,7 @@ The previous Codex activity work repaired the Windows settings and archive tests
 ## Required behavior
 
 - Route application profile directory and environment access through one enforced Rust boundary. Unit tests and isolated integration builds must never fall back to native home, config, data, Windows KnownFolders or WSL discovery when fixture context is missing.
+- Preserve upstream library directory call sites through a small certified compatibility boundary, including nested modules and renamed/grouped imports. Keep the native dependency inaccessible through the compatibility namespace, reject competing bindings and separate-target use, and preserve the existing explicit environment and worker boundaries.
 - Keep fixture overrides scoped, nested and panic-safe; concurrent test contexts must not borrow each other's paths or mutate the process environment. Unpropagated worker threads must fail closed.
 - Cover settings, archives, Claude presets, MCP presets, unified presets and provider discovery through meaningful regression tests. Preserve normal native directory and environment behavior in desktop, headless, debug and release builds.
 - Separate live-profile diagnostics from default tests. Preserve the diagnostics behind an explicit opt-in command and disclose that provider session loading can write derived caches.

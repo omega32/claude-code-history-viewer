@@ -133,7 +133,7 @@ pub struct ExportResult {
 
 /// Returns the archives base directory path: `~/.claude-history-viewer/archives/`
 fn get_archives_dir() -> Result<PathBuf, String> {
-    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer").join("archives"))
 }
 
@@ -1313,7 +1313,7 @@ pub async fn get_expiring_sessions(
 
         // Read cleanupPeriodDays from ~/.claude/settings.json
         let cleanup_period_days: i64 = {
-            let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
+            let home = dirs::home_dir().ok_or("Could not find home directory")?;
             let settings_path = home.join(".claude").join("settings.json");
             if settings_path.exists() {
                 fs::read_to_string(&settings_path)

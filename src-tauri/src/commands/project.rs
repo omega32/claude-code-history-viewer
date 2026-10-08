@@ -64,8 +64,8 @@ pub async fn get_git_log(actual_path: String, limit: usize) -> Result<Vec<GitCom
 
 #[tauri::command]
 pub async fn get_claude_folder_path() -> Result<String, String> {
-    let home_dir = crate::profile_paths::home_dir()
-        .ok_or("HOME_DIRECTORY_NOT_FOUND:Could not determine home directory")?;
+    let home_dir =
+        dirs::home_dir().ok_or("HOME_DIRECTORY_NOT_FOUND:Could not determine home directory")?;
     let claude_path = home_dir.join(".claude");
 
     if !claude_path.exists() {
@@ -133,12 +133,12 @@ pub async fn detect_claude_config_dir() -> Result<Option<String>, String> {
 
     // Expand ~ to home directory (only exact "~" or "~/..." patterns)
     let expanded = if raw == "~" {
-        match crate::profile_paths::home_dir() {
+        match dirs::home_dir() {
             Some(home) => home.to_string_lossy().to_string(),
             None => raw,
         }
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        match crate::profile_paths::home_dir() {
+        match dirs::home_dir() {
             Some(home) => home.join(rest).to_string_lossy().to_string(),
             None => raw,
         }

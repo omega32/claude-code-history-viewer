@@ -21,10 +21,10 @@ pub fn detect() -> Option<ProviderInfo> {
 
 fn get_db_path() -> Option<PathBuf> {
     // data_local_dir(): macOS ~/Library/Application Support, Linux ~/.local/share,
-    // Windows %LOCALAPPDATA% — matches upstream kiro-cli (crate::profile_paths::data_local_dir).
+    // Windows %LOCALAPPDATA% — matches upstream kiro-cli (dirs::data_local_dir).
     // (Previously hardcoded Windows to AppData/Roaming, which was wrong.)
     Some(
-        crate::profile_paths::data_local_dir()?
+        dirs::data_local_dir()?
             .join("kiro-cli")
             .join("data.sqlite3"),
     )

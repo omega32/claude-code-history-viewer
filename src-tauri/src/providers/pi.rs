@@ -70,7 +70,7 @@ impl PiStore {
     /// Store root: `~/<dot_dir>/agent/sessions`.
     fn sessions_root(&self) -> Option<PathBuf> {
         Some(
-            crate::profile_paths::home_dir()?
+            dirs::home_dir()?
                 .join(self.dot_dir)
                 .join("agent")
                 .join("sessions"),

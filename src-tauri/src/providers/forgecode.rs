@@ -74,7 +74,7 @@ pub fn get_base_path() -> Option<String> {
         }
     }
 
-    let home = crate::profile_paths::home_dir()?;
+    let home = dirs::home_dir()?;
     let default_path = home.join(".forge");
     if default_path.exists() {
         Some(default_path.to_string_lossy().to_string())
@@ -1475,7 +1475,7 @@ fn extract_workspace_display_name_from_context_json(context_json: &str) -> Optio
 
 /// Extract a workspace display name from a JSON value.
 fn extract_workspace_display_name_from_value(value: &Value) -> Option<String> {
-    let home_dir = crate::profile_paths::home_dir();
+    let home_dir = dirs::home_dir();
     let home_dir = home_dir.as_deref();
     let mut cwd_votes: BTreeMap<String, usize> = BTreeMap::new();
     collect_workspace_display_name_votes(value, home_dir, &mut cwd_votes);
@@ -1574,7 +1574,7 @@ fn collect_cwd_votes(value: &Value, cwd_votes: &mut BTreeMap<String, usize>) {
 
 /// Picks the most-voted cwd, filtering out home directories.
 fn choose_best_cwd(cwd_votes: &BTreeMap<String, usize>) -> Option<String> {
-    let home_dir = crate::profile_paths::home_dir();
+    let home_dir = dirs::home_dir();
     cwd_votes
         .iter()
         .filter(|(path, _)| {
@@ -2238,7 +2238,7 @@ mod tests {
                     "message": {
                         "tool": {
                             "arguments": {
-                                "cwd": crate::profile_paths::home_dir().unwrap().to_string_lossy().to_string()
+                                "cwd": dirs::home_dir().unwrap().to_string_lossy().to_string()
                             }
                         }
                     }

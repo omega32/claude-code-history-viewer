@@ -33,9 +33,7 @@ const SUMMARY_MAX_CHARS: usize = 80;
 
 /// `~/.openhands/sessions` (the classic `file_store_path` default).
 fn sessions_dir() -> Option<PathBuf> {
-    let dir = crate::profile_paths::home_dir()?
-        .join(".openhands")
-        .join("sessions");
+    let dir = dirs::home_dir()?.join(".openhands").join("sessions");
     if dir.is_dir() {
         Some(dir)
     } else {
