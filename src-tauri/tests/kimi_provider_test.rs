@@ -6,6 +6,8 @@ use tempfile::TempDir;
 
 #[test]
 fn kimi_provider_scans_projects_from_sessions_tree() {
+    let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+        .expect("run integration tests through scripts/test-rust.ts");
     let base = fixture_base();
 
     let projects = providers::kimi::scan_projects_from_path(base.to_str().unwrap())
@@ -30,6 +32,8 @@ fn kimi_provider_scans_projects_from_sessions_tree() {
 
 #[test]
 fn kimi_provider_loads_sessions_with_titles_and_timestamps() {
+    let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+        .expect("run integration tests through scripts/test-rust.ts");
     let base = fixture_base();
     let project_path = format!(
         "kimi://{}",
@@ -56,6 +60,8 @@ fn kimi_provider_loads_sessions_with_titles_and_timestamps() {
 
 #[test]
 fn kimi_provider_loads_messages_without_internal_roles() {
+    let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+        .expect("run integration tests through scripts/test-rust.ts");
     let base = fixture_base();
     let session_dir = base.join("sessions").join("project-hash").join("session-1");
 
@@ -91,6 +97,8 @@ fn kimi_provider_loads_messages_without_internal_roles() {
 #[test]
 #[serial]
 fn kimi_provider_normalizes_relative_kimi_home_to_absolute_path() {
+    let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+        .expect("run integration tests through scripts/test-rust.ts");
     let temp_dir = TempDir::new().expect("temp dir should be created");
     let original_cwd = std::env::current_dir().expect("current dir should exist");
     let _cwd_guard = CurrentDirGuard::set(temp_dir.path());
@@ -110,6 +118,8 @@ fn kimi_provider_normalizes_relative_kimi_home_to_absolute_path() {
 
 #[test]
 fn kimi_provider_searches_messages_from_base_path() {
+    let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+        .expect("run integration tests through scripts/test-rust.ts");
     let base = fixture_base();
 
     let results = providers::kimi::search_from_base_path(
@@ -138,15 +148,15 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set(key: &'static str, value: OsString) -> Self {
-        let original = std::env::var_os(key);
-        std::env::set_var(key, value);
+        let original = claude_code_history_viewer_lib::profile_paths::env::var_os(key);
+        claude_code_history_viewer_lib::profile_paths::env::set_var(key, value);
         Self { key, original }
     }
 
     #[allow(dead_code)]
     fn remove(key: &'static str) -> Self {
-        let original = std::env::var_os(key);
-        std::env::remove_var(key);
+        let original = claude_code_history_viewer_lib::profile_paths::env::var_os(key);
+        claude_code_history_viewer_lib::profile_paths::env::remove_var(key);
         Self { key, original }
     }
 }
@@ -154,9 +164,9 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         if let Some(value) = self.original.as_ref() {
-            std::env::set_var(self.key, value);
+            claude_code_history_viewer_lib::profile_paths::env::set_var(self.key, value);
         } else {
-            std::env::remove_var(self.key);
+            claude_code_history_viewer_lib::profile_paths::env::remove_var(self.key);
         }
     }
 }

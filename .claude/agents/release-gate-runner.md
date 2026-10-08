@@ -4,8 +4,8 @@ description: >
   Runs the frontend quality gate before a release and reports ONLY what fails.
   Use when the user says "run the quality gate", "check before release",
   "release check", "cut a version", "릴리즈 전 검증". Runs tsc, vitest, lint, and
-  i18n:validate locally; does NOT run cargo locally (blocked on this machine) and
-  instead reminds that Rust is validated by CI.
+  i18n:validate locally. Reports backend validation as outside this agent's scope
+  and points to the canonical isolated Rust gate.
 tools: Bash, Read
 model: sonnet
 ---
@@ -17,10 +17,7 @@ it unattended and surfacing only failures with the exact fix.
 ## Hard rules
 - Run commands; do NOT edit code to "fix" failures — report them and let the
   maintainer decide.
-- **Do NOT run `cargo` locally.** `cargo check/clippy/test` fails on this machine
-  (tauri-runtime-wry + rustc toolchain incompatibility). Rust is validated by CI
-  (`rust-tests.yml`). Explicitly state "Rust: deferred to CI" in your report —
-  never skip silently and never claim Rust passed locally.
+- **Keep this agent's gate frontend-only.** Report Rust as not run by this agent; follow [canonical backend validation](../../CLAUDE.md#rust-test-profile-safety) for the supported isolated runner and native lint/format commands. Do not infer a host toolchain failure or a passing backend gate from frontend results.
 
 ## Frontend gate (run in order; capture pass/fail each)
 ```bash
@@ -52,7 +49,7 @@ itself fails — then stop and report the install failure (likely needs
 ✅ lint
 ❌ i18n:validate     → {which keys/langs}
 
-Rust (clippy/test/fmt): deferred to CI — run `rust-tests.yml` / check CI on the release commit.
+Rust (clippy/test/fmt): not run by this frontend agent — follow CLAUDE.md backend validation and check `rust-tests.yml` on the release commit.
 
 Verdict: {GREEN — safe to proceed / RED — N blocker(s) above}
 ```

@@ -153,7 +153,7 @@ pub fn detect() -> Option<ProviderInfo> {
 /// Get the `OpenCode` base path
 pub fn get_base_path() -> Option<String> {
     // Check $OPENCODE_HOME first
-    if let Ok(home) = std::env::var("OPENCODE_HOME") {
+    if let Ok(home) = crate::profile_paths::env::var("OPENCODE_HOME") {
         let path = PathBuf::from(&home);
         if path.exists() {
             return Some(home);
@@ -161,7 +161,7 @@ pub fn get_base_path() -> Option<String> {
     }
 
     // XDG data directory
-    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+    if let Ok(xdg_data) = crate::profile_paths::env::var("XDG_DATA_HOME") {
         let path = PathBuf::from(&xdg_data).join("opencode");
         if path.exists() {
             return Some(path.to_string_lossy().to_string());
@@ -169,7 +169,7 @@ pub fn get_base_path() -> Option<String> {
     }
 
     // Default: ~/.local/share/opencode
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let opencode_path = home.join(".local").join("share").join("opencode");
     if opencode_path.exists() {
         Some(opencode_path.to_string_lossy().to_string())

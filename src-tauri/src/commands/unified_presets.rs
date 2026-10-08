@@ -67,7 +67,7 @@ pub struct UnifiedPresetInput {
 
 /// Get the unified presets folder path
 fn get_presets_folder() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer").join("unified-presets"))
 }
 
@@ -268,7 +268,7 @@ fn compute_summary(settings_json: &str, mcp_json: &str) -> UnifiedPresetSummary 
 /// Load all unified presets
 #[tauri::command]
 pub async fn load_unified_presets() -> Result<Vec<UnifiedPresetData>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let folder = match get_presets_folder() {
             Ok(f) => f,
             Err(_) => return Ok(vec![]), // No presets folder = no presets
@@ -309,7 +309,7 @@ pub async fn load_unified_presets() -> Result<Vec<UnifiedPresetData>, String> {
 /// Save a unified preset (create or update)
 #[tauri::command]
 pub async fn save_unified_preset(input: UnifiedPresetInput) -> Result<UnifiedPresetData, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         ensure_presets_folder()?;
 
         // Validate input JSON before any other operations
@@ -372,7 +372,7 @@ pub async fn save_unified_preset(input: UnifiedPresetInput) -> Result<UnifiedPre
 /// Delete a unified preset
 #[tauri::command]
 pub async fn delete_unified_preset(id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         validate_preset_id(&id)?;
         let path = get_preset_path(&id)?;
 
@@ -391,7 +391,7 @@ pub async fn delete_unified_preset(id: String) -> Result<(), String> {
 /// Get a single unified preset by ID
 #[tauri::command]
 pub async fn get_unified_preset(id: String) -> Result<Option<UnifiedPresetData>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         validate_preset_id(&id)?;
         let path = get_preset_path(&id)?;
 

@@ -133,14 +133,14 @@ pub(crate) fn detect_for(f: &Family) -> Option<ProviderInfo> {
 /// The family's global directory (env override or `~/<home_subdir>`).
 fn global_dir_for(f: &Family) -> Option<PathBuf> {
     if let Some(env) = f.global_dir_env {
-        if let Ok(dir) = std::env::var(env) {
+        if let Ok(dir) = crate::profile_paths::env::var(env) {
             let dir = dir.trim();
             if !dir.is_empty() {
                 return Some(PathBuf::from(dir));
             }
         }
     }
-    Some(dirs::home_dir()?.join(f.home_subdir))
+    Some(crate::profile_paths::home_dir()?.join(f.home_subdir))
 }
 
 /// Base path (`<global-dir>/sessions`); `None` unless the directory exists.

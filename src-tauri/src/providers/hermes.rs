@@ -208,23 +208,24 @@ pub(crate) fn load_offline_messages(path: &Path, id: &str) -> Result<Vec<ClaudeM
 }
 
 fn selected_home() -> Option<PathBuf> {
-    std::env::var("HERMES_HOME")
+    crate::profile_paths::env::var("HERMES_HOME")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|value| {
             expand_home(
                 &value,
-                |name| std::env::var(name).ok(),
-                dirs::home_dir().as_deref(),
+                |name| crate::profile_paths::env::var(name).ok(),
+                crate::profile_paths::home_dir().as_deref(),
                 &std::env::current_dir().unwrap_or_default(),
             )
         })
         .or_else(|| {
-            let suffix = std::env::var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
+            let suffix =
+                crate::profile_paths::env::var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
             if cfg!(windows) {
-                dirs::data_local_dir().map(|p| p.join(format!("hermes{suffix}")))
+                crate::profile_paths::data_local_dir().map(|p| p.join(format!("hermes{suffix}")))
             } else {
-                dirs::home_dir().map(|p| p.join(format!(".hermes{suffix}")))
+                crate::profile_paths::home_dir().map(|p| p.join(format!(".hermes{suffix}")))
             }
         })
 }

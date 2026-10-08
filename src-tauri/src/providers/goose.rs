@@ -29,20 +29,20 @@ fn candidate_db_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     // GOOSE_PATH_ROOT override → <root>/data/sessions/sessions.db
-    if let Ok(root) = std::env::var("GOOSE_PATH_ROOT") {
+    if let Ok(root) = crate::profile_paths::env::var("GOOSE_PATH_ROOT") {
         let root = root.trim();
         if !root.is_empty() {
             paths.push(PathBuf::from(root).join("data/sessions/sessions.db"));
         }
     }
     // $XDG_DATA_HOME/goose/sessions/sessions.db
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+    if let Ok(xdg) = crate::profile_paths::env::var("XDG_DATA_HOME") {
         let xdg = xdg.trim();
         if !xdg.is_empty() {
             paths.push(PathBuf::from(xdg).join("goose/sessions/sessions.db"));
         }
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::profile_paths::home_dir() {
         // XDG default (Linux, and macOS under Goose's etcetera strategy).
         paths.push(home.join(".local/share/goose/sessions/sessions.db"));
         // macOS Apple-strategy fallback.
@@ -51,7 +51,7 @@ fn candidate_db_paths() -> Vec<PathBuf> {
     }
     // Windows: %APPDATA%\Block\goose\data\sessions\sessions.db
     #[cfg(target_os = "windows")]
-    if let Some(data) = dirs::data_dir() {
+    if let Some(data) = crate::profile_paths::data_dir() {
         paths.push(data.join("Block/goose/data/sessions/sessions.db"));
     }
 

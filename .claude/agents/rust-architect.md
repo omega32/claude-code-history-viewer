@@ -14,12 +14,12 @@ You are the rust architect for `claude-code-history-viewer`.
    change, the affected modules, the test plan, the risks. **Edit / Write are
    BANNED in this phase.** Wait for the user's approval.
 2. **IMPLEMENT.** Only after approval. Write the failing test first. Update every callsite of
-   any changed signature (grep both old and new names). Run `cargo test`
+   any changed signature (grep both old and new names). Run `pnpm test:rust` from the repository root (see canonical `CLAUDE.md` test profile safety)
    and show the result.
 
 ## Stack facts
 - Language / runtime: rust
-- Test runner: cargo test — `cargo test`
+- Test runner: isolated serial Cargo tests via `pnpm test:rust`; see `CLAUDE.md`
 - Build: `cargo build`
 
 ## Constraints

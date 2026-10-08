@@ -23,14 +23,14 @@ const SCHEME: &str = "openinterpreter://";
 /// Open Interpreter home: `$INTERPRETER_HOME` (if set + exists) else
 /// `~/.openinterpreter`. Returns `None` unless the directory exists.
 fn home_dir() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("INTERPRETER_HOME") {
+    if let Ok(home) = crate::profile_paths::env::var("INTERPRETER_HOME") {
         let home = home.trim();
         if !home.is_empty() {
             let p = PathBuf::from(home);
             return if p.exists() { Some(p) } else { None };
         }
     }
-    let p = dirs::home_dir()?.join(".openinterpreter");
+    let p = crate::profile_paths::home_dir()?.join(".openinterpreter");
     if p.exists() {
         Some(p)
     } else {
@@ -264,16 +264,16 @@ mod tests {
     }
     impl HomeGuard {
         fn set(path: &Path) -> Self {
-            let original = std::env::var("INTERPRETER_HOME").ok();
-            std::env::set_var("INTERPRETER_HOME", path);
+            let original = crate::profile_paths::env::var("INTERPRETER_HOME").ok();
+            crate::profile_paths::env::set_var("INTERPRETER_HOME", path);
             Self { original }
         }
     }
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match self.original.as_ref() {
-                Some(v) => std::env::set_var("INTERPRETER_HOME", v),
-                None => std::env::remove_var("INTERPRETER_HOME"),
+                Some(v) => crate::profile_paths::env::set_var("INTERPRETER_HOME", v),
+                None => crate::profile_paths::env::remove_var("INTERPRETER_HOME"),
             }
         }
     }

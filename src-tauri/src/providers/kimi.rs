@@ -28,7 +28,9 @@ pub fn detect() -> Option<ProviderInfo> {
 }
 
 pub fn get_base_path() -> Option<String> {
-    if let Ok(env_val) = std::env::var("KIMI_SHARE_DIR").or_else(|_| std::env::var("KIMI_HOME")) {
+    if let Ok(env_val) = crate::profile_paths::env::var("KIMI_SHARE_DIR")
+        .or_else(|_| crate::profile_paths::env::var("KIMI_HOME"))
+    {
         let path = PathBuf::from(&env_val);
         let absolute_path = if path.is_absolute() {
             path
@@ -41,7 +43,7 @@ pub fn get_base_path() -> Option<String> {
         }
     }
 
-    let default = dirs::home_dir()?.join(".kimi");
+    let default = crate::profile_paths::home_dir()?.join(".kimi");
     if default.exists() {
         let normalized = default.canonicalize().unwrap_or(default);
         Some(normalized.to_string_lossy().to_string())
@@ -674,14 +676,14 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: std::ffi::OsString) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
 
         fn remove(key: &'static str) -> Self {
-            let original = std::env::var_os(key);
-            std::env::remove_var(key);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::remove_var(key);
             Self { key, original }
         }
     }
@@ -689,9 +691,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.original.as_ref() {
-                std::env::set_var(self.key, value);
+                crate::profile_paths::env::set_var(self.key, value);
             } else {
-                std::env::remove_var(self.key);
+                crate::profile_paths::env::remove_var(self.key);
             }
         }
     }
@@ -735,14 +737,13 @@ mod tests {
     #[test]
     #[serial]
     fn get_base_path_returns_none_when_default_dir_absent() {
+        let _home = crate::test_utils::TestHome::new();
         let _share = EnvVarGuard::remove("KIMI_SHARE_DIR");
         let _home_env = EnvVarGuard::remove("KIMI_HOME");
-        if dirs::home_dir()
-            .map(|h| h.join(".kimi").exists())
-            .unwrap_or(false)
-        {
-            return;
-        }
+        assert!(!crate::profile_paths::home_dir()
+            .unwrap()
+            .join(".kimi")
+            .exists());
         assert!(get_base_path().is_none());
     }
 }

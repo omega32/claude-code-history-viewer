@@ -26,7 +26,7 @@ pub fn detect() -> Option<ProviderInfo> {
 }
 
 pub fn get_base_path() -> Option<String> {
-    if let Ok(env_val) = std::env::var("VIBE_HOME") {
+    if let Ok(env_val) = crate::profile_paths::env::var("VIBE_HOME") {
         let path = PathBuf::from(&env_val);
         let absolute_path = if path.is_absolute() {
             path
@@ -39,7 +39,7 @@ pub fn get_base_path() -> Option<String> {
         }
     }
 
-    let default = dirs::home_dir()?.join(".vibe");
+    let default = crate::profile_paths::home_dir()?.join(".vibe");
     if default.exists() {
         let normalized = default.canonicalize().unwrap_or(default);
         Some(normalized.to_string_lossy().to_string())
@@ -799,13 +799,13 @@ mod tests {
         let vibe_home = temp.path().join(".vibe");
         fs::create_dir_all(&vibe_home).expect("create vibe home");
 
-        let original = std::env::var("VIBE_HOME").ok();
-        std::env::set_var("VIBE_HOME", &vibe_home);
+        let original = crate::profile_paths::env::var("VIBE_HOME").ok();
+        crate::profile_paths::env::set_var("VIBE_HOME", &vibe_home);
         let detected = get_base_path().expect("detect vibe home");
         if let Some(value) = original {
-            std::env::set_var("VIBE_HOME", value);
+            crate::profile_paths::env::set_var("VIBE_HOME", value);
         } else {
-            std::env::remove_var("VIBE_HOME");
+            crate::profile_paths::env::remove_var("VIBE_HOME");
         }
 
         assert_eq!(

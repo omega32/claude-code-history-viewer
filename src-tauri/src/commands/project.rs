@@ -64,8 +64,8 @@ pub async fn get_git_log(actual_path: String, limit: usize) -> Result<Vec<GitCom
 
 #[tauri::command]
 pub async fn get_claude_folder_path() -> Result<String, String> {
-    let home_dir =
-        dirs::home_dir().ok_or("HOME_DIRECTORY_NOT_FOUND:Could not determine home directory")?;
+    let home_dir = crate::profile_paths::home_dir()
+        .ok_or("HOME_DIRECTORY_NOT_FOUND:Could not determine home directory")?;
     let claude_path = home_dir.join(".claude");
 
     if !claude_path.exists() {
@@ -126,19 +126,19 @@ pub async fn validate_custom_claude_dir(path: String) -> Result<bool, String> {
 /// configuration directory (has a `projects/` subfolder). Returns `None` otherwise.
 #[tauri::command]
 pub async fn detect_claude_config_dir() -> Result<Option<String>, String> {
-    let raw = match std::env::var("CLAUDE_CONFIG_DIR") {
+    let raw = match crate::profile_paths::env::var("CLAUDE_CONFIG_DIR") {
         Ok(val) if !val.trim().is_empty() => val.trim().to_string(),
         _ => return Ok(None),
     };
 
     // Expand ~ to home directory (only exact "~" or "~/..." patterns)
     let expanded = if raw == "~" {
-        match dirs::home_dir() {
+        match crate::profile_paths::home_dir() {
             Some(home) => home.to_string_lossy().to_string(),
             None => raw,
         }
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        match dirs::home_dir() {
+        match crate::profile_paths::home_dir() {
             Some(home) => home.join(rest).to_string_lossy().to_string(),
             None => raw,
         }
@@ -389,7 +389,7 @@ mod tests {
     use std::sync::{LazyLock, Mutex, MutexGuard};
     use tempfile::TempDir;
 
-    /// Mutex to serialize tests that modify the `CLAUDE_CONFIG_DIR` environment variable.
+    /// Serialize configuration-directory regression cases.
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn lock_env() -> MutexGuard<'static, ()> {
@@ -984,11 +984,11 @@ mod tests {
     }
 
     // Tests for detect_claude_config_dir
-    // All tests use ENV_MUTEX to prevent race conditions on the global env var.
+    // These cases retain their shared ordering lock.
     #[tokio::test]
     async fn test_detect_config_dir_unset() {
         let _guard = lock_env();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        crate::profile_paths::env::remove_var("CLAUDE_CONFIG_DIR");
         let result = detect_claude_config_dir().await.unwrap();
         assert!(result.is_none());
     }
@@ -996,10 +996,10 @@ mod tests {
     #[tokio::test]
     async fn test_detect_config_dir_empty() {
         let _guard = lock_env();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "");
+        crate::profile_paths::env::set_var("CLAUDE_CONFIG_DIR", "");
         let result = detect_claude_config_dir().await.unwrap();
         assert!(result.is_none());
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        crate::profile_paths::env::remove_var("CLAUDE_CONFIG_DIR");
     }
 
     #[tokio::test]
@@ -1009,13 +1009,13 @@ mod tests {
         let projects_dir = temp_dir.path().join("projects");
         fs::create_dir_all(&projects_dir).unwrap();
 
-        std::env::set_var(
+        crate::profile_paths::env::set_var(
             "CLAUDE_CONFIG_DIR",
             temp_dir.path().to_string_lossy().to_string(),
         );
         let result = detect_claude_config_dir().await.unwrap();
         assert!(result.is_some());
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        crate::profile_paths::env::remove_var("CLAUDE_CONFIG_DIR");
     }
 
     #[tokio::test]
@@ -1024,21 +1024,21 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         // No projects/ subdirectory
 
-        std::env::set_var(
+        crate::profile_paths::env::set_var(
             "CLAUDE_CONFIG_DIR",
             temp_dir.path().to_string_lossy().to_string(),
         );
         let result = detect_claude_config_dir().await.unwrap();
         assert!(result.is_none());
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        crate::profile_paths::env::remove_var("CLAUDE_CONFIG_DIR");
     }
 
     #[tokio::test]
     async fn test_detect_config_dir_relative_path() {
         let _guard = lock_env();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "relative/path");
+        crate::profile_paths::env::set_var("CLAUDE_CONFIG_DIR", "relative/path");
         let result = detect_claude_config_dir().await.unwrap();
         assert!(result.is_none());
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        crate::profile_paths::env::remove_var("CLAUDE_CONFIG_DIR");
     }
 }

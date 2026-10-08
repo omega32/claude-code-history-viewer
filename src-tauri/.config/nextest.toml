@@ -1,11 +1,11 @@
 # cargo-nextest configuration
 # High-performance test runner for Rust
 # Install: cargo install cargo-nextest --locked
-# Run: cargo nextest run
+# Run from the repository root: pnpm test:rust nextest
 
 [store]
-# Cache test binaries for faster subsequent runs
-dir = "target/nextest"
+# Keep the result store aligned with the runner's isolated build target.
+dir = "target/test-isolated/nextest"
 
 [profile.default]
 # Number of retries for flaky tests
@@ -34,7 +34,7 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 
 # Archive settings for CI caching
 [profile.ci.junit]
-path = "target/nextest/ci/junit.xml"
+path = "junit.xml"
 
 [profile.coverage]
 # Profile for coverage runs
@@ -58,7 +58,7 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 filter = "test(::integration::)"
 threads-required = 2
 
-# Platform-specific settings
-[profile.default.target.'cfg(target_os = "macos")']
-# macOS-specific timeouts
+# Platform-specific settings use nextest's per-test overrides.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
 slow-timeout = { period = "90s", terminate-after = 2 }

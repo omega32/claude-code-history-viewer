@@ -20,13 +20,13 @@ pub fn detect() -> Option<ProviderInfo> {
 
 /// Get the base path for Gemini CLI data (~/.gemini)
 pub fn get_base_path() -> Option<String> {
-    if let Ok(val) = std::env::var("GEMINI_HOME") {
+    if let Ok(val) = crate::profile_paths::env::var("GEMINI_HOME") {
         let p = PathBuf::from(&val);
         if p.is_dir() {
             return Some(val);
         }
     }
-    dirs::home_dir().map(|h| h.join(".gemini").to_string_lossy().to_string())
+    crate::profile_paths::home_dir().map(|h| h.join(".gemini").to_string_lossy().to_string())
 }
 
 /// Scan for all Gemini CLI projects from a specific base path.

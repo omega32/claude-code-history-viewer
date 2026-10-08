@@ -762,8 +762,8 @@ mod tests {
     #[test]
     fn test_extract_kimi_context_paths() {
         let temp = TempDir::new().unwrap();
-        let old_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::set_var("KIMI_HOME", temp.path());
+        let old_kimi_home = crate::profile_paths::env::var_os("KIMI_HOME");
+        crate::profile_paths::env::set_var("KIMI_HOME", temp.path());
 
         let path = temp
             .path()
@@ -777,9 +777,9 @@ mod tests {
         let result = extract_provider_paths(&path).unwrap();
 
         if let Some(kimi_home) = old_kimi_home {
-            std::env::set_var("KIMI_HOME", kimi_home);
+            crate::profile_paths::env::set_var("KIMI_HOME", kimi_home);
         } else {
-            std::env::remove_var("KIMI_HOME");
+            crate::profile_paths::env::remove_var("KIMI_HOME");
         }
 
         assert_eq!(
@@ -807,8 +807,8 @@ mod tests {
     #[serial]
     fn test_extract_kimi_state_paths() {
         let temp = TempDir::new().unwrap();
-        let old_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::set_var("KIMI_HOME", temp.path());
+        let old_kimi_home = crate::profile_paths::env::var_os("KIMI_HOME");
+        crate::profile_paths::env::set_var("KIMI_HOME", temp.path());
 
         let path = temp
             .path()
@@ -822,9 +822,9 @@ mod tests {
         let result = extract_provider_paths(&path).unwrap();
 
         if let Some(kimi_home) = old_kimi_home {
-            std::env::set_var("KIMI_HOME", kimi_home);
+            crate::profile_paths::env::set_var("KIMI_HOME", kimi_home);
         } else {
-            std::env::remove_var("KIMI_HOME");
+            crate::profile_paths::env::remove_var("KIMI_HOME");
         }
 
         assert_eq!(
@@ -852,8 +852,8 @@ mod tests {
     #[serial]
     fn test_extract_kimi_paths_from_custom_home() {
         let temp = TempDir::new().unwrap();
-        let old_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::set_var("KIMI_HOME", temp.path());
+        let old_kimi_home = crate::profile_paths::env::var_os("KIMI_HOME");
+        crate::profile_paths::env::set_var("KIMI_HOME", temp.path());
 
         let path = temp
             .path()
@@ -867,9 +867,9 @@ mod tests {
         let result = extract_provider_paths(&path);
 
         if let Some(kimi_home) = old_kimi_home {
-            std::env::set_var("KIMI_HOME", kimi_home);
+            crate::profile_paths::env::set_var("KIMI_HOME", kimi_home);
         } else {
-            std::env::remove_var("KIMI_HOME");
+            crate::profile_paths::env::remove_var("KIMI_HOME");
         }
 
         let result = result.unwrap();

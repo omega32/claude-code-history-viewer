@@ -4,8 +4,6 @@
 //! archived sessions stored in ~/.claude-history-viewer/archives/
 
 use crate::models::ClaudeSession;
-#[cfg(test)]
-use crate::test_utils::dirs;
 use crate::utils::find_subagent_files;
 use chrono::Utc;
 use lazy_static::lazy_static;
@@ -135,7 +133,7 @@ pub struct ExportResult {
 
 /// Returns the archives base directory path: `~/.claude-history-viewer/archives/`
 fn get_archives_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer").join("archives"))
 }
 
@@ -549,7 +547,7 @@ pub async fn get_archive_base_path() -> Result<String, String> {
 /// to the new name-based format (e.g., `3f8a1b2c-...` → `My-Archive_3f8a1b2c`).
 #[tauri::command]
 pub async fn list_archives() -> Result<ArchiveManifest, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::profile_paths::spawn_blocking(|| {
         let mut manifest = load_manifest()?;
         let mut changed = false;
         let mut migrated_pairs: Vec<(String, String)> = Vec::new();
@@ -638,7 +636,7 @@ pub async fn create_archive(
     source_project_name: String,
     include_subagents: bool,
 ) -> Result<ArchiveEntry, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         if name.trim().is_empty() {
             return Err("Archive name is required".to_string());
         }
@@ -866,7 +864,7 @@ pub async fn create_archive(
 /// * `archive_id` - UUID of the archive to delete
 #[tauri::command]
 pub async fn delete_archive(archive_id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         validate_archive_id(&archive_id)?;
 
         // Update manifest first, then delete directory.
@@ -902,7 +900,7 @@ pub async fn delete_archive(archive_id: String) -> Result<(), String> {
 /// Returns the new archive ID (new directory name) so the frontend can update references.
 #[tauri::command]
 pub async fn rename_archive(archive_id: String, new_name: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         validate_archive_id(&archive_id)?;
 
         if new_name.trim().is_empty() {
@@ -1000,7 +998,7 @@ pub async fn rename_archive(archive_id: String, new_name: String) -> Result<Stri
 /// * `archive_id` - UUID of the archive
 #[tauri::command]
 pub async fn get_archive_sessions(archive_id: String) -> Result<Vec<ArchiveSessionInfo>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         validate_archive_id(&archive_id)?;
 
         let archive_dir = get_archive_dir(&archive_id)?;
@@ -1239,7 +1237,7 @@ pub async fn load_archive_session_messages(
 /// Calculates the total disk usage of all archives.
 #[tauri::command]
 pub async fn get_archive_disk_usage() -> Result<ArchiveDiskUsage, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::profile_paths::spawn_blocking(|| {
         let archives_dir = get_archives_dir()?;
 
         if !archives_dir.exists() {
@@ -1297,7 +1295,7 @@ pub async fn get_expiring_sessions(
     project_path: String,
     threshold_days: i64,
 ) -> Result<Vec<ExpiringSession>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         // Security: reject path traversal
         let project_pb = PathBuf::from(&project_path);
         if !project_pb.is_absolute() {
@@ -1315,7 +1313,7 @@ pub async fn get_expiring_sessions(
 
         // Read cleanupPeriodDays from ~/.claude/settings.json
         let cleanup_period_days: i64 = {
-            let home = dirs::home_dir().ok_or("Could not find home directory")?;
+            let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
             let settings_path = home.join(".claude").join("settings.json");
             if settings_path.exists() {
                 fs::read_to_string(&settings_path)
@@ -1446,7 +1444,7 @@ pub async fn export_session(
     session_file_path: String,
     format: String,
 ) -> Result<ExportResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = PathBuf::from(&session_file_path);
 
         // Security checks

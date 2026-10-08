@@ -41,11 +41,11 @@ const KEY_PREFIXES: &[&str] = &[
     "memento/icube-ai-chat-storage-",
 ];
 
-/// `<UserData>/Trae/User/workspaceStorage` (`dirs::config_dir()` resolves to
+/// `<UserData>/Trae/User/workspaceStorage` (`crate::profile_paths::config_dir()` resolves to
 /// `~/Library/Application Support` on macOS, `~/.config` on Linux, `%APPDATA%`
 /// on Windows — matching VS Code-family layout).
 fn workspace_storage() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?
+    let dir = crate::profile_paths::config_dir()?
         .join("Trae")
         .join("User")
         .join("workspaceStorage");

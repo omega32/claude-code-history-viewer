@@ -39,8 +39,6 @@
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::ProviderInfo;
-#[cfg(test)]
-use crate::test_utils::dirs;
 use crate::utils::{
     build_provider_message, is_symlink, ms_to_iso, search_json_value_case_insensitive,
 };
@@ -72,7 +70,7 @@ impl PiStore {
     /// Store root: `~/<dot_dir>/agent/sessions`.
     fn sessions_root(&self) -> Option<PathBuf> {
         Some(
-            dirs::home_dir()?
+            crate::profile_paths::home_dir()?
                 .join(self.dot_dir)
                 .join("agent")
                 .join("sessions"),

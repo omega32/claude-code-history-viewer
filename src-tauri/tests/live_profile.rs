@@ -1,7 +1,4 @@
-// Integration tests that exercise scan_all_projects end-to-end.
-// Run: cargo test test_scan_all_projects -- --nocapture --test-threads=1
-// Tests gated with #[ignore] require local Antigravity data:
-//   cargo test -- --ignored --test-threads=1
+// Opt-in native-profile diagnostics. Run through scripts/test-rust.ts live with explicit acknowledgement.
 
 #[cfg(test)]
 mod integration_tests {
@@ -10,11 +7,17 @@ mod integration_tests {
     use std::path::PathBuf;
 
     fn get_antigravity_logs_dir() -> Option<PathBuf> {
-        dirs::data_dir().map(|dir| dir.join("Antigravity").join("logs"))
+        claude_code_history_viewer_lib::profile_paths::data_dir()
+            .map(|dir| dir.join("Antigravity").join("logs"))
     }
 
     #[test]
+    #[ignore = "requires explicit live-profile runner acknowledgement"]
     fn test_detect_providers() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         let providers = providers::detect_providers();
         println!("\n=== detect_providers ===");
         println!("Total detected: {}", providers.len());
@@ -31,7 +34,12 @@ mod integration_tests {
     }
 
     #[test]
+    #[ignore = "requires explicit live-profile runner acknowledgement"]
     fn test_antigravity_scan_projects() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== providers::antigravity::scan_projects ===");
         let projects = providers::antigravity::scan_projects().expect("scan_projects failed");
         println!("Projects returned: {}", projects.len());
@@ -46,7 +54,12 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires explicit live-profile runner acknowledgement"]
     async fn test_scan_all_projects_full() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== scan_all_projects (all providers) ===");
 
         // Replicate exactly what the frontend calls
@@ -137,6 +150,10 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires local Antigravity data; run with --ignored"]
     async fn test_antigravity_load_provider_messages_real_data() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity load_provider_messages ===");
 
         let projects = providers::antigravity::scan_projects().expect("scan_projects failed");
@@ -196,6 +213,10 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires local Antigravity logs; run with --ignored"]
     async fn test_antigravity_load_provider_messages_returns_tool_use_for_logged_session() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity tool-use session probe ===");
 
         let Some(logs_root) = get_antigravity_logs_dir() else {
@@ -304,6 +325,10 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires local Antigravity data; run with --ignored"]
     async fn test_antigravity_project_stats_summary_returns_tools_for_logged_project() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity project stats summary tool probe ===");
 
         let project = providers::antigravity::scan_projects()
@@ -334,11 +359,16 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires explicit live-profile runner acknowledgement"]
     async fn test_antigravity_global_stats_summary_returns_tools_when_filtered() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity global stats summary tool probe ===");
 
         let claude_path = providers::claude::get_base_path().unwrap_or_else(|| {
-            dirs::home_dir()
+            claude_code_history_viewer_lib::profile_paths::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("/"))
                 .join(".claude")
                 .to_string_lossy()
@@ -371,10 +401,14 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "hardcoded date range targets local Antigravity data; run with --ignored"]
     async fn test_antigravity_global_stats_summary_returns_tools_for_ui_date_range() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity global stats summary ui date-range probe ===");
 
         let claude_path = providers::claude::get_base_path().unwrap_or_else(|| {
-            dirs::home_dir()
+            claude_code_history_viewer_lib::profile_paths::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("/"))
                 .join(".claude")
                 .to_string_lossy()
@@ -407,10 +441,14 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "hardcoded date range targets local Antigravity data; run with --ignored"]
     async fn test_antigravity_global_billing_breakdown_is_non_zero_for_real_data() {
+        assert!(
+            claude_code_history_viewer_lib::profile_paths::live_profile_tests_enabled(),
+            "run acknowledged live diagnostics through scripts/test-rust.ts"
+        );
         println!("\n=== antigravity global billing breakdown probe ===");
 
         let claude_path = providers::claude::get_base_path().unwrap_or_else(|| {
-            dirs::home_dir()
+            claude_code_history_viewer_lib::profile_paths::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("/"))
                 .join(".claude")
                 .to_string_lossy()

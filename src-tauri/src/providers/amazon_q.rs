@@ -1,6 +1,6 @@
 //! Amazon Q Developer CLI provider (`q chat`).
 //!
-//! Reads `dirs::data_local_dir()/amazon-q/data.sqlite3`, table
+//! Reads `crate::profile_paths::data_local_dir()/amazon-q/data.sqlite3`, table
 //! `conversations (key TEXT PRIMARY KEY, value TEXT)` where `key` is the working
 //! directory and `value` is a serialized `ConversationState` — i.e. exactly ONE
 //! conversation per cwd (the `q chat --resume` state). This is the v1 schema;
@@ -19,7 +19,7 @@ const SUMMARY_MAX_CHARS: usize = 100;
 
 fn get_db_path() -> Option<PathBuf> {
     Some(
-        dirs::data_local_dir()?
+        crate::profile_paths::data_local_dir()?
             .join("amazon-q")
             .join("data.sqlite3"),
     )

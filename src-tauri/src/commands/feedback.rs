@@ -47,7 +47,7 @@ pub async fn send_feedback(feedback: FeedbackData) -> Result<(), String> {
 
     // Generate mailto link
 
-    let feedback_email = std::env::var("FEEDBACK_EMAIL")
+    let feedback_email = crate::profile_paths::env::var("FEEDBACK_EMAIL")
         .unwrap_or_else(|_| "feedback@claude-history-viewer.app".to_string());
     let mailto_url =
         format!("mailto:{feedback_email}?subject={encoded_subject}&body={encoded_body}");

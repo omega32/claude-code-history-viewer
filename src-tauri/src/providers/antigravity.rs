@@ -194,7 +194,7 @@ fn to_u32_saturating(value: u64) -> u32 {
 
 /// Returns the platform-specific Antigravity logs root directory.
 fn antigravity_logs_root() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("Antigravity").join("logs"))
+    crate::profile_paths::data_dir().map(|dir| dir.join("Antigravity").join("logs"))
 }
 
 /// Maps an Antigravity overlay display string to a canonical tool name.

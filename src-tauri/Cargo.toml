@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-history-viewer"
-version = "1.29.0"
+version = "1.29.1"
 description = "Claude Code 대화 기록을 탐색하고 분석하는 데스크톱 애플리케이션"
 authors = ["JaeHyeok Lee"]
 license = "MIT"
@@ -38,7 +38,7 @@ tauri-plugin-opener = "2.5.4"
 tauri-plugin-os = "2.3.2"
 tauri-plugin-single-instance = "2.4.2"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5.0"
+native_dirs = { package = "dirs", version = "5.0" }
 fs2 = "0.4"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 walkdir = "2.3"
@@ -144,6 +144,7 @@ opt-level = 0
 unsafe_code = "deny"
 
 [lints.clippy]
+disallowed_methods = "deny"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # nursery lints are too unstable - enable selectively if needed

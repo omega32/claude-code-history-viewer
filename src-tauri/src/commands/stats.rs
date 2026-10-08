@@ -6,8 +6,6 @@ use crate::models::{
     TokenDistribution, TokenUsage, ToolUsageStats,
 };
 use crate::providers;
-#[cfg(test)]
-use crate::test_utils::dirs;
 use crate::utils::find_line_ranges;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use memmap2::Mmap;
@@ -376,7 +374,7 @@ fn is_antigravity_path(path: &str) -> bool {
 /// Whether `path` lies under `~/.codebuddy/projects/`. Anchored detection avoids
 /// false positives from arbitrary substrings (e.g. `/work/foo.codebuddy-test`).
 fn is_codebuddy_path(path: &str) -> bool {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::profile_paths::home_dir() else {
         return false;
     };
     is_codebuddy_path_under(path, &home)
@@ -1149,29 +1147,32 @@ fn collect_provider_global_file_stats(
     }
 
     // Process all sessions in parallel
+    let profile = crate::profile_paths::ProfileContext::capture();
     let all_stats: Vec<SessionFileStats> = session_tasks
         .par_iter()
         .filter_map(|(project_name, file_path)| {
-            let messages = match provider {
-                StatsProvider::Codebuddy => providers::codebuddy::load_messages(file_path),
-                StatsProvider::Codex => providers::codex::load_messages(file_path),
-                StatsProvider::ForgeCode => providers::forgecode::load_messages(file_path),
-                StatsProvider::OpenCode => providers::opencode::load_messages(file_path),
-                StatsProvider::Kimi => providers::kimi::load_messages(file_path),
-                StatsProvider::Antigravity => providers::antigravity::load_messages(file_path),
-                StatsProvider::Copilot => providers::copilot::load_messages(file_path),
-                StatsProvider::Claude => Ok(Vec::new()),
-            }
-            .unwrap_or_default();
+            profile.run(|| {
+                let messages = match provider {
+                    StatsProvider::Codebuddy => providers::codebuddy::load_messages(file_path),
+                    StatsProvider::Codex => providers::codex::load_messages(file_path),
+                    StatsProvider::ForgeCode => providers::forgecode::load_messages(file_path),
+                    StatsProvider::OpenCode => providers::opencode::load_messages(file_path),
+                    StatsProvider::Kimi => providers::kimi::load_messages(file_path),
+                    StatsProvider::Antigravity => providers::antigravity::load_messages(file_path),
+                    StatsProvider::Copilot => providers::copilot::load_messages(file_path),
+                    StatsProvider::Claude => Ok(Vec::new()),
+                }
+                .unwrap_or_default();
 
-            build_global_session_file_stats_from_messages(
-                provider,
-                project_name.clone(),
-                &messages,
-                mode,
-                s_limit,
-                e_limit,
-            )
+                build_global_session_file_stats_from_messages(
+                    provider,
+                    project_name.clone(),
+                    &messages,
+                    mode,
+                    s_limit,
+                    e_limit,
+                )
+            })
         })
         .collect();
 
@@ -3997,8 +3998,8 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -4006,9 +4007,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.original.as_ref() {
-                std::env::set_var(self.key, value);
+                crate::profile_paths::env::set_var(self.key, value);
             } else {
-                std::env::remove_var(self.key);
+                crate::profile_paths::env::remove_var(self.key);
             }
         }
     }
@@ -5932,8 +5933,8 @@ mod tests {
         let forge_dir = TempDir::new().expect("failed to create forge temp dir");
         write_forgecode_test_db(forge_dir.path());
 
-        let original_forge_config = std::env::var("FORGE_CONFIG").ok();
-        std::env::set_var("FORGE_CONFIG", forge_dir.path());
+        let original_forge_config = crate::profile_paths::env::var("FORGE_CONFIG").ok();
+        crate::profile_paths::env::set_var("FORGE_CONFIG", forge_dir.path());
 
         let project_path = "forgecode://workspace/workspace-alpha".to_string();
         let session_path =
@@ -6001,9 +6002,9 @@ mod tests {
         );
 
         if let Some(value) = original_forge_config {
-            std::env::set_var("FORGE_CONFIG", value);
+            crate::profile_paths::env::set_var("FORGE_CONFIG", value);
         } else {
-            std::env::remove_var("FORGE_CONFIG");
+            crate::profile_paths::env::remove_var("FORGE_CONFIG");
         }
     }
 

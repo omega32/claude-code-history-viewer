@@ -3,8 +3,6 @@
 //! This module provides commands for reading and writing Claude Code settings
 //! across different scopes (user, project, local, managed) and MCP server configurations.
 
-#[cfg(test)]
-use crate::test_utils::dirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -43,19 +41,19 @@ pub struct AllMCPServers {
 
 /// Get the user settings path (~/.claude/settings.json)
 fn get_user_settings_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude").join("settings.json"))
 }
 
 /// Get the user MCP settings path (~/.claude/.mcp.json)
 fn get_user_mcp_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude").join(".mcp.json"))
 }
 
 /// Get the main Claude config path (~/.claude.json) - the official config file
 fn get_claude_json_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude.json"))
 }
 
@@ -102,17 +100,8 @@ fn get_project_mcp_path(project_path: &str) -> Result<PathBuf, String> {
 }
 
 /// Get the managed settings path (macOS only)
-#[cfg(target_os = "macos")]
-#[allow(clippy::unnecessary_wraps)]
 fn get_managed_settings_path() -> Result<PathBuf, String> {
-    Ok(PathBuf::from(
-        "/Library/Application Support/ClaudeCode/managed-settings.json",
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn get_managed_settings_path() -> Result<PathBuf, String> {
-    Err("Managed settings are only available on macOS".to_string())
+    crate::profile_paths::managed_settings_path()
 }
 
 /// Get settings path for a specific scope
@@ -182,7 +171,7 @@ pub async fn get_settings_by_scope(
     scope: String,
     project_path: Option<String>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = get_settings_path(&scope, project_path.as_deref())?;
         read_settings_file(&path)
     })
@@ -210,7 +199,7 @@ pub async fn save_settings(
         return Err("Cannot modify managed settings (read-only)".to_string());
     }
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = get_settings_path(&scope, project_path.as_deref())?;
         write_settings_file(&path, &content)
     })
@@ -227,7 +216,7 @@ pub async fn save_settings(
 /// `AllSettings` struct with all 4 scopes (each is `Option<String>`)
 #[tauri::command]
 pub async fn get_all_settings(project_path: Option<String>) -> Result<AllSettings, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let user = get_user_settings_path()
             .ok()
             .and_then(|p| read_settings_file(&p).ok());
@@ -263,7 +252,7 @@ pub async fn get_all_settings(project_path: Option<String>) -> Result<AllSetting
 /// `MCPServers` struct with merged servers from both sources
 #[tauri::command]
 pub async fn get_mcp_servers() -> Result<MCPServers, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::profile_paths::spawn_blocking(|| {
         let mut merged = serde_json::Map::new();
 
         // Read from ~/.claude/settings.json (mcpServers field)
@@ -313,7 +302,7 @@ pub async fn get_mcp_servers() -> Result<MCPServers, String> {
 /// `AllMCPServers` struct with servers from each source separately
 #[tauri::command]
 pub async fn get_all_mcp_servers(project_path: Option<String>) -> Result<AllMCPServers, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         // User settings.json mcpServers (legacy)
         let user_settings = get_user_settings_path().ok().and_then(|p| {
             read_settings_file(&p).ok().and_then(|content| {
@@ -414,7 +403,7 @@ pub async fn save_mcp_servers(
     let servers_value: serde_json::Value =
         serde_json::from_str(&servers).map_err(|e| format!("Invalid MCP servers JSON: {e}"))?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         match source.as_str() {
             "user_settings" => {
                 // Update mcpServers field in ~/.claude/settings.json (legacy)
@@ -525,7 +514,7 @@ pub struct ClaudeJsonConfig {
 pub async fn get_claude_json_config(
     project_path: Option<String>,
 ) -> Result<ClaudeJsonConfig, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = get_claude_json_path()?;
         let file_path = path.to_string_lossy().to_string();
 
@@ -607,7 +596,7 @@ pub(crate) fn validate_dialog_path(path: &Path) -> Result<(), String> {
 /// `Ok(())` if path is safe, error message if not
 #[cfg(feature = "webui-server")]
 pub(crate) fn is_safe_path(path: &Path) -> Result<(), String> {
-    let home_raw = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home_raw = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     // Canonicalize home to resolve symlinks (e.g. macOS /var → /private/var)
     let home = home_raw.canonicalize().unwrap_or_else(|_| home_raw.clone());
     let home = strip_windows_prefix(&home);
@@ -615,9 +604,9 @@ pub(crate) fn is_safe_path(path: &Path) -> Result<(), String> {
     // Fall back to home-relative paths when the API returns None.
     let mut allowed_dirs = vec![home.join(".claude-history-viewer").join("exports")];
     for (api_dir, fallback_name) in [
-        (dirs::download_dir(), "Downloads"),
-        (dirs::document_dir(), "Documents"),
-        (dirs::desktop_dir(), "Desktop"),
+        (crate::profile_paths::download_dir(), "Downloads"),
+        (crate::profile_paths::document_dir(), "Documents"),
+        (crate::profile_paths::desktop_dir(), "Desktop"),
     ] {
         let resolved = api_dir.unwrap_or_else(|| home.join(fallback_name));
         let resolved =
@@ -670,7 +659,7 @@ fn strip_windows_prefix(path: &Path) -> PathBuf {
 /// * `content` - Text content to write
 #[tauri::command]
 pub async fn write_text_file(path: String, content: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = PathBuf::from(path);
 
         validate_dialog_path(&path)?;
@@ -706,7 +695,7 @@ pub async fn write_text_file(path: String, content: String) -> Result<(), String
 #[tauri::command]
 pub async fn save_screenshot(path: String, data: String) -> Result<(), String> {
     use base64::Engine;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = PathBuf::from(&path);
         validate_dialog_path(&path)?;
 
@@ -738,7 +727,7 @@ pub async fn save_screenshot(path: String, data: String) -> Result<(), String> {
 /// * `path` - Absolute path chosen by user via open dialog
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = PathBuf::from(path);
 
         validate_dialog_path(&path)?;
@@ -874,6 +863,20 @@ mod tests {
         assert!(all.local.is_none());
 
         drop(temp);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_settings_reads_only_scoped_managed_fixture() {
+        let home = setup_test_env();
+        let path = crate::profile_paths::managed_settings_path().unwrap();
+        assert!(path.starts_with(home.path()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let settings = r#"{"managed":"isolated-fixture"}"#;
+        fs::write(path, settings).unwrap();
+        assert_eq!(
+            get_all_settings(None).await.unwrap().managed.as_deref(),
+            Some(settings)
+        );
     }
 
     #[tokio::test]

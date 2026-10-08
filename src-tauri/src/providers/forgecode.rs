@@ -67,14 +67,14 @@ pub fn detect() -> Option<ProviderInfo> {
 /// `.forge.db` remains the authoritative transcript source, while `logs/` and
 /// `.forge_history` are treated as secondary detection artifacts only.
 pub fn get_base_path() -> Option<String> {
-    if let Ok(config_dir) = std::env::var("FORGE_CONFIG") {
+    if let Ok(config_dir) = crate::profile_paths::env::var("FORGE_CONFIG") {
         let path = PathBuf::from(&config_dir);
         if path.exists() {
             return Some(path.to_string_lossy().to_string());
         }
     }
 
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let default_path = home.join(".forge");
     if default_path.exists() {
         Some(default_path.to_string_lossy().to_string())
@@ -1475,7 +1475,7 @@ fn extract_workspace_display_name_from_context_json(context_json: &str) -> Optio
 
 /// Extract a workspace display name from a JSON value.
 fn extract_workspace_display_name_from_value(value: &Value) -> Option<String> {
-    let home_dir = dirs::home_dir();
+    let home_dir = crate::profile_paths::home_dir();
     let home_dir = home_dir.as_deref();
     let mut cwd_votes: BTreeMap<String, usize> = BTreeMap::new();
     collect_workspace_display_name_votes(value, home_dir, &mut cwd_votes);
@@ -1574,7 +1574,7 @@ fn collect_cwd_votes(value: &Value, cwd_votes: &mut BTreeMap<String, usize>) {
 
 /// Picks the most-voted cwd, filtering out home directories.
 fn choose_best_cwd(cwd_votes: &BTreeMap<String, usize>) -> Option<String> {
-    let home_dir = dirs::home_dir();
+    let home_dir = crate::profile_paths::home_dir();
     cwd_votes
         .iter()
         .filter(|(path, _)| {
@@ -1803,12 +1803,10 @@ mod tests {
     use rusqlite::params;
     use tempfile::TempDir;
 
-    /// RAII guard that restores a process-wide env var when dropped.
+    /// RAII guard that restores a scoped environment override when dropped.
     ///
     /// Use this instead of manual save / set / restore blocks so that the
     /// original value is put back even if an assertion in the test panics.
-    /// Tests in this module rely on `--test-threads=1` (see `CLAUDE.md`
-    /// "Phase 1: Quality Gate") because env vars are global to the process.
     ///
     /// `original` is stored as `OsString` rather than `String` so that
     /// non-UTF-8 values (legitimate on macOS / Linux) are restored
@@ -1820,8 +1818,8 @@ mod tests {
 
     impl EnvGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -1829,8 +1827,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
+                Some(v) => crate::profile_paths::env::set_var(self.key, v),
+                None => crate::profile_paths::env::remove_var(self.key),
             }
         }
     }
@@ -2233,13 +2231,14 @@ mod tests {
     #[test]
     /// Extract workspace display name prefers cwd basename and ignores home dir.
     fn extract_workspace_display_name_prefers_cwd_basename_and_ignores_home_dir() {
+        let _home = crate::test_utils::TestHome::new();
         let context = json!({
             "messages": [
                 {
                     "message": {
                         "tool": {
                             "arguments": {
-                                "cwd": dirs::home_dir().unwrap().to_string_lossy().to_string()
+                                "cwd": crate::profile_paths::home_dir().unwrap().to_string_lossy().to_string()
                             }
                         }
                     }

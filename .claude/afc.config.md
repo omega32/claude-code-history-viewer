@@ -6,11 +6,11 @@
 ## CI Commands
 
 ```yaml
-ci: "pnpm install && pnpm tsc --build . && pnpm lint && pnpm vitest run && cd src-tauri && cargo test -- --test-threads=1 && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cd .."
+ci: "pnpm install && pnpm tsc --build . && pnpm lint && pnpm vitest run && pnpm test:rust && cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cd .."
 gate: "pnpm tsc --build . && pnpm lint && cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings && cd .."
-test: "pnpm vitest run && cd src-tauri && cargo test -- --test-threads=1 && cd .."
+test: "pnpm vitest run && pnpm test:rust"
 test_frontend: "pnpm vitest run --reporter=verbose"
-test_backend: "cd src-tauri && cargo test -- --test-threads=1"
+test_backend: "pnpm test:rust"
 typecheck: "pnpm tsc --build ."
 lint: "pnpm lint"
 lint_fix: "pnpm lint --fix"
@@ -122,7 +122,7 @@ The project is a **Tauri 2 desktop application** with a layered, module-based ar
   - Path validation: No symlinks, traversal protection for user-provided paths
   - Atomic writes: Temp file + rename pattern (not direct overwrite)
   - Error handling: Propagate via `?` operator, convert to `Result<T, String>` for IPC
-  - Tests: Run with `--test-threads=1` (settings tests use `env::set_var("HOME")`)
+  - Tests: Use `pnpm test:rust`; see [canonical test profile safety](../CLAUDE.md#rust-test-profile-safety).
 - **Dependencies**: Minimalist; performance-critical paths use SIMD (simd-json, memmap2)
 
 ### ESLint & Linting
@@ -162,8 +162,7 @@ The project is a **Tauri 2 desktop application** with a layered, module-based ar
 
 ### Backend (Rust)
 - **Framework**: Built-in `#[cfg(test)]` modules
-- **Runner**: `cargo test` (no separate test framework needed)
-- **Thread Safety**: `--test-threads=1` mandatory (settings tests modify `env::set_var("HOME")`)
+- **Runner and isolation**: Follow [canonical test profile safety](../CLAUDE.md#rust-test-profile-safety); `pnpm test:rust` owns isolated compilation and serial libtest.
 - **Test Utils**: `src-tauri/src/test_utils.rs` (shared helpers)
 
 ## i18n Internationalization
@@ -213,7 +212,7 @@ The project is a **Tauri 2 desktop application** with a layered, module-based ar
 - Path splitting: `split(/[\\/]/)` to handle both Windows `\` and Unix `/`
 - Rust `fs::rename`: Windows fails if target exists → use `remove_file` first
 - Home directory detection: support `C:\Users\` pattern on Windows
-- Env vars: `HOME` not reliable; use `dirs::home_dir()` instead
+- Profile paths: Follow [canonical test profile safety](../CLAUDE.md#rust-test-profile-safety); use the shared Rust profile adapter.
 
 ### Performance
 - Virtual scrolling: VariableSizeList for message lists (100+ items)

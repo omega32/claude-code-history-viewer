@@ -34,14 +34,14 @@ const SUMMARY_MAX_CHARS: usize = 80;
 /// Runtime base dir: `$QWEN_RUNTIME_DIR` / `$QWEN_HOME` / `~/.qwen`.
 fn runtime_base() -> Option<PathBuf> {
     for env in ["QWEN_RUNTIME_DIR", "QWEN_HOME"] {
-        if let Ok(v) = std::env::var(env) {
+        if let Ok(v) = crate::profile_paths::env::var(env) {
             let v = v.trim();
             if !v.is_empty() {
                 return Some(PathBuf::from(v));
             }
         }
     }
-    Some(dirs::home_dir()?.join(".qwen"))
+    Some(crate::profile_paths::home_dir()?.join(".qwen"))
 }
 
 fn projects_dir() -> Option<PathBuf> {

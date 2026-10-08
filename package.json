@@ -1,7 +1,7 @@
 {
   "name": "claude-code-history-viewer",
   "private": true,
-  "version": "1.29.0",
+  "version": "1.29.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +11,8 @@
     "lint": "eslint src",
     "preview": "vite preview",
     "test": "vitest",
+    "test:rust": "tsc -p scripts/tsconfig.json && node scratch/test-tools/test-rust.js",
+    "test:rust:check": "tsc -p scripts/tsconfig.json && node --test scratch/test-tools/rust-tests.test.js",
     "generate:i18n-types": "node scripts/generate-i18n-types.mjs",
     "i18n:flatten": "node scripts/flatten-i18n.mjs",
     "i18n:sync": "node scripts/sync-i18n-keys.mjs",

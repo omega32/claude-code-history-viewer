@@ -126,30 +126,33 @@ serve-dev: frontend-build
 
 # ===== Rust Testing Commands =====
 
-# Run Rust tests with cargo test
-# Run Rust tests (single-threaded because scoped test-home overrides are shared)
+# Run Rust tests with an isolated profile and serial libtest execution
 rust-test:
-    cd src-tauri && cargo test -- --test-threads=1
+    pnpm test:rust
 
 # Run Rust tests with nextest (faster, parallel)
 rust-nextest:
-    cd src-tauri && cargo nextest run
+    pnpm test:rust nextest
 
 # Run Rust tests with coverage
 rust-coverage:
-    cd src-tauri && cargo llvm-cov nextest --html
+    pnpm test:rust coverage
 
 # Open Rust coverage report
 rust-coverage-open:
-    cd src-tauri && cargo llvm-cov nextest --html --open
+    pnpm test:rust coverage --open
 
 # Run Rust tests in CI profile
 rust-test-ci:
-    cd src-tauri && cargo nextest run --profile ci
+    pnpm test:rust nextest --profile ci
+
+# Explicit live diagnostics: reads user data and may write provider caches
+rust-test-live:
+    pnpm test:rust live --acknowledge-profile-access
 
 # Run Rust clippy lints
 rust-lint:
-    cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings
+    pnpm test:rust clippy
 
 # Check Rust formatting
 rust-fmt-check:
@@ -172,7 +175,7 @@ rust-check-all: rust-fmt-check rust-lint rust-test
 
 # Watch and run Rust tests on changes
 rust-watch:
-    cd src-tauri && cargo watch -x test
+    cd src-tauri && cargo watch -s "cd .. && pnpm test:rust"
 
 # Generate Rust documentation
 rust-doc:
@@ -180,7 +183,7 @@ rust-doc:
 
 # Run property-based tests only
 rust-proptest:
-    cd src-tauri && cargo test proptest
+    pnpm test:rust test --filter proptest
 
 # Review snapshot changes (insta)
 rust-snapshot-review:

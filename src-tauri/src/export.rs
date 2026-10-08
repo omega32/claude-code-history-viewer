@@ -638,7 +638,7 @@ fn resolve_session_path(value: &str) -> Result<PathBuf, String> {
         ));
     }
 
-    let projects = dirs::home_dir()
+    let projects = crate::profile_paths::home_dir()
         .ok_or("Could not determine home directory")?
         .join(".claude")
         .join("projects");

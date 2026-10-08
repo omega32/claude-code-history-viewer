@@ -63,6 +63,8 @@ mod session_count_tests {
 
     #[tokio::test]
     async fn sidechain_files_are_not_counted_as_sessions() {
+        let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+            .expect("run integration tests through scripts/test-rust.ts");
         // Before the fix this returned 2 + 3 = 5 (recursive count).
         // After the fix only the 2 top-level sessions count.
         let count = counted_sessions(2, 3).await;
@@ -74,12 +76,16 @@ mod session_count_tests {
 
     #[tokio::test]
     async fn only_top_level_sessions_are_counted() {
+        let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+            .expect("run integration tests through scripts/test-rust.ts");
         let count = counted_sessions(4, 10).await;
         assert_eq!(count, 4);
     }
 
     #[tokio::test]
     async fn project_with_no_top_level_sessions_is_skipped() {
+        let _profile = claude_code_history_viewer_lib::profile_paths::TestProfile::new()
+            .expect("run integration tests through scripts/test-rust.ts");
         // A dir containing only sidechain files has no main session and should
         // not appear at all (session_count == 0 -> continue).
         let temp = TempDir::new().expect("temp dir");

@@ -4,8 +4,6 @@
 //! user metadata stored in ~/.claude-history-viewer/user-data.json
 
 use crate::models::{ProjectMetadata, SessionMetadata, UserMetadata, UserSettings};
-#[cfg(test)]
-use crate::test_utils::dirs;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -59,7 +57,7 @@ impl Default for MetadataState {
 
 /// Get the metadata folder path (~/.claude-history-viewer)
 fn get_metadata_folder() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer"))
 }
 
@@ -81,7 +79,7 @@ fn ensure_metadata_folder() -> Result<PathBuf, String> {
 /// Get the metadata folder path
 #[tauri::command]
 pub async fn get_metadata_folder_path() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::profile_paths::spawn_blocking(|| {
         let path = get_metadata_folder()?;
         Ok(path.to_string_lossy().to_string())
     })
@@ -96,7 +94,7 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     let path = get_user_data_path()?;
 
     // Perform blocking file I/O off the async runtime
-    let metadata = tauri::async_runtime::spawn_blocking(move || {
+    let metadata = crate::profile_paths::spawn_blocking(move || {
         if path.exists() {
             let content = fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read metadata file: {e}"))?;
@@ -150,7 +148,7 @@ pub async fn save_user_metadata(
     let metadata_clone = metadata.clone();
 
     // Perform blocking file I/O off the async runtime
-    tauri::async_runtime::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
+    crate::profile_paths::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
         .await
         .map_err(|e| format!("Task join error: {e}"))??;
 
@@ -192,7 +190,7 @@ pub async fn update_session_metadata(
 
     // Perform blocking file I/O off the async runtime
     let metadata_clone = metadata_to_save.clone();
-    tauri::async_runtime::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
+    crate::profile_paths::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
         .await
         .map_err(|e| format!("Task join error: {e}"))??;
 
@@ -230,7 +228,7 @@ pub async fn update_project_metadata(
 
     // Perform blocking file I/O off the async runtime
     let metadata_clone = metadata_to_save.clone();
-    tauri::async_runtime::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
+    crate::profile_paths::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
         .await
         .map_err(|e| format!("Task join error: {e}"))??;
 
@@ -258,7 +256,7 @@ pub async fn update_user_settings(
 
     // Perform blocking file I/O off the async runtime
     let metadata_clone = metadata_to_save.clone();
-    tauri::async_runtime::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
+    crate::profile_paths::spawn_blocking(move || save_metadata_to_disk(&metadata_clone))
         .await
         .map_err(|e| format!("Task join error: {e}"))??;
 
@@ -340,7 +338,7 @@ mod tests {
     fn test_atomic_write() {
         let (_guard, temp) = setup_test_env();
 
-        // Manually create the metadata folder since HOME is mocked
+        // Create the metadata folder inside the scoped test home.
         let metadata_folder = temp.path().join(".claude-history-viewer");
         fs::create_dir_all(&metadata_folder).unwrap();
 

@@ -5,11 +5,23 @@ on:
     branches: [main, develop]
     paths:
       - "src-tauri/**"
+      - "scripts/test-rust.ts"
+      - "scripts/rust-tests.test.ts"
+      - "scripts/tsconfig.json"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "justfile"
       - ".github/workflows/rust-tests.yml"
   pull_request:
     branches: [main, develop]
     paths:
       - "src-tauri/**"
+      - "scripts/test-rust.ts"
+      - "scripts/rust-tests.test.ts"
+      - "scripts/tsconfig.json"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "justfile"
       - ".github/workflows/rust-tests.yml"
 
 env:
@@ -59,18 +71,31 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   # Main test job - runs in parallel with lint
-  # PR: Ubuntu only, Main: Ubuntu + macOS
+  # Windows exercises KnownFolder isolation on pull requests as well as pushes.
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest", "windows-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
         rust: [stable]
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install runner tooling
+        run: pnpm install --frozen-lockfile
+
+      - name: Check test runner contracts
+        run: pnpm test:rust:check
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -99,25 +124,24 @@ jobs:
 
 
       - name: Create dist placeholder for rust-embed
+        shell: bash
         run: mkdir -p dist && touch dist/index.html
 
       - name: Run tests with nextest
-        working-directory: src-tauri
-        run: cargo nextest run --profile ci --retries 2
+        run: pnpm test:rust nextest --profile ci
 
       # webui-server gates extra command surface (incl. is_safe_session_path),
       # which the default run does not compile. Exercise it explicitly so those
       # paths get real test coverage (e.g. the #355 symlinked-root regression).
       - name: Run tests with nextest (webui-server feature)
-        working-directory: src-tauri
-        run: cargo nextest run --profile ci --retries 2 --features webui-server
+        run: pnpm test:rust nextest --profile ci --features webui-server
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.os }}
-          path: src-tauri/target/nextest/ci/junit.xml
+          path: src-tauri/target/test-isolated/nextest/ci/junit.xml
           retention-days: 7
 
   # Code coverage - main branch only
@@ -127,6 +151,16 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install runner tooling
+        run: pnpm install --frozen-lockfile
 
       - name: Install system dependencies
         run: |
@@ -157,9 +191,7 @@ jobs:
 
 
       - name: Generate coverage report
-        working-directory: src-tauri
-        run: |
-          cargo llvm-cov nextest --lcov --output-path lcov.info
+        run: pnpm test:rust coverage --lcov
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

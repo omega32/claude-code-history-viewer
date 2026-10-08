@@ -153,8 +153,8 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 }
 
 fn find_stores() -> Vec<PathBuf> {
-    let override_value = std::env::var(PATH_OVERRIDE).ok();
-    let data_local = dirs::data_local_dir();
+    let override_value = crate::profile_paths::env::var(PATH_OVERRIDE).ok();
+    let data_local = crate::profile_paths::data_local_dir();
     find_stores_from(override_value.as_deref(), data_local.as_deref())
 }
 

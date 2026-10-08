@@ -13,9 +13,6 @@ mod load;
 mod rename;
 mod search;
 
-#[cfg(all(test, feature = "webui-server"))]
-use crate::test_utils::dirs;
-
 // Re-export all commands
 pub use delete::*;
 pub use edits::*;
@@ -40,7 +37,7 @@ pub(crate) fn is_safe_session_path(path: &std::path::Path) -> Result<(), String>
             .unwrap_or_else(|| p.to_path_buf())
     }
 
-    let home_raw = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home_raw = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     let home = home_raw.canonicalize().unwrap_or_else(|_| home_raw.clone());
     let home = strip_windows_prefix(&home);
 
@@ -135,10 +132,11 @@ pub(crate) fn is_safe_session_path(path: &std::path::Path) -> Result<(), String>
     }
 }
 
-#[cfg(all(test, feature = "webui-server", unix))]
+#[cfg(all(test, feature = "webui-server"))]
 mod tests {
     use super::*;
     use serial_test::serial;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -151,6 +149,7 @@ mod tests {
     // Regression test for #355: when `~/.claude` is itself a symlink, the
     // candidate path canonicalizes to the symlink target, so the allowlist
     // entries must be canonicalized too or valid sessions are rejected.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn accepts_session_under_symlinked_claude_root() {
@@ -219,8 +218,9 @@ mod tests {
     #[serial]
     fn test_safe_session_path_allows_custom_kimi_home() {
         let temp = TempDir::new().unwrap();
-        let old_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::set_var("KIMI_HOME", temp.path());
+        let _home = crate::test_utils::HomeGuard::set(temp.path());
+        let old_kimi_home = crate::profile_paths::env::var_os("KIMI_HOME");
+        crate::profile_paths::env::set_var("KIMI_HOME", temp.path());
 
         let session_dir = temp
             .path()
@@ -234,9 +234,9 @@ mod tests {
         let result = is_safe_session_path(&session_file);
 
         if let Some(kimi_home) = old_kimi_home {
-            std::env::set_var("KIMI_HOME", kimi_home);
+            crate::profile_paths::env::set_var("KIMI_HOME", kimi_home);
         } else {
-            std::env::remove_var("KIMI_HOME");
+            crate::profile_paths::env::remove_var("KIMI_HOME");
         }
 
         assert!(result.is_ok());
@@ -249,8 +249,8 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            let previous = crate::profile_paths::env::var(key).ok();
+            crate::profile_paths::env::set_var(key, value);
             Self { key, previous }
         }
     }
@@ -258,8 +258,8 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                Some(value) => crate::profile_paths::env::set_var(self.key, value),
+                None => crate::profile_paths::env::remove_var(self.key),
             }
         }
     }
@@ -268,6 +268,7 @@ mod tests {
     #[serial]
     fn safe_session_path_allows_codex_home_sessions() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = crate::test_utils::HomeGuard::set(temp.path());
         let codex_home = temp.path().join("custom-codex");
         let sessions = codex_home.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -283,6 +284,7 @@ mod tests {
     #[serial]
     fn safe_session_path_allows_codex_home_archived_sessions() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = crate::test_utils::HomeGuard::set(temp.path());
         let codex_home = temp.path().join("custom-codex");
         let archived_sessions = codex_home.join("archived_sessions");
         std::fs::create_dir_all(&archived_sessions).unwrap();

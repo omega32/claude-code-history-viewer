@@ -24,6 +24,9 @@ pub fn build_unc_path_fallback(distro: &str, linux_path: &Path) -> PathBuf {
 
 #[cfg(target_os = "windows")]
 pub fn is_wsl_available() -> bool {
+    if crate::profile_paths::test_profile_enabled() {
+        return false;
+    }
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -38,6 +41,9 @@ pub fn is_wsl_available() -> bool {
 
 #[cfg(target_os = "windows")]
 pub fn detect_distros() -> Vec<WslDistro> {
+    if crate::profile_paths::test_profile_enabled() {
+        return Vec::new();
+    }
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
@@ -79,6 +85,9 @@ pub fn detect_distros() -> Vec<WslDistro> {
 
 #[cfg(target_os = "windows")]
 pub fn resolve_home_path(distro: &str) -> Result<PathBuf, String> {
+    if crate::profile_paths::test_profile_enabled() {
+        return Err("Native WSL profiles are unavailable in isolated tests".to_string());
+    }
     use std::process::Command;
 
     if !distro
@@ -136,6 +145,9 @@ fn decode_utf16le(bytes: &[u8]) -> Result<String, String> {
 }
 
 pub fn resolve_wsl_provider_path(distro: &str, linux_path: &Path) -> Option<PathBuf> {
+    if crate::profile_paths::test_profile_enabled() {
+        return None;
+    }
     let primary = build_unc_path(distro, linux_path);
     if primary.exists() {
         return Some(primary);
@@ -150,6 +162,17 @@ pub fn resolve_wsl_provider_path(distro: &str, linux_path: &Path) -> Option<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_tests_cannot_resolve_native_wsl_profiles() {
+        assert!(!is_wsl_available());
+        assert!(detect_distros().is_empty());
+        assert!(resolve_home_path("Ubuntu").is_err());
+        assert_eq!(
+            resolve_wsl_provider_path("Ubuntu", Path::new("/home/user/.claude")),
+            None
+        );
+    }
 
     #[test]
     fn build_unc_path_converts_linux_path() {

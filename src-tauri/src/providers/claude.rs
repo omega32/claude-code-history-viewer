@@ -16,7 +16,7 @@ const SNAPSHOT_CURSOR_VERSION: u32 = 2;
 
 /// Detect Claude Code installation
 pub fn detect() -> Option<ProviderInfo> {
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let claude_path = home.join(".claude");
     let projects_path = claude_path.join("projects");
 
@@ -30,7 +30,7 @@ pub fn detect() -> Option<ProviderInfo> {
 
 /// Get the Claude base path (~/.claude)
 pub fn get_base_path() -> Option<String> {
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let claude_path = home.join(".claude");
     if claude_path.exists() {
         Some(claude_path.to_string_lossy().to_string())

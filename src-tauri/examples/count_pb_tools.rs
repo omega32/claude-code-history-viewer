@@ -39,7 +39,7 @@ fn main() {
         .nth(1)
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            dirs::home_dir().map(|home| {
+            claude_code_history_viewer_lib::profile_paths::home_dir().map(|home| {
                 home.join(".gemini")
                     .join("antigravity")
                     .join("conversations")

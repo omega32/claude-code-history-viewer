@@ -75,6 +75,14 @@ pnpm build                                      # Build frontend with TypeScript
 pnpm lint                                       # Run ESLint
 ```
 
+### Rust test profile safety
+
+Run `pnpm test:rust` (or `just rust-test`) from the repository root. The TypeScript runner compiles with the existing compiler, checks the profile boundary, creates a fresh temporary process profile, clears inherited provider overrides, and selects an isolated Cargo target directory. It retains the existing Cargo/Rustup caches. `pnpm test:rust nextest --profile ci`, `pnpm test:rust test --lib --filter <name>`, `pnpm test:rust test --test <fixture-target>`, `pnpm test:rust coverage` and `pnpm test:rust clippy` use the same boundary. Runner contract checks are `pnpm test:rust:check`.
+
+`src-tauri/src/profile_paths.rs` is the only native directory and profile-environment adapter. Unit tests and builds explicitly activated by compile-time `CCHV_TEST_PROFILE=isolated-v1` fail closed without a scoped `TestProfile`/`HomeGuard`. Fixture state is local to a thread, nested and unwind-safe; the shared blocking-worker helper propagates it only to owned workers. Unrelated threads receive no profile or inherited environment. Do not reintroduce raw native directory, process-environment or WSL discovery in application code; the renamed dependency, Clippy restrictions and runner preflight enforce this boundary. Integration test functions must acquire `TestProfile::new()` as their first statement. Plain Cargo integration execution refuses before profile work because its library is not compiled with `cfg(test)`; use the runner rather than overriding HOME or USERPROFILE.
+
+All live diagnostics are ignored in `src-tauri/tests/live_profile.rs` and additionally require compile-time `live-v1` activation. The supported `pnpm test:rust live --acknowledge-profile-access` command (or the explicitly named `just rust-test-live`) requires acknowledgement and uses native profiles; provider session loading can update derived caches. Do not run that command as an ordinary validation gate. Ordinary debug/release and `--all-features` builds preserve native application paths unless explicitly compiled in test mode. This boundary is not an OS sandbox for arbitrary explicit paths, native APIs or third-party subprocesses. See [the owning specification](specs/2026-10-08-test-profile-isolation/spec.md) and [the activation decision](docs/adr/0001-test-profile-isolation.md).
+
 ## Branch Strategy
 
 ```
@@ -159,7 +167,7 @@ pnpm vitest run --reporter=verbose  # 프론트엔드 테스트
 pnpm lint                       # ESLint (no-explicit-any 등)
 
 # ===== Backend 검증 =====
-cd src-tauri && cargo test -- --test-threads=1 && cd ..  # Rust 테스트 (단일 스레드 필수)
+pnpm test:rust                                      # Isolated Rust tests; serial libtest
 cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings && cd ..  # Rust 린트
 cd src-tauri && cargo fmt --all -- --check && cd ..      # Rust 포맷 체크
 
@@ -168,7 +176,7 @@ pnpm run i18n:validate          # 5개 언어 키 동기화 확인 (en, ko, ja, 
 ```
 
 **주의사항:**
-- `cargo test`는 반드시 `--test-threads=1`로 실행 (home-dependent tests share a scoped test-home override)
+- Use `pnpm test:rust`; it enforces `cargo test -- --test-threads=1` and isolated integration compilation. Serialization remains required for other process-global test state; profile overrides themselves are thread-local.
 - `pnpm install` 생략 시 lockfile과 node_modules 불일치로 빌드 실패 가능
 - lint에서 `@typescript-eslint/no-explicit-any` 에러 발생 시 `as unknown as TargetType` 패턴 사용
 
@@ -253,7 +261,7 @@ gh release edit v1.3.1 --notes-file /path/to/notes.md
 | 문제 | 원인 | 해결 |
 |------|------|------|
 | CI에서 pnpm 버전 충돌 | `pnpm/action-setup`의 `version` 필드와 `package.json`의 `packageManager` 충돌 | 워크플로우에서 `version` 제거 (packageManager 자동 감지) |
-| `cargo test` 간헐적 실패 | The scoped test-home override is process-global; parallel tests can race | `--test-threads=1` 사용 |
+| Plain Cargo integration tests refuse to start | The linked production library lacks isolated test activation | Use `pnpm test:rust`; do not add ambient home overrides |
 | 릴리즈 중복 생성 | 수동 `gh release create` + 워크플로우 자동 생성 | 수동 생성 금지, 워크플로우에 위임 |
 | 자동 업데이트 시 에러 플래시 | `relaunch()` 전 바이너리 교체로 UI 크래시 | `isRestarting` 상태로 오버레이 표시 후 500ms 딜레이 |
 | `pnpm install` 후에도 모듈 못 찾음 | lockfile과 실제 node_modules 불일치 | `rm -rf node_modules && pnpm install` |
@@ -501,7 +509,7 @@ Assistant messages contain additional metadata within the `message` object:
 - Virtual scrolling is implemented for performance with large message lists
 - Pagination is used to load messages in batches (100 messages per page)
 - Message tree structure is flattened for virtual scrolling while preserving parent-child relationships
-- No test suite currently exists
+- Frontend and Rust test suites exist; follow the canonical test commands and Rust profile safety above.
 
 ### CLI flags
 
@@ -966,7 +974,7 @@ this block adds only the discipline spine and agent/critic routing.
 
 - Frontend: `vitest` — one-shot run `pnpm exec vitest run`. Typecheck with
   `pnpm tsc --build .` (same as CI).
-- Backend (`src-tauri/`): `cargo test -- --test-threads=1` is MANDATORY because home-dependent tests share a scoped test-home override. The cfg(test) directory resolver fails closed without a guard; Windows KnownFolder lookup ignores HOME and USERPROFILE. Lint `cargo clippy --all-targets --all-features -- -D warnings`, format `cargo fmt --all -- --check`.
+- Backend: `pnpm test:rust` from the root is MANDATORY for the serial `cargo test -- --test-threads=1` gate with isolated integration compilation. Profile state is thread-local and fails closed without a guard; serial libtest remains required for other process-global test state. Windows KnownFolder lookup ignores ambient HOME/USERPROFILE. See Rust test profile safety above. Lint `cargo clippy --all-targets --all-features -- -D warnings` for native-build coverage and `pnpm test:rust clippy` for isolated-build coverage; format `cargo fmt --all -- --check` in `src-tauri/`.
 - Tests-first for non-trivial changes; for backend / library code (Rust
   providers, parsers, commands) a failing test comes before the implementation.
 - i18n changes: `pnpm run i18n:validate` is part of the gate.

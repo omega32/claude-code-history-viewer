@@ -1543,7 +1543,7 @@ pub fn detect() -> Option<ProviderInfo> {
 /// Get the Codex base path
 pub fn get_base_path() -> Option<String> {
     // Check $CODEX_HOME first
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+    if let Ok(codex_home) = crate::profile_paths::env::var("CODEX_HOME") {
         let path = PathBuf::from(&codex_home);
         if path.exists() {
             return Some(codex_home);
@@ -1551,7 +1551,7 @@ pub fn get_base_path() -> Option<String> {
     }
 
     // Default: ~/.codex
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let codex_path = home.join(".codex");
     if codex_path.exists() {
         Some(codex_path.to_string_lossy().to_string())
@@ -7767,8 +7767,8 @@ mod tests {
 
     impl EnvVarGuard {
         pub(super) fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -7776,9 +7776,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.original.as_ref() {
-                std::env::set_var(self.key, value);
+                crate::profile_paths::env::set_var(self.key, value);
             } else {
-                std::env::remove_var(self.key);
+                crate::profile_paths::env::remove_var(self.key);
             }
         }
     }

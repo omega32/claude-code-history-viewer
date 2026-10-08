@@ -1,7 +1,5 @@
 use super::ProviderInfo;
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
-#[cfg(test)]
-use crate::test_utils::dirs;
 use crate::utils::{
     build_provider_message, decode_with_filesystem_check, find_line_ranges,
     search_json_value_case_insensitive,
@@ -31,7 +29,7 @@ pub fn detect() -> Option<ProviderInfo> {
 
 /// Get the `CodeBuddy` projects base path (`~/.codebuddy/projects`)
 pub fn get_base_path() -> Option<String> {
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let projects_path = home.join(".codebuddy").join("projects");
     if projects_path.exists() && projects_path.is_dir() {
         Some(projects_path.to_string_lossy().to_string())
@@ -43,7 +41,7 @@ pub fn get_base_path() -> Option<String> {
 /// Scan `CodeBuddy` projects under the user's `~/.codebuddy/projects` root.
 ///
 /// Thin wrapper over [`scan_projects_in`] that resolves the production root
-/// from `dirs::home_dir()`. Tests should call `scan_projects_in` directly with
+/// from `crate::profile_paths::home_dir()`. Tests should call `scan_projects_in` directly with
 /// a tempdir so the assertion runs against the real production code path
 /// instead of a copy of the loop logic.
 pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
@@ -373,7 +371,7 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
 
 /// Validate that a session path is within `~/.codebuddy/projects`
 fn validate_session_path(path: &Path) -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     let allowed = home.join(".codebuddy").join("projects");
 
     let canonical = if path.exists() {

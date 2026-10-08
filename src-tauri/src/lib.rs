@@ -5,6 +5,7 @@ pub mod commands;
 pub mod export;
 pub mod headless_dump;
 pub mod models;
+pub mod profile_paths;
 pub mod providers;
 pub mod utils;
 pub mod wsl;
@@ -231,16 +232,16 @@ fn run_tauri() {
     //
     // See: https://github.com/jhlee0409/claude-code-history-viewer/issues/186
     // See: https://github.com/tauri-apps/tauri/issues/11988
-    // Note: std::env::set_var becomes unsafe in Rust edition 2024.
+    // Note: the underlying std::env::set_var becomes unsafe in Rust edition 2024.
     // This is safe here because no threads exist yet at this point in startup.
     #[cfg(target_os = "linux")]
-    if std::env::var("APPIMAGE")
+    if crate::profile_paths::env::var("APPIMAGE")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
         // Only set if not already configured by the user
-        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        if crate::profile_paths::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            crate::profile_paths::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
     }
 
@@ -466,17 +467,17 @@ mod ime_environment_tests {
 fn configure_linux_ime_environment() {
     // configure_linux_ime_environment runs during process startup before Tauri
     // spawns threads, so applying linux_ime_environment_updates with
-    // std::env::set_var avoids the Rust 2024 environment mutation hazard.
-    let gtk_im_module = std::env::var("GTK_IM_MODULE").ok();
-    let xmodifiers = std::env::var("XMODIFIERS").ok();
-    let ibus_address = std::env::var("IBUS_ADDRESS").ok();
+    // the native setter avoids the Rust 2024 environment mutation hazard.
+    let gtk_im_module = crate::profile_paths::env::var("GTK_IM_MODULE").ok();
+    let xmodifiers = crate::profile_paths::env::var("XMODIFIERS").ok();
+    let ibus_address = crate::profile_paths::env::var("IBUS_ADDRESS").ok();
 
     for (key, value) in linux_ime_environment_updates(
         gtk_im_module.as_deref(),
         xmodifiers.as_deref(),
         ibus_address.as_deref(),
     ) {
-        std::env::set_var(key, value);
+        crate::profile_paths::env::set_var(key, value);
     }
 }
 
@@ -818,7 +819,7 @@ fn require_non_empty_flag(args: &[String], flag: &str) -> Result<Option<String>,
 
 #[cfg(feature = "webui-server")]
 fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
+    crate::profile_paths::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1000,7 +1001,7 @@ fn resolve_auth_token(args: &[String]) -> Option<(String, AuthTokenSource)> {
         // a token without warning the operator their config is broken.
         eprintln!("⚠ --token value is empty; falling back to auto-generated token");
     }
-    if let Ok(token) = std::env::var("CCHV_TOKEN") {
+    if let Ok(token) = crate::profile_paths::env::var("CCHV_TOKEN") {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
             return Some((trimmed.to_string(), AuthTokenSource::Env));
@@ -1012,7 +1013,7 @@ fn resolve_auth_token(args: &[String]) -> Option<(String, AuthTokenSource)> {
 /// Persist auto-generated token to a local file instead of logging the full secret.
 #[cfg(feature = "webui-server")]
 fn write_generated_token_file(token: &str) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let dir = home.join(".claude-history-viewer");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("webui-token.txt");
@@ -1093,7 +1094,7 @@ fn collect_watch_paths() -> Vec<std::path::PathBuf> {
 
     let mut paths: Vec<PathBuf> = Vec::new();
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::profile_paths::home_dir() {
         let claude_projects = home.join(".claude").join("projects");
         if claude_projects.is_dir() {
             paths.push(claude_projects);

@@ -163,7 +163,7 @@ pub async fn scan_all_projects(
         .map(|(name, scan)| {
             let name = *name;
             let scan = *scan;
-            tauri::async_runtime::spawn_blocking(move || (name, scan()))
+            crate::profile_paths::spawn_blocking(move || (name, scan()))
         })
         .collect();
 

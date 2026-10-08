@@ -4,8 +4,6 @@
 //! the same `system/local_command` event shape written by Claude Code's
 //! `/rename` command.
 
-#[cfg(test)]
-use crate::test_utils::dirs;
 use chrono::{SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -322,7 +320,7 @@ fn validate_claude_path(file_path: &str) -> Result<(), String> {
         .map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
 
     // Get home directory
-    let home_dir = dirs::home_dir()
+    let home_dir = crate::profile_paths::home_dir()
         .ok_or_else(|| {
             RenameError::IoError("Cannot determine home directory".to_string()).to_string()
         })?

@@ -56,7 +56,7 @@ pub struct MCPPresetInput {
 
 /// Get the MCP presets folder path (~/.claude-history-viewer/mcp-presets)
 fn get_mcp_presets_folder() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let home = crate::profile_paths::home_dir().ok_or("Could not find home directory")?;
     Ok(home.join(".claude-history-viewer").join("mcp-presets"))
 }
 
@@ -118,7 +118,7 @@ pub async fn save_mcp_preset(input: MCPPresetInput) -> Result<MCPPresetData, Str
     let now = chrono::Utc::now().to_rfc3339();
 
     // Check if preset already exists to preserve created_at
-    let created_at = tauri::async_runtime::spawn_blocking({
+    let created_at = crate::profile_paths::spawn_blocking({
         let id = id.clone();
         let now = now.clone();
         move || {
@@ -148,7 +148,7 @@ pub async fn save_mcp_preset(input: MCPPresetInput) -> Result<MCPPresetData, Str
 
     // Perform blocking file I/O
     let preset_clone = preset.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         ensure_mcp_presets_folder()?;
         let path = get_mcp_preset_path(&preset_clone.id)?;
 
@@ -182,7 +182,7 @@ pub async fn save_mcp_preset(input: MCPPresetInput) -> Result<MCPPresetData, Str
 /// Load all MCP presets from disk
 #[tauri::command]
 pub async fn load_mcp_presets() -> Result<Vec<MCPPresetData>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::profile_paths::spawn_blocking(|| {
         let folder = get_mcp_presets_folder()?;
 
         // Return empty vec if folder doesn't exist yet
@@ -237,7 +237,7 @@ pub async fn load_mcp_presets() -> Result<Vec<MCPPresetData>, String> {
 /// Load a single MCP preset by ID
 #[tauri::command]
 pub async fn get_mcp_preset(id: String) -> Result<Option<MCPPresetData>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = get_mcp_preset_path(&id)?;
 
         if !path.exists() {
@@ -259,7 +259,7 @@ pub async fn get_mcp_preset(id: String) -> Result<Option<MCPPresetData>, String>
 /// Delete an MCP preset by ID
 #[tauri::command]
 pub async fn delete_mcp_preset(id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::profile_paths::spawn_blocking(move || {
         let path = get_mcp_preset_path(&id)?;
 
         if !path.exists() {

@@ -116,13 +116,13 @@ pub fn detect_desktop() -> Option<ProviderInfo> {
 /// Honours `$COPILOT_CLI_HOME` if it points to an existing directory,
 /// otherwise falls back to `~/.copilot`.
 pub fn get_base_path() -> Option<String> {
-    if let Ok(env) = std::env::var("COPILOT_CLI_HOME") {
+    if let Ok(env) = crate::profile_paths::env::var("COPILOT_CLI_HOME") {
         let path = PathBuf::from(&env);
         if path.is_dir() {
             return Some(env);
         }
     }
-    let home = dirs::home_dir()?;
+    let home = crate::profile_paths::home_dir()?;
     let candidate = home.join(".copilot");
     if candidate.is_dir() {
         Some(candidate.to_string_lossy().to_string())
@@ -1391,8 +1391,8 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -1400,9 +1400,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.original.as_ref() {
-                std::env::set_var(self.key, value);
+                crate::profile_paths::env::set_var(self.key, value);
             } else {
-                std::env::remove_var(self.key);
+                crate::profile_paths::env::remove_var(self.key);
             }
         }
     }

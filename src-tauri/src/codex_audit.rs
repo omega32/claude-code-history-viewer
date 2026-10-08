@@ -804,8 +804,8 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &Path) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
+            let original = crate::profile_paths::env::var_os(key);
+            crate::profile_paths::env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -813,9 +813,9 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.original.as_ref() {
-                std::env::set_var(self.key, value);
+                crate::profile_paths::env::set_var(self.key, value);
             } else {
-                std::env::remove_var(self.key);
+                crate::profile_paths::env::remove_var(self.key);
             }
         }
     }

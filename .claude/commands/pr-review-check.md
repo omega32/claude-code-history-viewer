@@ -383,7 +383,7 @@ Do not add a preamble. Do not repeat the diff back.
    - `pnpm vitest run` (관련 파일 경로 지정 가능)
    - `pnpm tsc --build .`
    - `pnpm lint`
-   - Rust 쪽 변경이면 `cd src-tauri && cargo test -- --test-threads=1 && cargo clippy --all-targets --all-features -- -D warnings`
+   - Rust 쪽 변경이면 `pnpm test:rust && cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`; follow canonical `CLAUDE.md` test profile safety.
 2. 원래 지적된 concern이 실제로 해소됐는지 재확인 (단순히 코드가 바뀌었다는 것과 다름).
 3. 실패하면 되돌리거나 수정 보완 — **스코프 벗어나지 않는 선에서만**.
 

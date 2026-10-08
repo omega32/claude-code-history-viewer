@@ -79,13 +79,13 @@ pub fn get_base_paths() -> Vec<PathBuf> {
 
 fn get_user_data_roots() -> Vec<UserDataRoot> {
     #[cfg(test)]
-    if let Some(path) = std::env::var_os("CCHV_TEST_VSCODE_USER_DATA_ROOT") {
+    if let Some(path) = crate::profile_paths::env::var_os("CCHV_TEST_VSCODE_USER_DATA_ROOT") {
         return vec![UserDataRoot {
             path: PathBuf::from(path),
             label: "VS Code",
         }];
     }
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::profile_paths::home_dir() else {
         return Vec::new();
     };
 

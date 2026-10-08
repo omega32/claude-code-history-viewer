@@ -1,0 +1,17 @@
+disallowed-methods = [
+  { path = "dirs::home_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::data_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::data_local_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::config_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::cache_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::download_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::document_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "dirs::desktop_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "std::env::home_dir", reason = "Resolve profiles through crate::profile_paths" },
+  { path = "std::env::var", reason = "Use crate::profile_paths::env so tests cannot inherit live roots" },
+  { path = "std::env::var_os", reason = "Use crate::profile_paths::env so tests cannot inherit live roots" },
+  { path = "std::env::vars", reason = "Ambient environment enumeration bypasses test isolation" },
+  { path = "std::env::vars_os", reason = "Ambient environment enumeration bypasses test isolation" },
+  { path = "std::env::set_var", reason = "Use crate::profile_paths::env for scoped test overrides" },
+  { path = "std::env::remove_var", reason = "Use crate::profile_paths::env for scoped test overrides" },
+]

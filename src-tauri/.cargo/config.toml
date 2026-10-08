@@ -22,14 +22,10 @@ RUST_LOG = "debug"
 
 # Aliases for common test commands
 [alias]
-# Run all tests with nextest (faster parallel execution)
-t = "nextest run"
-# Run tests with coverage
-tcov = "llvm-cov nextest --lcov --output-path lcov.info"
+# Test/coverage aliases live in the root package scripts and justfile so they
+# cannot skip the source preflight or isolated integration compilation.
 # Run clippy with all features
 lint = "clippy --all-targets --all-features -- -D warnings"
-# Run mutation testing
-mutants = "mutants --test-tool nextest"
 # Run benchmarks
 bench-all = "bench --all-features"
 # Check formatting
