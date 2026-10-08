@@ -3374,10 +3374,15 @@ mod tests {
         std::fs::create_dir_all(&actual_cwd).unwrap();
         let actual_cwd = actual_cwd.to_string_lossy();
 
-        let content = format!(
-            r#"{{"uuid":"uuid-1","sessionId":"session-1","timestamp":"2025-06-26T10:00:00Z","type":"user","cwd":"{actual_cwd}","message":{{"role":"user","content":"Hello world"}}}}
-"#
-        );
+        let content = serde_json::json!({
+            "uuid": "uuid-1",
+            "sessionId": "session-1",
+            "timestamp": "2025-06-26T10:00:00Z",
+            "type": "user",
+            "cwd": actual_cwd,
+            "message": {"role": "user", "content": "Hello world"}
+        })
+        .to_string();
         let file_path = project_dir.join("test.jsonl");
         let mut file = File::create(&file_path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
@@ -3393,22 +3398,27 @@ mod tests {
     #[tokio::test]
     async fn test_load_project_sessions_prefers_verified_folder_over_stale_cwd() {
         let temp_dir = TempDir::new().unwrap();
-        // Folder name decodes to an existing directory (/usr/lib); the
-        // `.claude/projects/` marker must be present for verified decoding.
+        let real = temp_dir.path().join("lib");
+        std::fs::create_dir(&real).unwrap();
         let project_dir = temp_dir
             .path()
             .join(".claude")
             .join("projects")
-            .join("-usr-lib");
+            .join(crate::test_utils::encode_project_fixture(&real));
         std::fs::create_dir_all(&project_dir).unwrap();
 
         // Stale embedded cwd simulates a session moved into this folder by hand.
-        let content = concat!(
-            r#"{"uuid":"uuid-1","sessionId":"session-1","timestamp":"2025-06-26T10:00:00Z","#,
-            r#""type":"user","cwd":"/some/stale/Dev","#,
-            r#""message":{"role":"user","content":"Hello world"}}"#,
-            "\n"
-        );
+        let stale_cwd = temp_dir.path().join("stale").join("Dev");
+        assert!(stale_cwd.is_absolute());
+        let content = serde_json::json!({
+            "uuid": "uuid-1",
+            "sessionId": "session-1",
+            "timestamp": "2025-06-26T10:00:00Z",
+            "type": "user",
+            "cwd": stale_cwd,
+            "message": {"role": "user", "content": "Hello world"}
+        })
+        .to_string();
         let file_path = project_dir.join("test.jsonl");
         let mut file = File::create(&file_path).unwrap();
         file.write_all(content.as_bytes()).unwrap();

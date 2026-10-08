@@ -127,7 +127,7 @@ serve-dev: frontend-build
 # ===== Rust Testing Commands =====
 
 # Run Rust tests with cargo test
-# Run Rust tests (single-threaded due to env::set_var("HOME") in tests)
+# Run Rust tests (single-threaded because scoped test-home overrides are shared)
 rust-test:
     cd src-tauri && cargo test -- --test-threads=1
 

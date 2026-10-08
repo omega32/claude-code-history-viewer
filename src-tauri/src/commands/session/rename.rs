@@ -4,6 +4,8 @@
 //! the same `system/local_command` event shape written by Claude Code's
 //! `/rename` command.
 
+#[cfg(test)]
+use crate::test_utils::dirs;
 use chrono::{SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -320,9 +322,12 @@ fn validate_claude_path(file_path: &str) -> Result<(), String> {
         .map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
 
     // Get home directory
-    let home_dir = dirs::home_dir().ok_or_else(|| {
-        RenameError::IoError("Cannot determine home directory".to_string()).to_string()
-    })?;
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| {
+            RenameError::IoError("Cannot determine home directory".to_string()).to_string()
+        })?
+        .canonicalize()
+        .map_err(|e| RenameError::IoError(e.to_string()).to_string())?;
 
     // Build the allowed claude directory path
     let claude_dir = home_dir.join(".claude");
@@ -1288,34 +1293,13 @@ mod tests {
 
     #[test]
     fn test_validate_claude_path_valid_path() {
-        // This test requires a real .jsonl file in ~/.claude to exist
-        if let Some(home) = dirs::home_dir() {
-            let claude_projects = home.join(".claude/projects");
-            if claude_projects.exists() {
-                // Try to find any .jsonl file in projects subdirectories
-                if let Ok(projects) = fs::read_dir(&claude_projects) {
-                    for project in projects.flatten() {
-                        if project.path().is_dir() {
-                            if let Ok(files) = fs::read_dir(project.path()) {
-                                for file in files.flatten() {
-                                    let path = file.path();
-                                    if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                                        let test_path = path.to_string_lossy().to_string();
-                                        let result = validate_claude_path(&test_path);
-                                        assert!(
-                                            result.is_ok(),
-                                            "Validation failed for valid path {test_path}: {result:?}"
-                                        );
-                                        return; // Test passed
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Skip test if no suitable file found
+        let home = crate::test_utils::TestHome::new();
+        let projects = home.path().join(".claude").join("projects").join("project");
+        fs::create_dir_all(&projects).unwrap();
+        let session = projects.join("valid-session.jsonl");
+        fs::write(&session, "{}\n").unwrap();
+        assert!(validate_claude_path(&session.to_string_lossy()).is_ok());
+        assert!(validate_claude_path(&session.canonicalize().unwrap().to_string_lossy()).is_ok());
     }
 
     #[test]
@@ -1327,18 +1311,24 @@ mod tests {
 
     #[test]
     fn test_validate_claude_path_filename_with_special_chars() {
-        // Test filename validation with various invalid characters
-        if let Some(home) = dirs::home_dir() {
-            let claude_dir = home.join(".claude/projects");
-            // Filename with dot (besides extension) should fail
-            let path_with_dot = claude_dir
-                .join("test.file.jsonl")
-                .to_string_lossy()
-                .to_string();
-            let result = validate_claude_path(&path_with_dot);
-            // Will fail either on filename validation or canonicalize (file doesn't exist)
-            assert!(result.is_err());
-        }
+        let home = crate::test_utils::TestHome::new();
+        let path_with_dot = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("test.file.jsonl");
+        let result = validate_claude_path(&path_with_dot.to_string_lossy());
+        assert!(result.unwrap_err().contains("Filename must contain only"));
+    }
+
+    #[test]
+    fn test_validate_claude_path_rejects_existing_file_outside_home() {
+        let _home = crate::test_utils::TestHome::new();
+        let outside = tempfile::tempdir().unwrap();
+        let session = outside.path().join("session.jsonl");
+        fs::write(&session, "{}\n").unwrap();
+        let error = validate_claude_path(&session.to_string_lossy()).unwrap_err();
+        assert!(error.contains("File path must be within ~/.claude directory"));
     }
 
     // --- Title validation tests ---

@@ -56,9 +56,9 @@ pub fn search(query: &str, max_results: usize) -> Result<Vec<ClaudeMessage>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::HomeGuard;
     use serial_test::serial;
     use std::fs;
-    use std::path::Path;
 
     const SESSION: &str = concat!(
         r#"{"type":"session","version":3,"id":"omp-1","timestamp":"2026-06-03T14:57:13.623Z","cwd":"/Users/ac/dev/omp-fixture"}"#,
@@ -70,25 +70,6 @@ mod tests {
         r#"{"type":"message","id":"u1","parentId":"m1","timestamp":"2026-06-03T14:57:24.001Z","message":{"role":"user","content":[{"type":"text","text":"hello omp"}],"timestamp":1748962644001}}"#,
         "\n",
     );
-
-    struct HomeGuard {
-        original: Option<String>,
-    }
-    impl HomeGuard {
-        fn set(path: &Path) -> Self {
-            let original = std::env::var("HOME").ok();
-            std::env::set_var("HOME", path);
-            Self { original }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.original.as_ref() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
 
     /// The full pipeline resolves against `~/.omp/agent/sessions` and stamps
     /// the `ompi` provider id — the only two things this thin module adds

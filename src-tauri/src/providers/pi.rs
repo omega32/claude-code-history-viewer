@@ -39,6 +39,8 @@
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::ProviderInfo;
+#[cfg(test)]
+use crate::test_utils::dirs;
 use crate::utils::{
     build_provider_message, is_symlink, ms_to_iso, search_json_value_case_insensitive,
 };
@@ -844,31 +846,10 @@ mod tests {
         assert_eq!(projects[0].provider.as_deref(), Some("pi"));
     }
 
-    /// Saves/restores `HOME` around a test so `sessions_root()` resolves to a
-    /// fixture store under a fresh `TempDir` rather than the real user home.
-    /// `HOME` is process-global; combined with `#[serial]` so these tests
-    /// don't race each other.
-    struct HomeGuard {
-        original: Option<String>,
-    }
-    impl HomeGuard {
-        fn set(path: &Path) -> Self {
-            let original = std::env::var("HOME").ok();
-            std::env::set_var("HOME", path);
-            Self { original }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.original.as_ref() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    use crate::test_utils::HomeGuard;
 
     /// `load_messages` must work against a literal session path under the
-    /// fixture store that `$HOME` is pointed at, proving the store resolution
+    /// fixture store selected by the scoped home override, proving store resolution
     /// works without requiring the real `~/.pi/agent/sessions`.
     #[test]
     #[serial]
@@ -891,7 +872,7 @@ mod tests {
     }
 
     /// `load_sessions` likewise must work against a literal fixture directory
-    /// path under the `$HOME`-resolved sessions root.
+    /// path under the isolated sessions root.
     #[test]
     #[serial]
     fn load_sessions_succeeds_for_fixture_dir_under_home_override() {
@@ -913,7 +894,7 @@ mod tests {
         assert_eq!(sessions[0].message_count, 3);
     }
 
-    /// A path outside the `$HOME`-resolved sessions root must be rejected by
+    /// A path outside the isolated sessions root must be rejected by
     /// both `load_sessions` and `load_messages`, even though it's a
     /// well-formed directory/file otherwise — this is the actual security
     /// property `validate_under_root` provides.

@@ -602,9 +602,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let claude_dir = temp_dir.path().join(".claude");
         let projects_dir = claude_dir.join("projects");
-        // Folder name decodes to an existing directory (/usr/lib).
-        let project_dir = projects_dir.join("-usr-lib");
+        let real = temp_dir.path().join("lib");
+        fs::create_dir(&real).unwrap();
+        let project_dir = projects_dir.join(crate::test_utils::encode_project_fixture(&real));
         fs::create_dir_all(&project_dir).unwrap();
+        let stale_cwd = temp_dir.path().join("stale").join("Dev");
+        assert!(stale_cwd.is_absolute());
 
         // The session's embedded cwd is stale (points elsewhere), simulating a
         // JSONL file moved into this folder by hand.
@@ -616,7 +619,7 @@ mod tests {
                 "sessionId": "session-1",
                 "timestamp": "2025-06-26T10:00:00Z",
                 "type": "user",
-                "cwd": "/some/stale/Dev",
+                "cwd": stale_cwd,
                 "message": { "role": "user", "content": "Hello" },
             })]),
         );
@@ -627,7 +630,12 @@ mod tests {
 
         assert_eq!(projects.len(), 1);
         // Verified folder name wins over the stale cwd.
-        assert_eq!(projects[0].actual_path, "/usr/lib");
+        assert_eq!(
+            PathBuf::from(&projects[0].actual_path)
+                .canonicalize()
+                .unwrap(),
+            real.canonicalize().unwrap()
+        );
         assert_eq!(projects[0].name, "lib");
     }
 
@@ -899,7 +907,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_git_log_invalid_path() {
-        let result = get_git_log("/nonexistent/path".to_string(), 10).await;
+        let temp = TempDir::new().unwrap();
+        let result = get_git_log(
+            temp.path()
+                .join("nonexistent")
+                .to_string_lossy()
+                .to_string(),
+            10,
+        )
+        .await;
         // Should fail because path doesn't exist
         assert!(result.is_err());
         assert_eq!(

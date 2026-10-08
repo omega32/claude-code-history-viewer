@@ -16,7 +16,10 @@ fn kimi_provider_scans_projects_from_sessions_tree() {
     assert_eq!(project.name, "project-hash");
     assert_eq!(
         project.path,
-        format!("kimi://{}", base.join("sessions/project-hash").display())
+        format!(
+            "kimi://{}",
+            base.join("sessions").join("project-hash").display()
+        )
     );
     assert_eq!(project.actual_path, "project-hash");
     assert_eq!(project.session_count, 2);
@@ -28,7 +31,10 @@ fn kimi_provider_scans_projects_from_sessions_tree() {
 #[test]
 fn kimi_provider_loads_sessions_with_titles_and_timestamps() {
     let base = fixture_base();
-    let project_path = format!("kimi://{}", base.join("sessions/project-hash").display());
+    let project_path = format!(
+        "kimi://{}",
+        base.join("sessions").join("project-hash").display()
+    );
 
     let sessions =
         providers::kimi::load_sessions_from_base_path(base.to_str().unwrap(), &project_path, false)
@@ -51,7 +57,7 @@ fn kimi_provider_loads_sessions_with_titles_and_timestamps() {
 #[test]
 fn kimi_provider_loads_messages_without_internal_roles() {
     let base = fixture_base();
-    let session_dir = base.join("sessions/project-hash/session-1");
+    let session_dir = base.join("sessions").join("project-hash").join("session-1");
 
     let messages = providers::kimi::load_messages_from_base_path(
         base.to_str().unwrap(),

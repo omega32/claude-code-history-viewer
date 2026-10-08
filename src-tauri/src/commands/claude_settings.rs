@@ -3,6 +3,8 @@
 //! This module provides commands for reading and writing Claude Code settings
 //! across different scopes (user, project, local, managed) and MCP server configurations.
 
+#[cfg(test)]
+use crate::test_utils::dirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -751,16 +753,10 @@ pub async fn read_text_file(path: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-    use tempfile::TempDir;
+    use crate::test_utils::TestHome;
 
-    /// Sets up a test environment with a temporary HOME directory.
-    /// NOTE: Tests using this MUST run with --test-threads=1 because
-    /// `env::set_var("HOME")` is process-global and not thread-safe.
-    fn setup_test_env() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        env::set_var("HOME", temp_dir.path());
-        temp_dir
+    fn setup_test_env() -> TestHome {
+        TestHome::new()
     }
 
     #[test]
@@ -990,16 +986,18 @@ mod tests {
 
     #[test]
     fn test_validate_dialog_path_parent_dir_rejected() {
-        let path = Path::new("/some/path/../escape.txt");
-        let result = validate_dialog_path(path);
+        let temp = setup_test_env();
+        let path = temp.path().join("some").join("..").join("escape.txt");
+        let result = validate_dialog_path(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'..'"));
     }
 
     #[test]
     fn test_validate_dialog_path_nonexistent_parent_rejected() {
-        let path = Path::new("/nonexistent_dir_abc123/file.txt");
-        let result = validate_dialog_path(path);
+        let temp = setup_test_env();
+        let path = temp.path().join("nonexistent").join("file.txt");
+        let result = validate_dialog_path(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not exist"));
     }

@@ -111,19 +111,26 @@ mod tests {
 
     #[tokio::test]
     async fn reject_non_jsonl_extension() {
-        let err = delete_session("/tmp/session.txt".into()).await.unwrap_err();
+        let temp = TempDir::new().unwrap();
+        let err = delete_session(temp.path().join("session.txt").to_string_lossy().into())
+            .await
+            .unwrap_err();
         assert_eq!(err, "Only .jsonl session files can be deleted");
     }
 
     #[tokio::test]
     async fn reject_session_id_with_dots() {
-        let err = delete_session("/tmp/a..b.jsonl".into()).await.unwrap_err();
+        let temp = TempDir::new().unwrap();
+        let err = delete_session(temp.path().join("a..b.jsonl").to_string_lossy().into())
+            .await
+            .unwrap_err();
         assert_eq!(err, "Invalid session ID format");
     }
 
     #[tokio::test]
     async fn reject_session_id_with_spaces() {
-        let err = delete_session("/tmp/bad name.jsonl".into())
+        let temp = TempDir::new().unwrap();
+        let err = delete_session(temp.path().join("bad name.jsonl").to_string_lossy().into())
             .await
             .unwrap_err();
         assert_eq!(err, "Invalid session ID format");

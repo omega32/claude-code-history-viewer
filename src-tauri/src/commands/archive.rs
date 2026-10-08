@@ -4,6 +4,8 @@
 //! archived sessions stored in ~/.claude-history-viewer/archives/
 
 use crate::models::ClaudeSession;
+#[cfg(test)]
+use crate::test_utils::dirs;
 use crate::utils::find_subagent_files;
 use chrono::Utc;
 use lazy_static::lazy_static;
@@ -1493,17 +1495,12 @@ pub async fn export_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use crate::test_utils::TestHome;
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
-    use tempfile::TempDir;
 
-    /// Sets up an isolated HOME directory for testing.
-    /// NOTE: Must run with `--test-threads=1` because `env::set_var` is process-global.
-    fn setup_test_env() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        env::set_var("HOME", dir.path());
-        dir
+    fn setup_test_env() -> TestHome {
+        TestHome::new()
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::ProviderInfo;
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
+#[cfg(test)]
+use crate::test_utils::dirs;
 use crate::utils::{
     build_provider_message, decode_with_filesystem_check, find_line_ranges,
     search_json_value_case_insensitive,
@@ -996,16 +998,16 @@ mod tests {
     /// prevent path-traversal-style reads of arbitrary directories on disk.
     #[test]
     fn load_sessions_rejects_path_outside_codebuddy_root() {
-        // /tmp definitely exists on macOS/Linux and is outside the codebuddy
-        // root. The function checks existence first, so we need a real path.
-        let result = load_sessions("/tmp", false);
-        // Either errors with the "outside" message, or — if /tmp doesn't
-        // canonicalize on this platform — errors with a canonicalize message.
-        // Both are acceptable; what we want to guard against is `Ok(...)`.
+        let _home = crate::test_utils::TestHome::new();
+        let outside = tempfile::tempdir().unwrap();
+        let result = load_sessions(&outside.path().to_string_lossy(), false);
         assert!(
             result.is_err(),
             "path outside codebuddy root must error, got: {result:?}"
         );
+        assert!(result
+            .unwrap_err()
+            .contains("outside CodeBuddy projects directory"));
     }
 
     /// Regression for the `function_call` -> `tool_use` conversion. Earlier
@@ -1165,12 +1167,13 @@ mod tests {
         std::fs::create_dir(&project_dir).expect("create project");
 
         let session = project_dir.join("s.jsonl");
+        let cwd = tmp.path().join("claude-code-history-viewer");
         let line = json!({
             "type": "message",
             "role": "user",
             "sessionId": "s1",
             "timestamp": 1_700_000_000_000i64,
-            "cwd": "/Users/rassyan/WebstormProjects/claude-code-history-viewer",
+            "cwd": cwd,
             "content": [{"type": "input_text", "text": "hi"}],
         });
         std::fs::write(&session, format!("{line}\n")).expect("write");
@@ -1182,7 +1185,8 @@ mod tests {
             "display name must keep the full hyphenated project leaf"
         );
         assert_eq!(
-            projects[0].actual_path, "/Users/rassyan/WebstormProjects/claude-code-history-viewer",
+            projects[0].actual_path,
+            cwd.to_string_lossy(),
             "actual_path must be the real cwd, not the lossy storage path"
         );
     }
@@ -1201,23 +1205,18 @@ mod tests {
     #[test]
     fn scan_projects_falls_back_to_fs_decoding_when_cwd_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
-
-        let projects_root = canonical_tmp.join("projects");
+        let projects_root = tmp.path().join("projects");
         std::fs::create_dir(&projects_root).expect("create projects root");
 
         // Build a real on-disk path `<tmp>/work/hyphenated-leaf` so
         // `decode_with_filesystem_check` can walk and recognize it.
-        let real_parent = canonical_tmp.join("work");
+        let real_parent = tmp.path().join("work");
         let real_leaf = real_parent.join("hyphenated-leaf");
         std::fs::create_dir_all(&real_leaf).expect("create real layout");
 
-        // Build the matching CodeBuddy-style lossy encoding. We strip the
-        // leading `/` and join with `-`, mirroring how CodeBuddy actually
-        // names project directories on disk.
-        let real_leaf_str = real_leaf.to_string_lossy().to_string();
-        let encoded = real_leaf_str.trim_start_matches('/').replace('/', "-");
-        let project_dir = projects_root.join(&encoded);
+        let encoded = crate::test_utils::encode_project_fixture(&real_leaf);
+        let encoded = encoded.trim_start_matches('-');
+        let project_dir = projects_root.join(encoded);
         std::fs::create_dir(&project_dir).expect("create project");
 
         // Session without any `cwd` field — forces fallback path.

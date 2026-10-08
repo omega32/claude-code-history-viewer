@@ -111,6 +111,12 @@ pub fn run() {
         {
             std::process::exit(headless_dump::run_dump_session(&args));
         }
+        if args.iter().any(|a| {
+            a == "--dump-session-subagent-activity"
+                || a.starts_with("--dump-session-subagent-activity=")
+        }) {
+            std::process::exit(headless_dump::run_dump_session_subagent_activity(&args));
+        }
         // Opt-in two-lane Codex history export. Superseded paginated tails are
         // kept separate so the ordinary dump and its turn numbering stay fixed.
         if args

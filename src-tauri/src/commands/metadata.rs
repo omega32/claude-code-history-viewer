@@ -4,6 +4,8 @@
 //! user metadata stored in ~/.claude-history-viewer/user-data.json
 
 use crate::models::{ProjectMetadata, SessionMetadata, UserMetadata, UserSettings};
+#[cfg(test)]
+use crate::test_utils::dirs;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -309,21 +311,14 @@ pub async fn get_session_display_name(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use crate::test_utils::TestHome;
     use std::sync::{LazyLock, Mutex, MutexGuard};
-    use tempfile::TempDir;
 
-    /// Static mutex to serialize tests that modify the HOME environment variable.
-    /// This prevents race conditions when multiple tests run in parallel.
     static TEST_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// Sets up a test environment with a temporary HOME directory.
-    /// Returns both the mutex guard (to hold the lock) and the `TempDir`.
-    /// The guard must be kept alive for the duration of the test.
-    fn setup_test_env() -> (MutexGuard<'static, ()>, TempDir) {
+    fn setup_test_env() -> (MutexGuard<'static, ()>, TestHome) {
         let guard = TEST_ENV_MUTEX.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        env::set_var("HOME", temp_dir.path());
+        let temp_dir = TestHome::new();
         (guard, temp_dir)
     }
 
@@ -374,7 +369,8 @@ mod tests {
 
     #[test]
     fn test_validate_project_metadata_key_absolute_path() {
-        assert!(validate_project_metadata_key("/tmp/project").is_ok());
+        let temp = TestHome::new();
+        assert!(validate_project_metadata_key(&temp.path().to_string_lossy()).is_ok());
     }
 
     #[test]

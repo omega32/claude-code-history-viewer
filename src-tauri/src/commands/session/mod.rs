@@ -13,6 +13,9 @@ mod load;
 mod rename;
 mod search;
 
+#[cfg(all(test, feature = "webui-server"))]
+use crate::test_utils::dirs;
+
 // Re-export all commands
 pub use delete::*;
 pub use edits::*;
@@ -139,18 +142,10 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
-    /// Run `body` with `$HOME` temporarily pointed at `home`, restoring it after.
-    /// Serialized because `is_safe_session_path` resolves the home dir from the
-    /// process environment (other suites also override `HOME`).
+    /// Run `body` with the shared scoped test-home override.
     fn with_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", home);
-        let out = body();
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        out
+        let _home = crate::test_utils::HomeGuard::set(home);
+        body()
     }
 
     // Regression test for #355: when `~/.claude` is itself a symlink, the
@@ -203,8 +198,7 @@ mod tests {
     #[serial]
     fn test_safe_session_path_allows_kimi_sessions() {
         let temp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", temp.path());
+        let _home = crate::test_utils::HomeGuard::set(temp.path());
 
         let session_dir = temp
             .path()
@@ -217,12 +211,6 @@ mod tests {
         std::fs::write(&session_file, "{}\n").unwrap();
 
         let result = is_safe_session_path(&session_file);
-
-        if let Some(home) = old_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
 
         assert!(result.is_ok());
     }

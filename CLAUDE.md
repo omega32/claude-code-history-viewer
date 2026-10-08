@@ -41,6 +41,8 @@ Codex fork provenance is classified during the existing rollout parse. After the
 
 Codex `source.subagent.thread_spawn.parent_thread_id` is the authoritative spawned-child edge and is independent of `session_meta.payload.forked_from_id`, which proves copied or referenced history. The Codex provider normalizes the source to `entrypoint:"codex-subagent"` and emits the spawn parent as `subagent_provenance.parent_session_id`; a valid child may therefore have subagent provenance while `forked_from_id` remains absent. Do not synthesize fork provenance from the spawn graph or require a fork before exposing a subagent. Metadata cache version 3 invalidates rows that predate the spawn-parent field.
 
+The additive `codex-subagent-activity-v1` capability advertises read-only `--dump-session-subagent-activity <session-id|session-path> --provider codex`. Its schema-versioned envelope separates proven inherited normalized records, native child tasks, routed inter-agent messages and unassigned evidence without changing ordinary dump/snapshot/listing/search/export records, counts, ranges or certified identities. Boundary proof uses the first child metadata, exact spawn parent and contiguous physical ordinals; timestamps never classify inheritance. Native task IDs own grouping, overlap and duplicate identities fail closed, and adjacent structural communication metadata alone supplies `triggerTurn`. Readable agent-message text and routing survive while encrypted payloads are represented only by `encryptedPayloadUnavailable:true`; no delegated task becomes an authored user prompt. Unsupported or invalid boundary proof returns no child tasks and retains the ordinary projection as unassigned. `--output` uses atomic create-new semantics and refuses existing files. The canonical wire contract, bounds, redacted fixtures and validation evidence live in `specs/2026-10-08-codex-subagent-activity/`; task-level selection/export is deferred.
+
 ### Codex asynchronous question replies
 
 Canonical user input containing a complete `<send_user_message_question_reply>` carrier gains additive `data.questionReply:{toolName:"request_user_input_async",replies:[{toolCallId,questionIndex,question,answer}]}` only when every reply identifies one unique preceding native `request_user_input_async` function call, a valid question index, and the exact original question title. Replies retain source order and verbatim answer strings, including empty answers. Duplicate call ids or reply identities, unknown or malformed fields, wrong titles or tools, out-of-range indices, quoted/extended wrappers, and mixed or multiple content blocks leave the original message unclassified. The provider preserves the raw wrapper, original timestamp, canonical `authored_user`/`steer` classification, and turn/client provenance; it neither turns the reply into a tool result nor mistakes the immediate `{"accepted":true}` acknowledgement for an answer. A cursor-resumed suffix containing a complete reply carrier safely falls back to a full parse to revalidate preceding calls without storing unbounded call histories or question text in the cursor. Snapshot cursor version 15 repairs retained prefixes predating this metadata; desktop release version and session metadata cache version remain unchanged.
@@ -166,7 +168,7 @@ pnpm run i18n:validate          # 5개 언어 키 동기화 확인 (en, ko, ja, 
 ```
 
 **주의사항:**
-- `cargo test`는 반드시 `--test-threads=1`로 실행 (settings 테스트가 `env::set_var("HOME")` 사용)
+- `cargo test`는 반드시 `--test-threads=1`로 실행 (home-dependent tests share a scoped test-home override)
 - `pnpm install` 생략 시 lockfile과 node_modules 불일치로 빌드 실패 가능
 - lint에서 `@typescript-eslint/no-explicit-any` 에러 발생 시 `as unknown as TargetType` 패턴 사용
 
@@ -251,7 +253,7 @@ gh release edit v1.3.1 --notes-file /path/to/notes.md
 | 문제 | 원인 | 해결 |
 |------|------|------|
 | CI에서 pnpm 버전 충돌 | `pnpm/action-setup`의 `version` 필드와 `package.json`의 `packageManager` 충돌 | 워크플로우에서 `version` 제거 (packageManager 자동 감지) |
-| `cargo test` 간헐적 실패 | `env::set_var("HOME")`이 프로세스 전역 → 병렬 실행 시 경쟁 | `--test-threads=1` 사용 |
+| `cargo test` 간헐적 실패 | The scoped test-home override is process-global; parallel tests can race | `--test-threads=1` 사용 |
 | 릴리즈 중복 생성 | 수동 `gh release create` + 워크플로우 자동 생성 | 수동 생성 금지, 워크플로우에 위임 |
 | 자동 업데이트 시 에러 플래시 | `relaunch()` 전 바이너리 교체로 UI 크래시 | `isRestarting` 상태로 오버레이 표시 후 500ms 딜레이 |
 | `pnpm install` 후에도 모듈 못 찾음 | lockfile과 실제 node_modules 불일치 | `rm -rf node_modules && pnpm install` |
@@ -964,9 +966,7 @@ this block adds only the discipline spine and agent/critic routing.
 
 - Frontend: `vitest` — one-shot run `pnpm exec vitest run`. Typecheck with
   `pnpm tsc --build .` (same as CI).
-- Backend (`src-tauri/`): `cargo test -- --test-threads=1` — single-threaded is
-  MANDATORY (settings tests mutate `HOME`). Lint `cargo clippy --all-targets
-  --all-features -- -D warnings`, format `cargo fmt --all -- --check`.
+- Backend (`src-tauri/`): `cargo test -- --test-threads=1` is MANDATORY because home-dependent tests share a scoped test-home override. The cfg(test) directory resolver fails closed without a guard; Windows KnownFolder lookup ignores HOME and USERPROFILE. Lint `cargo clippy --all-targets --all-features -- -D warnings`, format `cargo fmt --all -- --check`.
 - Tests-first for non-trivial changes; for backend / library code (Rust
   providers, parsers, commands) a failing test comes before the implementation.
 - i18n changes: `pnpm run i18n:validate` is part of the gate.

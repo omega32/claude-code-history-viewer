@@ -204,6 +204,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "dump-session",
             "dump-session-snapshot",
             "dump-session-history",
+            "dump-session-subagent-activity",
             "dump-backup-session",
             "list-sessions",
             "list-session-subagents",
@@ -219,6 +220,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
         features: vec![
             "image-artifacts-v1",
             "codex-session-subagents-v1",
+            "codex-subagent-activity-v1",
             "stable-record-ref-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
@@ -413,6 +415,35 @@ pub fn run_dump_session_history(args: &[String]) -> i32 {
     });
     match result {
         Ok(history) => emit_json(args, &history),
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+/// Handle the separate read-only Codex child-activity projection.
+pub fn run_dump_session_subagent_activity(args: &[String]) -> i32 {
+    let usage = "Usage: --dump-session-subagent-activity <session-id|session-path> --provider codex [--format json] [--output <file>]";
+    let Some(id) = extract_flag_value(args, "--dump-session-subagent-activity") else {
+        eprintln!("{usage}");
+        return 2;
+    };
+    if has_explicit_empty_flag(args, "--provider")
+        || has_explicit_empty_flag(args, "--format")
+        || has_explicit_empty_flag(args, "--output")
+        || extract_flag_value(args, "--provider").as_deref() != Some("codex")
+        || extract_flag_value(args, "--format").is_some_and(|format| format != "json")
+    {
+        eprintln!("{usage}");
+        return 2;
+    }
+    let result = block_on(async {
+        let path = resolve_session_path("codex", &id).await?;
+        codex::load_subagent_activity(&path)
+    });
+    match result {
+        Ok(activity) => emit_read_only_audit_json(args, &activity),
         Err(error) => {
             eprintln!("{error}");
             1
@@ -2444,6 +2475,7 @@ mod tests {
             json!([
                 "image-artifacts-v1",
                 "codex-session-subagents-v1",
+                "codex-subagent-activity-v1",
                 "stable-record-ref-v1",
                 "supplemental-history-v1",
                 "claude-session-archive-v1",
@@ -2456,6 +2488,7 @@ mod tests {
                 "dump-session",
                 "dump-session-snapshot",
                 "dump-session-history",
+                "dump-session-subagent-activity",
                 "dump-backup-session",
                 "list-sessions",
                 "list-session-subagents",
@@ -2575,6 +2608,72 @@ mod tests {
         assert_eq!(history["sessionId"], session_id);
         assert_eq!(history["primary"], ordinary);
         assert_eq!(history["supplemental"], json!([]));
+    }
+
+    #[test]
+    fn subagent_activity_command_requires_codex_and_nonempty_options() {
+        for options in [
+            vec![],
+            vec!["--provider", "claude"],
+            vec!["--provider=codex", "--format=yaml"],
+            vec!["--provider=codex", "--output="],
+            vec!["--provider="],
+        ] {
+            let mut argv = args(&["viewer", "--dump-session-subagent-activity", "child"]);
+            argv.extend(options.into_iter().map(str::to_string));
+            assert_eq!(run_dump_session_subagent_activity(&argv), 2);
+        }
+        assert_eq!(
+            run_dump_session_subagent_activity(&args(&[
+                "viewer",
+                "--dump-session-subagent-activity"
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_activity_command_preserves_ordinary_dump_and_refuses_existing_output() {
+        let temp = TempDir::new().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("07");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let rollout =
+            sessions.join("rollout-2026-10-07T20-22-43-01a11808-535b-7da3-9a05-1244b988e35b.jsonl");
+        let bytes = include_bytes!("../tests/fixtures/codex-subagent-activity/scroll-audit.jsonl");
+        std::fs::write(&rollout, bytes).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let ordinary_before = codex::load_messages(rollout.to_str().unwrap()).unwrap();
+        let output = temp.path().join("activity.json");
+        let argv = args(&[
+            "viewer",
+            "--dump-session-subagent-activity",
+            rollout.to_str().unwrap(),
+            "--provider",
+            "codex",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(run_dump_session_subagent_activity(&argv), 0);
+        let envelope: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(envelope["schemaVersion"], 1);
+        assert_eq!(
+            envelope["boundary"],
+            json!({"status":"verified","startOrdinal":12})
+        );
+        assert_eq!(envelope["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(envelope["unassignedMessages"], json!([]));
+        assert_eq!(run_dump_session_subagent_activity(&argv), 1);
+        assert_eq!(std::fs::read(&rollout).unwrap(), bytes);
+        assert_eq!(
+            serde_json::to_value(ordinary_before).unwrap(),
+            serde_json::to_value(codex::load_messages(rollout.to_str().unwrap()).unwrap()).unwrap()
+        );
     }
 
     #[test]

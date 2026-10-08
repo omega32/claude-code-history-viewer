@@ -4,6 +4,8 @@
 //! user settings presets stored in ~/.claude-history-viewer/presets/
 
 use crate::models::UserSettings;
+#[cfg(test)]
+use crate::test_utils::dirs;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -259,25 +261,20 @@ pub async fn delete_preset(id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-    use tempfile::TempDir;
+    use crate::test_utils::TestHome;
 
-    /// Sets up a test environment with a temporary HOME directory.
-    /// NOTE: Tests using this MUST run with --test-threads=1 because
-    /// `env::set_var("HOME")` is process-global and not thread-safe.
-    fn setup_test_env() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        env::set_var("HOME", temp_dir.path());
-        temp_dir
+    fn setup_test_env() -> TestHome {
+        TestHome::new()
     }
 
     #[test]
     fn test_get_presets_folder() {
-        let _temp = setup_test_env();
+        let temp = setup_test_env();
         let folder = get_presets_folder().unwrap();
-        assert!(folder
-            .to_string_lossy()
-            .contains(".claude-history-viewer/presets"));
+        assert_eq!(
+            folder,
+            temp.path().join(".claude-history-viewer").join("presets")
+        );
     }
 
     #[test]

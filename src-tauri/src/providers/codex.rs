@@ -1,5 +1,8 @@
 use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
+
+#[path = "codex_subagent_activity.rs"]
+mod subagent_activity;
 use crate::models::{
     previous_titles_from_transitions, push_title_transition, ClaudeMessage, ClaudeProject,
     ClaudeSession, InferenceCost, InferenceMetadata, InferenceUsage, RecordRef, SubagentProvenance,
@@ -23,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+pub(crate) use subagent_activity::load as load_subagent_activity;
 use walkdir::WalkDir;
 
 #[cfg(test)]
@@ -144,6 +148,7 @@ struct CodexSnapshotLineageSegment {
 
 struct CodexParseOutcome {
     messages: Vec<ClaudeMessage>,
+    source_spans: Vec<(usize, usize)>,
     diagnostics: Vec<CodexAuthorshipDiagnostic>,
     checkpoint: CodexParserCheckpoint,
     accepted_len: usize,
@@ -3583,12 +3588,34 @@ pub(crate) fn parse_authorship_audit(
 fn parse_rollout_slice(
     bytes: &[u8],
     ranges: &[(usize, usize)],
+    state: CodexParserState,
+    checkpoint: CodexParserCheckpoint,
+    resumed: bool,
+    source_line_base: usize,
+) -> Result<CodexParseOutcome, ()> {
+    parse_rollout_slice_capturing(
+        bytes,
+        ranges,
+        state,
+        checkpoint,
+        resumed,
+        source_line_base,
+        false,
+    )
+}
+
+fn parse_rollout_slice_capturing(
+    bytes: &[u8],
+    ranges: &[(usize, usize)],
     mut state: CodexParserState,
     mut checkpoint: CodexParserCheckpoint,
     resumed: bool,
     source_line_base: usize,
+    capture_source_spans: bool,
 ) -> Result<CodexParseOutcome, ()> {
     let mut messages: Vec<ClaudeMessage> = Vec::new();
+    let mut source_spans = Vec::<(usize, usize)>::new();
+    let mut previous_source_line = source_line_base;
     let mut diagnostics = Vec::new();
     let slice_base_replace_from = checkpoint.replace_from;
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
@@ -3627,6 +3654,9 @@ fn parse_rollout_slice(
     let mut pending_fork_branch: Option<PendingForkBranch> = None;
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
+        if capture_source_spans {
+            source_spans.resize(messages.len(), (previous_source_line, previous_source_line));
+        }
         if start < usize::try_from(checkpoint.byte_offset).map_err(|_| ())? {
             continue;
         }
@@ -3636,6 +3666,7 @@ fn parse_rollout_slice(
             .checked_add(range_index)
             .and_then(|line| line.checked_add(1))
             .ok_or(())?;
+        previous_source_line = source_line;
         let val: Value = if let Ok(value) = simd_json::from_slice(&mut buf) {
             value
         } else {
@@ -3723,6 +3754,9 @@ fn parse_rollout_slice(
                                 let has_rollback_candidate = rollback_candidate.is_some();
                                 if let Some(candidate) = rollback_candidate {
                                     if candidate.replacement_task_started {
+                                        if capture_source_spans {
+                                            source_spans[candidate.message_index].1 = source_line;
+                                        }
                                         let data = messages[candidate.message_index]
                                             .data
                                             .get_or_insert_with(|| {
@@ -3738,6 +3772,9 @@ fn parse_rollout_slice(
                                 }
                                 if !has_rollback_candidate {
                                     if let Some(candidate) = pending_fork_branch.take() {
+                                        if capture_source_spans {
+                                            source_spans[candidate.message_index].1 = source_line;
+                                        }
                                         let data = messages[candidate.message_index]
                                             .data
                                             .get_or_insert_with(|| {
@@ -3831,6 +3868,16 @@ fn parse_rollout_slice(
                             &msg,
                             Some(&tool_image_producers),
                         ) {
+                            if let Some((tool_use_id, _)) = capture_source_spans
+                                .then(|| extract_tool_result_block(&msg))
+                                .flatten()
+                            {
+                                if let Some(index) = messages.iter().rposition(|message| {
+                                    matching_tool_use(message, &tool_use_id).is_some()
+                                }) {
+                                    source_spans[index].1 = source_line;
+                                }
+                            }
                             continue;
                         }
                         if resumed && extract_tool_result_block(&msg).is_some() {
@@ -3930,6 +3977,19 @@ fn parse_rollout_slice(
                             // the full source instead of growing cursors with call history.
                             return Err(());
                         }
+                        let pending_indices = if capture_source_spans {
+                            authorship_tracker
+                                .lanes
+                                .values()
+                                .flat_map(|lane| {
+                                    lane.pending_user_messages
+                                        .iter()
+                                        .map(|candidate| candidate.message_index)
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
                         project_canonical_user_event(
                             &mut messages,
                             &mut authorship_tracker,
@@ -3944,6 +4004,13 @@ fn parse_rollout_slice(
                             &mut diagnostics,
                             source_line,
                         );
+                        for index in pending_indices {
+                            if messages[index].subtype.as_deref().is_some_and(|subtype| {
+                                matches!(subtype, AUTHORED_USER_SUBTYPE | STEER_SUBTYPE)
+                            }) {
+                                source_spans[index].1 = source_line;
+                            }
+                        }
                         continue;
                     }
                     if event_type == "agent_message" {
@@ -4083,16 +4150,22 @@ fn parse_rollout_slice(
                         if resumed && active_turn_id.is_none() {
                             return Err(());
                         }
-                        let Some(last_msg) = messages[active_turn_message_start..]
+                        let Some((relative_index, last_msg)) = messages
+                            [active_turn_message_start..]
                             .iter_mut()
+                            .enumerate()
                             .rev()
-                            .find(|message| {
+                            .find(|(_, message)| {
                                 message.message_type == "assistant" && message.usage.is_none()
                             })
                         else {
                             state.pending_usage = CodexTokenUsage::default();
                             continue;
                         };
+                        if capture_source_spans {
+                            source_spans[active_turn_message_start + relative_index].1 =
+                                source_line;
+                        }
                         let delta = std::mem::take(&mut state.pending_usage);
 
                         // Separate non-cached input from cached input for correct billing.
@@ -4190,6 +4263,11 @@ fn parse_rollout_slice(
                             if let Some(lane) = authorship_tracker.lanes.remove(&key) {
                                 closed_active_lane = lane.active;
                                 if lane.active {
+                                    if capture_source_spans {
+                                        for candidate in &lane.pending_user_messages {
+                                            source_spans[candidate.message_index].1 = source_line;
+                                        }
+                                    }
                                     classify_pending_terminal_context(
                                         &mut messages,
                                         &lane.pending_user_messages,
@@ -4206,10 +4284,12 @@ fn parse_rollout_slice(
                             active_turn_order.retain(|turn_id| turn_id != completed_turn_id);
                             if event_type == "task_complete" {
                                 if let Some(completed_message_start) = completed_message_start {
-                                    if let Some(last_msg) = messages[completed_message_start..]
+                                    if let Some((relative_index, last_msg)) = messages
+                                        [completed_message_start..]
                                         .iter_mut()
+                                        .enumerate()
                                         .rev()
-                                        .find(|message| {
+                                        .find(|(_, message)| {
                                             message.message_type == "assistant"
                                                 && message
                                                     .data
@@ -4222,6 +4302,11 @@ fn parse_rollout_slice(
                                                     )
                                         })
                                     {
+                                        if capture_source_spans {
+                                            source_spans
+                                                [completed_message_start + relative_index]
+                                                .1 = source_line;
+                                        }
                                         let inference = last_msg
                                             .inference
                                             .get_or_insert_with(|| state.current_inference.clone());
@@ -4291,6 +4376,10 @@ fn parse_rollout_slice(
         }
     }
 
+    if capture_source_spans {
+        source_spans.resize(messages.len(), (previous_source_line, previous_source_line));
+    }
+
     for lane in authorship_tracker.lanes.values() {
         for candidate in &lane.pending_user_messages {
             diagnose_unresolved_candidate(
@@ -4304,6 +4393,7 @@ fn parse_rollout_slice(
 
     Ok(CodexParseOutcome {
         messages,
+        source_spans,
         diagnostics,
         checkpoint,
         accepted_len,
@@ -7670,13 +7760,13 @@ mod tests {
         std::os::windows::fs::symlink_dir(target, link)
     }
 
-    struct EnvVarGuard {
+    pub(super) struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
+        pub(super) fn set(key: &'static str, value: &std::path::Path) -> Self {
             let original = std::env::var_os(key);
             std::env::set_var(key, value);
             Self { key, original }

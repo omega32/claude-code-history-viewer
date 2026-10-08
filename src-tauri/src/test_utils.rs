@@ -17,6 +17,100 @@ use tempfile::TempDir;
 pub use proptest::prelude::*;
 pub use rstest::*;
 
+static TEST_HOME: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Overrides only the crate's test home lookup, including on Windows where
+/// `dirs::home_dir()` ignores HOME and USERPROFILE. Tests remain single-threaded.
+pub struct HomeGuard {
+    previous: Option<PathBuf>,
+}
+
+impl HomeGuard {
+    pub fn set(path: &std::path::Path) -> Self {
+        let previous = TEST_HOME.lock().unwrap().replace(path.to_path_buf());
+        Self { previous }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        *TEST_HOME.lock().unwrap() = self.previous.take();
+    }
+}
+
+pub struct TestHome {
+    _guard: HomeGuard,
+    directory: TempDir,
+}
+
+impl TestHome {
+    pub fn new() -> Self {
+        let directory = TempDir::new().expect("create isolated test home");
+        let guard = HomeGuard::set(directory.path());
+        Self {
+            _guard: guard,
+            directory,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.directory.path()
+    }
+}
+
+impl Default for TestHome {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Missing test guards must never fall back to the real user profile.
+pub mod dirs {
+    use super::{PathBuf, TEST_HOME};
+
+    pub fn home_dir() -> Option<PathBuf> {
+        TEST_HOME.lock().unwrap().clone()
+    }
+
+    fn user_folder(name: &str) -> Option<PathBuf> {
+        TEST_HOME
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|home| home.join(name))
+    }
+
+    pub fn data_dir() -> Option<PathBuf> {
+        user_folder(".test-data")
+    }
+
+    pub fn config_dir() -> Option<PathBuf> {
+        user_folder(".test-config")
+    }
+
+    #[cfg(feature = "webui-server")]
+    pub fn download_dir() -> Option<PathBuf> {
+        user_folder("Downloads")
+    }
+
+    #[cfg(feature = "webui-server")]
+    pub fn document_dir() -> Option<PathBuf> {
+        user_folder("Documents")
+    }
+
+    #[cfg(feature = "webui-server")]
+    pub fn desktop_dir() -> Option<PathBuf> {
+        user_folder("Desktop")
+    }
+}
+
+pub fn encode_project_fixture(path: &std::path::Path) -> String {
+    let canonical = path.canonicalize().expect("canonical fixture directory");
+    let canonical = canonical.to_string_lossy();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    canonical.replace(['/', '\\', ':'], "-")
+}
+
 /// Test fixture for creating a mock Claude project structure
 pub struct MockClaudeProject {
     pub temp_dir: TempDir,
@@ -327,6 +421,31 @@ macro_rules! assert_contains {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_home_override_restores_after_panic_without_changing_environment() {
+        let environment = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        let original_home = dirs::home_dir();
+        assert!(
+            original_home.is_none(),
+            "test home requires an explicit guard"
+        );
+        let outer = TestHome::new();
+        assert_eq!(dirs::home_dir().as_deref(), Some(outer.path()));
+        let result = std::panic::catch_unwind(|| {
+            let inner = TestHome::new();
+            assert_eq!(dirs::home_dir().as_deref(), Some(inner.path()));
+            panic!("exercise unwinding");
+        });
+        assert!(result.is_err());
+        assert_eq!(dirs::home_dir().as_deref(), Some(outer.path()));
+        drop(outer);
+        assert_eq!(dirs::home_dir(), original_home);
+        assert_eq!(
+            (std::env::var_os("HOME"), std::env::var_os("USERPROFILE")),
+            environment
+        );
+    }
 
     #[test]
     fn test_message_builder_user() {

@@ -103,13 +103,20 @@ pub fn find_line_starts(data: &[u8]) -> Vec<usize> {
 }
 
 pub fn extract_project_name(raw_project_name: &str) -> String {
-    if let Some(stripped) = raw_project_name.strip_prefix('-') {
+    let stripped = raw_project_name.strip_prefix('-');
+    #[cfg(windows)]
+    let stripped =
+        stripped.or_else(|| encoded_windows_drive(raw_project_name).map(|_| raw_project_name));
+    if let Some(stripped) = stripped {
         // Prefer filesystem-checked decoding — handles arbitrarily deep paths
         // and project names containing hyphens (e.g. ~/Projects/{Host}/{Org}/{Repo}).
         if let Some(decoded) = decode_with_filesystem_check(stripped) {
             if let Some(leaf) = Path::new(&decoded).file_name() {
                 return leaf.to_string_lossy().to_string();
             }
+        }
+        if !raw_project_name.starts_with('-') {
+            return raw_project_name.to_string();
         }
         // Fallback: original heuristic for paths no longer on disk.
         let parts: Vec<&str> = raw_project_name.splitn(4, '-').collect();
@@ -248,9 +255,19 @@ pub fn decode_project_path(session_storage_path: &str) -> String {
     }
 
     // 2. Fallback: decode from encoded directory name
+    #[cfg(windows)]
+    let storage_path = session_storage_path.replace('\\', "/");
+    #[cfg(not(windows))]
+    let storage_path = session_storage_path;
     const MARKER: &str = ".claude/projects/";
-    if let Some(marker_pos) = session_storage_path.find(MARKER) {
-        let encoded = &session_storage_path[marker_pos + MARKER.len()..];
+    if let Some(marker_pos) = storage_path.find(MARKER) {
+        let encoded = &storage_path[marker_pos + MARKER.len()..];
+        #[cfg(windows)]
+        if encoded_windows_drive(encoded).is_some() {
+            if let Some(path) = decode_with_filesystem_check(encoded) {
+                return path;
+            }
+        }
         if let Some(stripped) = encoded.strip_prefix('-') {
             // Try filesystem-based decoding (recursive)
             if let Some(path) = decode_with_filesystem_check(stripped) {
@@ -307,11 +324,31 @@ pub fn decode_project_path_verified(session_storage_path: &str) -> Option<String
 
     // 2. Decode the encoded folder name, verifying each segment against the
     //    filesystem. Returns `None` if the decoded path does not exist.
+    #[cfg(windows)]
+    let storage_path = session_storage_path.replace('\\', "/");
+    #[cfg(not(windows))]
+    let storage_path = session_storage_path;
     const MARKER: &str = ".claude/projects/";
-    let marker_pos = session_storage_path.find(MARKER)?;
-    let encoded = &session_storage_path[marker_pos + MARKER.len()..];
-    let stripped = encoded.strip_prefix('-')?;
+    let marker_pos = storage_path.find(MARKER)?;
+    let encoded = &storage_path[marker_pos + MARKER.len()..];
+    let stripped = encoded.strip_prefix('-');
+    #[cfg(windows)]
+    let stripped = stripped.or_else(|| encoded_windows_drive(encoded).map(|_| encoded));
+    let stripped = stripped?;
     decode_with_filesystem_check(stripped)
+}
+
+#[cfg(windows)]
+fn encoded_windows_drive(encoded: &str) -> Option<(char, &str)> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && matches!((bytes[1], bytes[2]), (b':' | b'-', b'-'))
+    {
+        Some((char::from(bytes[0]), &encoded[3..]))
+    } else {
+        None
+    }
 }
 
 /// Decode path by checking filesystem existence at each possible split point
@@ -322,6 +359,10 @@ pub fn decode_project_path_verified(session_storage_path: &str) -> Option<String
 /// 3. Check `/Users/jack/client` (exists? continue)
 /// 4. Check `/Users/jack/client/claude-code-history-viewer` (exists? ✓ return this)
 pub(crate) fn decode_with_filesystem_check(encoded: &str) -> Option<String> {
+    #[cfg(windows)]
+    if let Some((drive, remaining)) = encoded_windows_drive(encoded) {
+        return decode_recursive(remaining, &format!("{drive}:"));
+    }
     decode_recursive(encoded, "")
 }
 
@@ -857,21 +898,17 @@ mod tests {
     /// slug plus the root for cleanup. Canonicalization is required because
     /// the decoder rejects symlinked path components (macOS `/var` →
     /// `/private/var`).
-    fn make_encoded_path(root_name: &str, segments: &[&str]) -> (String, std::path::PathBuf) {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp dir")
-            .join(root_name);
-        let mut deep = root.clone();
+    fn make_encoded_path(root_name: &str, segments: &[&str]) -> (String, tempfile::TempDir) {
+        let root = tempfile::Builder::new()
+            .prefix(root_name)
+            .tempdir()
+            .unwrap();
+        let mut deep = root.path().to_path_buf();
         for s in segments {
             deep = deep.join(s);
         }
         std::fs::create_dir_all(&deep).expect("create deep tmp dir");
-        // Normalize both Unix and Windows separators so the encoded slug
-        // matches Claude's leading-dash convention regardless of host OS.
-        let mut encoded = deep.to_string_lossy().replace(['/', '\\'], "-");
-        if !encoded.starts_with('-') {
-            encoded.insert(0, '-');
-        }
+        let encoded = crate::test_utils::encode_project_fixture(&deep);
         (encoded, root)
     }
 
@@ -884,7 +921,7 @@ mod tests {
             &["Projects", "GitHub", "org", "repo"],
         );
         let result = extract_project_name(&encoded);
-        std::fs::remove_dir_all(&root).ok();
+        drop(root);
         assert_eq!(result, "repo");
     }
 
@@ -904,7 +941,7 @@ mod tests {
             ],
         );
         let result = extract_project_name(&encoded);
-        std::fs::remove_dir_all(&root).ok();
+        drop(root);
         assert_eq!(result, "dummy-app-microservice-apple");
     }
 
@@ -987,12 +1024,45 @@ mod tests {
 
     #[test]
     fn test_decode_project_path_verified_resolves_existing_folder() {
-        // `/usr/lib` exists on macOS and Linux and contains no dashes, so the
-        // dash-decoder can resolve it against the real filesystem.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("verified-leaf");
+        std::fs::create_dir(&real).unwrap();
+        let encoded = crate::test_utils::encode_project_fixture(&real);
+        let storage = root.path().join(".claude").join("projects").join(encoded);
+        let decoded = decode_project_path_verified(&storage.to_string_lossy()).unwrap();
         assert_eq!(
-            decode_project_path_verified("/Users/whoever/.claude/projects/-usr-lib"),
-            Some("/usr/lib".to_string())
+            Path::new(&decoded).canonicalize().unwrap(),
+            real.canonicalize().unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_drive_project_decoding_with_native_storage_separators() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("deep").join("hyphenated-leaf");
+        std::fs::create_dir_all(&real).unwrap();
+        let native = crate::test_utils::encode_project_fixture(&real);
+        assert!(native.as_bytes()[0].is_ascii_alphabetic());
+        assert_eq!(&native[1..3], "--");
+        let legacy = format!("-{}:-{}", &native[..1], &native[3..]);
+        for encoded in [native, legacy] {
+            let storage = root.path().join(".claude").join("projects").join(&encoded);
+            let storage = storage.to_string_lossy();
+            assert!(storage.contains('\\'));
+            let decoded = decode_project_path_verified(&storage).unwrap();
+            assert_eq!(
+                Path::new(&decoded).canonicalize().unwrap(),
+                real.canonicalize().unwrap()
+            );
+            assert_eq!(
+                Path::new(&decode_project_path(&storage))
+                    .canonicalize()
+                    .unwrap(),
+                real.canonicalize().unwrap()
+            );
+            assert_eq!(extract_project_name(&encoded), "hyphenated-leaf");
+        }
     }
 
     #[test]

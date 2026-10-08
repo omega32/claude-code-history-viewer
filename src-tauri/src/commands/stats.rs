@@ -6,6 +6,8 @@ use crate::models::{
     TokenDistribution, TokenUsage, ToolUsageStats,
 };
 use crate::providers;
+#[cfg(test)]
+use crate::test_utils::dirs;
 use crate::utils::find_line_ranges;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use memmap2::Mmap;
@@ -5802,11 +5804,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let home = temp_dir.path();
 
-        // Override HOME so resolve_antigravity_root() points at our fixture.
-        // env::set_var is process-global → this test must be `#[serial]` so
-        // it cannot race with other HOME-touching tests.
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", home);
+        let _home = crate::test_utils::HomeGuard::set(home);
 
         let antigravity_root = home.join(".gemini").join("antigravity");
         let rpc_session = antigravity_root
@@ -5856,12 +5854,6 @@ mod tests {
         // Sanity: the rest of the distribution still aggregates correctly.
         assert_eq!(summary.token_distribution.input, 100);
         assert_eq!(summary.token_distribution.output, 50);
-
-        if let Some(value) = original_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     /// Write a temporary `ForgeCode` database used by stats tests.

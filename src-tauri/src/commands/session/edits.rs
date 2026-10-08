@@ -694,7 +694,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_file_rejects_path_traversal() {
-        let result = restore_file("/tmp/../etc/passwd".to_string(), "content".to_string()).await;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("child").join("..").join("file.txt");
+        let result = restore_file(path.to_string_lossy().to_string(), "content".to_string()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("path traversal"));
     }

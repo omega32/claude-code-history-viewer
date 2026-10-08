@@ -2,6 +2,8 @@ use crate::models::{
     AntigravityProjectSummary, AntigravitySessionInfo, AntigravityState, PersistedSessionState,
     SessionLifecycle, SessionLifecycleStatus, SessionTotals,
 };
+#[cfg(test)]
+use crate::test_utils::dirs;
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
