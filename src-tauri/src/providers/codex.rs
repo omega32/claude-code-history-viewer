@@ -48,7 +48,7 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 22;
+const SNAPSHOT_CURSOR_VERSION: u32 = 23;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
 const SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const SUPPLEMENTAL_HISTORY_MAX_REPLAYED_DECODED_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -786,7 +786,8 @@ fn codex_question_reply_body(content: Option<&Value>) -> Option<&str> {
         }
         _ => return None,
     };
-    text.strip_prefix("<send_user_message_question_reply>")?
+    text.trim()
+        .strip_prefix("<send_user_message_question_reply>")?
         .strip_suffix("</send_user_message_question_reply>")
 }
 
@@ -8715,6 +8716,58 @@ mod tests {
     }
 
     #[test]
+    fn async_question_reply_accepts_outer_whitespace_without_changing_content() {
+        let tmp = TempDir::new().unwrap();
+        let reply = async_question_reply();
+        for (name, prefix, suffix) in [
+            ("lf", "", "\n"),
+            ("crlf", "", "\r\n"),
+            ("surrounding", " \t\r\n", "\r\n\t "),
+        ] {
+            for paginated in [false, true] {
+                let text = format!("{prefix}{reply}{suffix}");
+                let mut lines = snapshot_fixture_prefix(name);
+                let task_started = lines.remove(4);
+                lines.insert(2, task_started);
+                lines.insert(5, async_question_call());
+                lines.insert(6, user_message_line("2026-07-29T10:00:05Z", &text));
+                let event = if paginated {
+                    json!({"timestamp":"2026-07-29T10:00:06Z","type":"event_msg","payload":{
+                        "type":"item_completed","turn_id":"turn-1","item":{
+                            "type":"UserMessage","id":"reply-item","client_id":"reply-client",
+                            "content":[{"type":"text","text":text}]
+                        }
+                    }})
+                } else {
+                    json!({"timestamp":"2026-07-29T10:00:06Z","type":"event_msg","payload":{
+                        "type":"user_message","message":text
+                    }})
+                };
+                lines.insert(7, event);
+                let path =
+                    write_rollout_lines(tmp.path(), &format!("{name}-{paginated}.jsonl"), &lines);
+                let messages = parse_rollout_file(&path).unwrap();
+                let answer = messages
+                    .iter()
+                    .find(|message| message.subtype.as_deref() == Some(STEER_SUBTYPE))
+                    .unwrap();
+                assert_eq!(answer.timestamp, "2026-07-29T10:00:05Z");
+                assert_eq!(answer.content.as_ref().unwrap()[0]["text"], text);
+                assert_eq!(
+                    answer.data.as_ref().unwrap()["questionReply"],
+                    json!({
+                        "toolName":"request_user_input_async","replies":[
+                            {"toolCallId":"question-1","questionIndex":0,"question":"Which receiver?","answer":"Use mine.\nKeep this exact."},
+                            {"toolCallId":"question-1","questionIndex":1,"question":"Which format?","answer":"JSON"}
+                        ]
+                    }),
+                    "{name}, paginated={paginated}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn async_question_reply_rejects_unproven_or_partial_carriers() {
         let tmp = TempDir::new().unwrap();
         let reply = async_question_reply();
@@ -8753,6 +8806,18 @@ mod tests {
                 false,
             ),
             ("trailing", format!("{reply}\nMore text"), false, false),
+            (
+                "surrounded-quoted",
+                format!("\nHere is the carrier: {reply}\n"),
+                false,
+                false,
+            ),
+            (
+                "surrounded-trailing",
+                format!("\n{reply}\nMore text\n"),
+                false,
+                false,
+            ),
             (
                 "malformed",
                 reply.replace("\"answer\":\"JSON\"", "\"answer\":42"),
@@ -8833,7 +8898,7 @@ mod tests {
             &path,
             &[
                 json!({"timestamp":"2026-07-29T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
-                json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-2","item":{"type":"UserMessage","id":"reply-item","content":[{"type":"input_text","text":async_question_reply()}]}}}),
+                json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-2","item":{"type":"UserMessage","id":"reply-item","content":[{"type":"text","text":format!("{}\n", async_question_reply())}]}}}),
             ],
         );
         let messages = match load_session_snapshot(&path_text, Some(&cursor)).unwrap() {
