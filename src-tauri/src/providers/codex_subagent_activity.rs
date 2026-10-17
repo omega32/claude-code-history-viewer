@@ -107,7 +107,7 @@ fn parse_outcome(path: &Path, bytes: &[u8]) -> Result<CodexParseOutcome, String>
         &find_line_ranges(bytes),
         state,
         checkpoint,
-        false,
+        None,
         0,
         true,
     )

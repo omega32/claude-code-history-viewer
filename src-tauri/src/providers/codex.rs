@@ -48,8 +48,9 @@ const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
-const SNAPSHOT_CURSOR_VERSION: u32 = 23;
+const SNAPSHOT_CURSOR_VERSION: u32 = 24;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
+const MAX_QUESTION_REPLY_PROOFS: usize = 64;
 const SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const SUPPLEMENTAL_HISTORY_MAX_REPLAYED_DECODED_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const SUPPLEMENTAL_HISTORY_MAX_GROUPS: usize = 64;
@@ -134,9 +135,24 @@ struct CodexSnapshotCursor {
     canonical_path: String,
     accepted_len: u64,
     accepted_digest: String,
+    accepted_source_line: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    question_reply_proofs: Vec<CodexQuestionReplyProof>,
     checkpoint: CodexParserCheckpoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lineage: Option<Vec<CodexSnapshotLineageSegment>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexQuestionReplyProof {
+    source_line: usize,
+    record_digest: String,
+    projection_digest: Option<String>,
+}
+
+struct CodexReplayContext<'a> {
+    question_reply_proofs: &'a [CodexQuestionReplyProof],
+    accepted_len: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +168,8 @@ struct CodexParseOutcome {
     diagnostics: Vec<CodexAuthorshipDiagnostic>,
     checkpoint: CodexParserCheckpoint,
     accepted_len: usize,
+    accepted_source_line: usize,
+    question_reply_proofs: Vec<CodexQuestionReplyProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +782,7 @@ struct CanonicalCodexUserProjectionContext<'a> {
     counter: &'a mut u64,
     fallback_turn_id: Option<&'a str>,
     question_calls: &'a HashMap<String, Option<CodexQuestionCall>>,
+    certified_reply: Option<&'a CodexQuestionReplyProof>,
 }
 
 struct CodexQuestionCall {
@@ -847,44 +866,31 @@ fn merge_codex_question_reply(
     message: &mut ClaudeMessage,
     calls: &HashMap<String, Option<CodexQuestionCall>>,
     source_line: usize,
+    certified_reply: Option<&CodexQuestionReplyProof>,
 ) {
-    let Some(body) = codex_question_reply_body(message.content.as_ref()) else {
+    if certified_reply.is_some_and(|proof| proof.projection_digest.is_none()) {
         return;
-    };
-    let projection = (|| {
-        let rows: Value = serde_json::from_str(body).ok()?;
-        let rows = rows.as_array()?;
-        if rows.is_empty() {
-            return None;
-        }
-        let mut seen = HashSet::new();
-        let mut replies = Vec::with_capacity(rows.len());
-        for row in rows {
-            let row = row.as_object()?;
-            if row.len() != 3 {
-                return None;
-            }
-            let identity: Value =
-                serde_json::from_str(row.get("questionItemId")?.as_str()?).ok()?;
-            let identity = identity.as_array()?;
-            if identity.len() != 3 || identity[0].as_str()? != "request_user_input_async" {
-                return None;
-            }
-            let call_id = identity[1].as_str()?;
-            let index = usize::try_from(identity[2].as_u64()?).ok()?;
-            let question = row.get("question")?.as_str()?;
-            let answer = row.get("answer")?.as_str()?;
-            let call = calls.get(call_id)?.as_ref()?;
-            if !seen.insert((call_id.to_string(), index))
-                || call.source_line >= source_line
-                || call.questions.get(index)? != question
-            {
-                return None;
-            }
-            replies.push(serde_json::json!({"toolCallId":call_id,"questionIndex":index,"question":question,"answer":answer}));
-        }
-        Some(serde_json::json!({"toolName":"request_user_input_async","replies":replies}))
-    })();
+    }
+    let projection =
+        codex_question_reply_projection(message.content.as_ref(), |call_id, index, question| {
+            certified_reply.is_some()
+                || calls
+                    .get(call_id)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|call| {
+                        call.source_line < source_line
+                            && call
+                                .questions
+                                .get(index)
+                                .is_some_and(|title| title == question)
+                    })
+        })
+        .filter(|projection| {
+            certified_reply.map_or(true, |proof| {
+                proof.projection_digest.as_ref()
+                    == Some(&question_reply_projection_digest(projection))
+            })
+        });
     if let Some(projection) = projection {
         let data = message
             .data
@@ -893,6 +899,44 @@ fn merge_codex_question_reply(
             data.insert("questionReply".to_string(), projection);
         }
     }
+}
+
+fn question_reply_projection_digest(projection: &Value) -> String {
+    digest_bytes(projection.to_string().as_bytes())
+}
+
+fn codex_question_reply_projection(
+    content: Option<&Value>,
+    mut accepts: impl FnMut(&str, usize, &str) -> bool,
+) -> Option<Value> {
+    let body = codex_question_reply_body(content)?;
+    let rows: Value = serde_json::from_str(body).ok()?;
+    let rows = rows.as_array()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut replies = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row.as_object()?;
+        if row.len() != 3 {
+            return None;
+        }
+        let identity: Value = serde_json::from_str(row.get("questionItemId")?.as_str()?).ok()?;
+        let identity = identity.as_array()?;
+        if identity.len() != 3 || identity[0].as_str()? != "request_user_input_async" {
+            return None;
+        }
+        let call_id = identity[1].as_str()?;
+        let index = usize::try_from(identity[2].as_u64()?).ok()?;
+        let question = row.get("question")?.as_str()?;
+        let answer = row.get("answer")?.as_str()?;
+        if !seen.insert((call_id.to_string(), index)) || !accepts(call_id, index, question) {
+            return None;
+        }
+        replies.push(serde_json::json!({"toolCallId":call_id,"questionIndex":index,"question":question,"answer":answer}));
+    }
+    Some(serde_json::json!({"toolName":"request_user_input_async","replies":replies}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -998,10 +1042,10 @@ fn project_canonical_user_event(
     context: &mut CanonicalCodexUserProjectionContext<'_>,
     diagnostics: &mut Vec<CodexAuthorshipDiagnostic>,
     source_line: usize,
-) {
+) -> Option<usize> {
     let Some(canonical) = canonical_codex_user_message(event_payload) else {
         if event_payload.get("type").and_then(Value::as_str) != Some("user_message") {
-            return;
+            return None;
         }
         tracker.invalidate_all(
             diagnostics,
@@ -1012,7 +1056,7 @@ fn project_canonical_user_event(
         for lane in tracker.lanes.values_mut() {
             lane.pending_user_messages.clear();
         }
-        return;
+        return None;
     };
 
     let pending_lane_key = if let Some(turn_id) = canonical.turn_id.as_ref() {
@@ -1121,6 +1165,7 @@ fn project_canonical_user_event(
                 &mut messages[message_index],
                 context.question_calls,
                 reply_source_line,
+                context.certified_reply,
             );
         }
     } else {
@@ -1146,12 +1191,18 @@ fn project_canonical_user_event(
             canonical.client_id.as_deref(),
         );
         if question_reply_carrier {
-            merge_codex_question_reply(&mut message, context.question_calls, reply_source_line);
+            merge_codex_question_reply(
+                &mut message,
+                context.question_calls,
+                reply_source_line,
+                context.certified_reply,
+            );
         }
         messages.push(message);
     }
     lane.pending_user_messages.clear();
     lane.authored_user_count += 1;
+    Some(matched_index.unwrap_or(messages.len() - 1))
 }
 
 fn codex_response_is_same_turn_agent_activity(payload: &Value, active_turn_id: &str) -> bool {
@@ -3059,7 +3110,7 @@ fn parse_logical_rollout_outcome(
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    parse_rollout_slice(bytes, &ranges, state, checkpoint, false, 0).map_err(|()| {
+    parse_rollout_slice(bytes, &ranges, state, checkpoint, None, 0).map_err(|()| {
         "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
     })
 }
@@ -3107,7 +3158,7 @@ fn parse_rollout_bytes(canonical_path: &Path, bytes: &[u8]) -> Result<Vec<Claude
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    parse_rollout_slice(bytes, &ranges, state, checkpoint, false, 0)
+    parse_rollout_slice(bytes, &ranges, state, checkpoint, None, 0)
         .map(|outcome| outcome.messages)
         .map_err(|()| "Codex rollout unexpectedly referenced an earlier prefix".to_string())
 }
@@ -3571,7 +3622,7 @@ pub(crate) fn parse_authorship_audit(
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0)
+    let outcome = parse_rollout_slice(&bytes, &ranges, state, checkpoint, None, 0)
         .map_err(|()| "Codex audit parse unexpectedly crossed its prefix".to_string())?;
     let session_id = outcome
         .messages
@@ -3591,7 +3642,7 @@ fn parse_rollout_slice(
     ranges: &[(usize, usize)],
     state: CodexParserState,
     checkpoint: CodexParserCheckpoint,
-    resumed: bool,
+    replay: Option<CodexReplayContext<'_>>,
     source_line_base: usize,
 ) -> Result<CodexParseOutcome, ()> {
     parse_rollout_slice_capturing(
@@ -3599,7 +3650,7 @@ fn parse_rollout_slice(
         ranges,
         state,
         checkpoint,
-        resumed,
+        replay,
         source_line_base,
         false,
     )
@@ -3610,16 +3661,19 @@ fn parse_rollout_slice_capturing(
     ranges: &[(usize, usize)],
     mut state: CodexParserState,
     mut checkpoint: CodexParserCheckpoint,
-    resumed: bool,
+    replay: Option<CodexReplayContext<'_>>,
     source_line_base: usize,
     capture_source_spans: bool,
 ) -> Result<CodexParseOutcome, ()> {
+    let resumed = replay.is_some();
     let mut messages: Vec<ClaudeMessage> = Vec::new();
     let mut source_spans = Vec::<(usize, usize)>::new();
     let mut previous_source_line = source_line_base;
     let mut diagnostics = Vec::new();
     let slice_base_replace_from = checkpoint.replace_from;
     let mut accepted_len = usize::try_from(checkpoint.byte_offset).map_err(|_| ())?;
+    let mut accepted_source_line = checkpoint.source_line;
+    let mut question_reply_proofs = Vec::new();
     if !detached_active_lanes_are_valid(&checkpoint.detached_active_lanes) {
         return Err(());
     }
@@ -3684,6 +3738,7 @@ fn parse_rollout_slice_capturing(
         } else {
             end
         };
+        accepted_source_line = source_line;
         let line_timestamp = val
             .get("timestamp")
             .and_then(|v| v.as_str())
@@ -3969,15 +4024,30 @@ fn parse_rollout_slice_capturing(
                             .and_then(Value::as_str)
                             == Some("UserMessage");
                     if event_type == "user_message" || is_completed_user_item {
-                        if resumed
-                            && canonical_codex_user_message(payload).is_some_and(|canonical| {
+                        let is_question_reply =
+                            canonical_codex_user_message(payload).is_some_and(|canonical| {
                                 codex_question_reply_body(canonical.content.as_ref()).is_some()
-                            })
-                        {
-                            // The originating call may predate the checkpoint. Revalidate
-                            // the full source instead of growing cursors with call history.
-                            return Err(());
-                        }
+                            });
+                        // A completed-task checkpoint can precede this reply for many refreshes.
+                        // Only a verdict from the already verified prefix may bypass call history.
+                        let certified_reply = if resumed && is_question_reply {
+                            let replay = replay.as_ref().ok_or(())?;
+                            if accepted_len > replay.accepted_len {
+                                return Err(());
+                            }
+                            Some(
+                                replay
+                                    .question_reply_proofs
+                                    .iter()
+                                    .find(|proof| {
+                                        proof.source_line == source_line
+                                            && proof.record_digest == digest_bytes(line)
+                                    })
+                                    .ok_or(())?,
+                            )
+                        } else {
+                            None
+                        };
                         let pending_indices = if capture_source_spans {
                             authorship_tracker
                                 .lanes
@@ -3991,7 +4061,7 @@ fn parse_rollout_slice_capturing(
                         } else {
                             Vec::new()
                         };
-                        project_canonical_user_event(
+                        let projected_index = project_canonical_user_event(
                             &mut messages,
                             &mut authorship_tracker,
                             payload,
@@ -4001,10 +4071,31 @@ fn parse_rollout_slice_capturing(
                                 counter: &mut state.msg_counter,
                                 fallback_turn_id: active_turn_id.as_deref(),
                                 question_calls: &question_calls,
+                                certified_reply,
                             },
                             &mut diagnostics,
                             source_line,
                         );
+                        if is_question_reply {
+                            let projection_digest = projected_index
+                                .and_then(|index| {
+                                    messages[index].data.as_ref()?.get("questionReply")
+                                })
+                                .map(question_reply_projection_digest);
+                            if certified_reply
+                                .is_some_and(|proof| proof.projection_digest != projection_digest)
+                            {
+                                return Err(());
+                            }
+                            question_reply_proofs.push(CodexQuestionReplyProof {
+                                source_line,
+                                record_digest: digest_bytes(line),
+                                projection_digest,
+                            });
+                            if question_reply_proofs.len() > MAX_QUESTION_REPLY_PROOFS {
+                                question_reply_proofs.remove(0);
+                            }
+                        }
                         for index in pending_indices {
                             if messages[index].subtype.as_deref().is_some_and(|subtype| {
                                 matches!(subtype, AUTHORED_USER_SUBTYPE | STEER_SUBTYPE)
@@ -4392,12 +4483,15 @@ fn parse_rollout_slice_capturing(
         }
     }
 
+    question_reply_proofs.retain(|proof| proof.source_line > checkpoint.source_line);
     Ok(CodexParseOutcome {
         messages,
         source_spans,
         diagnostics,
         checkpoint,
         accepted_len,
+        accepted_source_line,
+        question_reply_proofs,
     })
 }
 
@@ -4419,8 +4513,31 @@ fn decode_snapshot_cursor(encoded: &str) -> Result<CodexSnapshotCursor, String> 
     let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|error| format!("Invalid Codex snapshot cursor encoding: {error}"))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Invalid Codex snapshot cursor payload: {error}"))
+    let cursor: CodexSnapshotCursor = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid Codex snapshot cursor payload: {error}"))?;
+    let valid_digest = |digest: &str| {
+        BASE64_URL_SAFE_NO_PAD
+            .decode(digest)
+            .is_ok_and(|bytes| bytes.len() == 32 && BASE64_URL_SAFE_NO_PAD.encode(bytes) == digest)
+    };
+    let mut previous_line = cursor.checkpoint.source_line;
+    if cursor.accepted_source_line < previous_line
+        || cursor.question_reply_proofs.len() > MAX_QUESTION_REPLY_PROOFS
+        || cursor.question_reply_proofs.iter().any(|proof| {
+            let invalid = proof.source_line <= previous_line
+                || proof.source_line > cursor.accepted_source_line
+                || !valid_digest(&proof.record_digest)
+                || proof
+                    .projection_digest
+                    .as_ref()
+                    .is_some_and(|digest| !valid_digest(digest));
+            previous_line = proof.source_line;
+            invalid
+        })
+    {
+        return Err("Invalid Codex snapshot reply proofs".to_string());
+    }
+    Ok(cursor)
 }
 
 /** Authoritative normalized replacement boundary carried by a provider cursor. */
@@ -4447,6 +4564,8 @@ fn cursor_for(
     canonical_path: &Path,
     bytes: &[u8],
     checkpoint: CodexParserCheckpoint,
+    accepted_source_line: usize,
+    question_reply_proofs: Vec<CodexQuestionReplyProof>,
 ) -> Result<String, String> {
     encode_snapshot_cursor(&CodexSnapshotCursor {
         version: SNAPSHOT_CURSOR_VERSION,
@@ -4455,6 +4574,8 @@ fn cursor_for(
         accepted_len: u64::try_from(bytes.len())
             .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
         accepted_digest: digest_bytes(bytes),
+        accepted_source_line,
+        question_reply_proofs,
         checkpoint,
         lineage: None,
     })
@@ -4489,6 +4610,120 @@ fn metadata_stayed_stable(before: &std::fs::Metadata, after: &std::fs::Metadata)
         return false;
     };
     after.len() == before.len() && after_modified == before_modified
+}
+
+struct CodexReplayCapture {
+    bytes: Vec<u8>,
+    offset: usize,
+    accepted_len: usize,
+    mapped_len: usize,
+    hasher: blake3::Hasher,
+}
+
+impl CodexReplayCapture {
+    fn new(
+        bytes: &[u8],
+        offset: usize,
+        accepted_len: usize,
+        accepted_digest: &str,
+    ) -> Result<Self, &'static str> {
+        const MAX_REPLAY_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+        if accepted_len > bytes.len() {
+            return Err("source-shrank");
+        }
+        if offset > accepted_len
+            || (offset > 0 && offset < bytes.len() && bytes[offset - 1] != b'\n')
+        {
+            return Err("invalid-checkpoint");
+        }
+        let window_len = bytes.len() - offset;
+        if window_len > MAX_REPLAY_WINDOW_BYTES {
+            return Err("replay-window-too-large");
+        }
+        let mut window = Vec::new();
+        window
+            .try_reserve_exact(window_len)
+            .map_err(|_| "replay-window-allocation-failed")?;
+        window.extend_from_slice(&bytes[offset..]);
+        // Hash the replayed old tail from the same owned bytes the parser sees;
+        // a separate mmap hash could certify a different concurrent observation.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes[..offset]);
+        hasher.update(&window[..accepted_len - offset]);
+        if BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize().as_bytes()) != accepted_digest {
+            return Err("prefix-mismatch");
+        }
+        Ok(Self {
+            bytes: window,
+            offset,
+            accepted_len,
+            mapped_len: bytes.len(),
+            hasher,
+        })
+    }
+
+    fn accepted_prefix(&self, relative_end: usize) -> Option<(usize, String)> {
+        let end = self.offset.checked_add(relative_end)?;
+        if end < self.accepted_len || relative_end > self.bytes.len() {
+            return None;
+        }
+        let mut hasher = self.hasher.clone();
+        hasher.update(&self.bytes[self.accepted_len - self.offset..relative_end]);
+        Some((
+            end,
+            BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes()),
+        ))
+    }
+
+    fn parse(&self, cursor: &CodexSnapshotCursor) -> Result<CodexParseOutcome, ()> {
+        let ranges = find_line_ranges(&self.bytes);
+        let mut checkpoint = cursor.checkpoint.clone();
+        checkpoint.byte_offset = 0;
+        parse_rollout_slice(
+            &self.bytes,
+            &ranges,
+            cursor.checkpoint.state.clone(),
+            checkpoint,
+            Some(CodexReplayContext {
+                question_reply_proofs: &cursor.question_reply_proofs,
+                accepted_len: self.accepted_len - self.offset,
+            }),
+            cursor.checkpoint.source_line,
+        )
+    }
+
+    fn confirm(
+        &self,
+        path: &Path,
+        before: &std::fs::Metadata,
+        relative_end: usize,
+    ) -> Result<bool, String> {
+        let Some((accepted_end, expected_digest)) = self.accepted_prefix(relative_end) else {
+            return Ok(false);
+        };
+        let after = fs::metadata(path).map_err(|error| error.to_string())?;
+        if source_stayed_stable(before, &after, self.mapped_len) {
+            return Ok(true);
+        }
+        let mapped_len = u64::try_from(self.mapped_len).unwrap_or(u64::MAX);
+        if before.len() > mapped_len || after.len() < mapped_len || after.len() <= before.len() {
+            return Ok(false);
+        }
+        let (confirmed, confirmation_before) = map_plain_rollout(path)?;
+        if confirmation_before.len() < after.len()
+            || accepted_end > confirmed.len()
+            || digest_bytes(&confirmed[..accepted_end]) != expected_digest
+        {
+            return Ok(false);
+        }
+        // EOF may keep advancing. Only the captured, fully hashed accepted
+        // prefix is published; later bytes belong to the next refresh.
+        let confirmation_after = fs::metadata(path).map_err(|error| error.to_string())?;
+        Ok(confirmation_after.len() >= confirmation_before.len()
+            && confirmation_after.len() >= u64::try_from(confirmed.len()).unwrap_or(u64::MAX)
+            && (confirmation_after.len() > confirmation_before.len()
+                || metadata_stayed_stable(&confirmation_before, &confirmation_after)))
+    }
 }
 
 fn sources_stayed_stable(sources: &[(PathBuf, std::fs::Metadata)]) -> Result<bool, String> {
@@ -4533,7 +4768,7 @@ fn complete_paginated_snapshot(
         detached_active_lanes: Vec::new(),
     };
     let outcome =
-        parse_rollout_slice(&bytes, &ranges, state, checkpoint, false, 0).map_err(|()| {
+        parse_rollout_slice(&bytes, &ranges, state, checkpoint, None, 0).map_err(|()| {
             "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
         })?;
     let original_len = outcome.messages.len();
@@ -4567,6 +4802,8 @@ fn complete_paginated_snapshot(
             canonical_path: canonical_path.to_string_lossy().into_owned(),
             accepted_len: current.accepted_len,
             accepted_digest: current.accepted_digest.clone(),
+            accepted_source_line: outcome.accepted_source_line,
+            question_reply_proofs: outcome.question_reply_proofs,
             checkpoint: outcome.checkpoint,
             lineage: Some(lineage),
         })?)
@@ -4649,12 +4886,6 @@ fn load_paginated_snapshot(
     if accepted_len > mmap.len() {
         return complete_paginated_snapshot(canonical_path, "source-shrank".to_string());
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&mmap[..accepted_len]);
-    if BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize().as_bytes()) != cursor.accepted_digest
-    {
-        return complete_paginated_snapshot(canonical_path, "prefix-mismatch".to_string());
-    }
     let accepted_total = lineage.iter().try_fold(0usize, |total, segment| {
         usize::try_from(segment.accepted_len)
             .ok()
@@ -4669,15 +4900,19 @@ fn load_paginated_snapshot(
     if checkpoint_offset > accepted_total {
         return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
     }
-    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
-    if !source_stayed_stable(&before, &after, mmap.len()) {
-        return complete_paginated_snapshot(
-            canonical_path,
-            "source-changed-during-read".to_string(),
-        );
-    }
     if accepted_len == mmap.len() {
-        if !sources_stayed_stable(&verified_ancestor_sources)? {
+        let capture = match CodexReplayCapture::new(
+            &mmap,
+            accepted_len,
+            accepted_len,
+            &cursor.accepted_digest,
+        ) {
+            Ok(capture) => capture,
+            Err(reason) => return complete_paginated_snapshot(canonical_path, reason.to_string()),
+        };
+        if !capture.confirm(canonical_path, &before, 0)?
+            || !sources_stayed_stable(&verified_ancestor_sources)?
+        {
             return complete_paginated_snapshot(
                 canonical_path,
                 "source-changed-during-read".to_string(),
@@ -4709,18 +4944,16 @@ fn load_paginated_snapshot(
     let replace_from = cursor.checkpoint.replace_from;
     // Cursor offsets address the complete logical lineage. Rebase only while
     // parsing the current-carrier window, then restore the logical coordinate.
-    let parse_bytes = &mmap[checkpoint_current_offset..];
-    let ranges = find_line_ranges(parse_bytes);
-    let mut parse_checkpoint = cursor.checkpoint.clone();
-    parse_checkpoint.byte_offset = 0;
-    let mut outcome = match parse_rollout_slice(
-        parse_bytes,
-        &ranges,
-        cursor.checkpoint.state.clone(),
-        parse_checkpoint,
-        true,
-        cursor.checkpoint.source_line,
+    let capture = match CodexReplayCapture::new(
+        &mmap,
+        checkpoint_current_offset,
+        accepted_len,
+        &cursor.accepted_digest,
     ) {
+        Ok(capture) => capture,
+        Err(reason) => return complete_paginated_snapshot(canonical_path, reason.to_string()),
+    };
+    let mut outcome = match capture.parse(&cursor) {
         Ok(outcome) => outcome,
         Err(()) => {
             return complete_paginated_snapshot(
@@ -4730,15 +4963,11 @@ fn load_paginated_snapshot(
         }
     };
 
-    let Some(next_accepted_len) = checkpoint_current_offset.checked_add(outcome.accepted_len)
+    let Some((next_accepted_len, full_digest)) = capture.accepted_prefix(outcome.accepted_len)
     else {
         return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
     };
-    if next_accepted_len < accepted_len || next_accepted_len > mmap.len() {
-        return complete_paginated_snapshot(canonical_path, "invalid-checkpoint".to_string());
-    }
-    let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
-    if !source_stayed_stable(&before, &after, mmap.len())
+    if !capture.confirm(canonical_path, &before, outcome.accepted_len)?
         || !sources_stayed_stable(&verified_ancestor_sources)?
     {
         return complete_paginated_snapshot(
@@ -4752,8 +4981,6 @@ fn load_paginated_snapshot(
         });
     }
 
-    hasher.update(&mmap[accepted_len..next_accepted_len]);
-    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
     let checkpoint_window_base = current_prefix_len
         .checked_add(checkpoint_current_offset)
         .ok_or_else(|| "Codex paginated checkpoint exceeds its lineage".to_string())?;
@@ -4786,6 +5013,8 @@ fn load_paginated_snapshot(
         canonical_path: canonical_path.to_string_lossy().into_owned(),
         accepted_len: current.accepted_len,
         accepted_digest: full_digest,
+        accepted_source_line: outcome.accepted_source_line,
+        question_reply_proofs: outcome.question_reply_proofs,
         checkpoint: outcome.checkpoint,
         lineage: Some(next_lineage),
     })?;
@@ -4825,7 +5054,7 @@ fn complete_snapshot_from_path(
         state: state.clone(),
         detached_active_lanes: Vec::new(),
     };
-    let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, false, 0)
+    let outcome = parse_rollout_slice(&mmap, &ranges, state, checkpoint, None, 0)
         .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
     let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
     let original_len = outcome.messages.len();
@@ -4836,6 +5065,8 @@ fn complete_snapshot_from_path(
                 canonical_path,
                 &mmap[..outcome.accepted_len],
                 outcome.checkpoint.clone(),
+                outcome.accepted_source_line,
+                outcome.question_reply_proofs,
             )?)
         } else {
             None
@@ -4866,7 +5097,7 @@ fn cursor_checkpoint_is_valid(cursor: &CodexSnapshotCursor, bytes: &[u8]) -> boo
         return false;
     }
     offset == 0
-        || offset == accepted_len
+        || offset == bytes.len()
         || bytes
             .get(offset.wrapping_sub(1))
             .is_some_and(|byte| *byte == b'\n')
@@ -4919,16 +5150,22 @@ pub(crate) fn load_session_snapshot(
         return complete_snapshot_from_path(&canonical_path, "invalid-checkpoint");
     }
 
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&mmap[..accepted_len]);
-    let accepted_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.clone().finalize().as_bytes());
-    if accepted_digest != cursor.accepted_digest {
-        return complete_snapshot_from_path(&canonical_path, "prefix-mismatch");
-    }
+    let checkpoint_offset = usize::try_from(cursor.checkpoint.byte_offset)
+        .map_err(|_| "Codex checkpoint does not fit this platform".to_string())?;
+    let capture_offset = if accepted_len == mmap.len() {
+        accepted_len
+    } else {
+        checkpoint_offset
+    };
+    let capture =
+        match CodexReplayCapture::new(&mmap, capture_offset, accepted_len, &cursor.accepted_digest)
+        {
+            Ok(capture) => capture,
+            Err(reason) => return complete_snapshot_from_path(&canonical_path, reason),
+        };
 
     if accepted_len == mmap.len() {
-        let after = fs::metadata(&canonical_path).map_err(|error| error.to_string())?;
-        if source_stayed_stable(&before, &after, mmap.len()) {
+        if capture.confirm(&canonical_path, &before, 0)? {
             return Ok(SessionSnapshotLoad::Unchanged {
                 cursor: encoded_cursor.to_string(),
             });
@@ -4937,33 +5174,31 @@ pub(crate) fn load_session_snapshot(
     }
 
     let replace_from = cursor.checkpoint.replace_from;
-    let ranges = find_line_ranges(&mmap);
-    let outcome = match parse_rollout_slice(
-        &mmap,
-        &ranges,
-        cursor.checkpoint.state.clone(),
-        cursor.checkpoint.clone(),
-        true,
-        0,
-    ) {
+    let mut outcome = match capture.parse(&cursor) {
         Ok(outcome) => outcome,
         Err(()) => {
             return complete_snapshot_from_path(&canonical_path, "unsafe-backward-reference");
         }
     };
-    let after = fs::metadata(&canonical_path).map_err(|error| error.to_string())?;
-    if !source_stayed_stable(&before, &after, mmap.len()) {
+    let Some((next_accepted_len, full_digest)) = capture.accepted_prefix(outcome.accepted_len)
+    else {
+        return complete_snapshot_from_path(&canonical_path, "invalid-checkpoint");
+    };
+    if !capture.confirm(&canonical_path, &before, outcome.accepted_len)? {
         return complete_snapshot_from_path(&canonical_path, "source-changed-during-read");
     }
 
-    if outcome.accepted_len == accepted_len {
+    if next_accepted_len == accepted_len {
         return Ok(SessionSnapshotLoad::Unchanged {
             cursor: encoded_cursor.to_string(),
         });
     }
 
-    hasher.update(&mmap[accepted_len..outcome.accepted_len]);
-    let full_digest = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
+    outcome.checkpoint.byte_offset = cursor
+        .checkpoint
+        .byte_offset
+        .checked_add(outcome.checkpoint.byte_offset)
+        .ok_or_else(|| "Codex checkpoint exceeds its carrier".to_string())?;
     let cursor_replace_from = outcome.checkpoint.replace_from;
     let original_len = outcome.messages.len();
     let messages = finalize_loaded_messages(outcome.messages);
@@ -4974,9 +5209,11 @@ pub(crate) fn load_session_snapshot(
         version: SNAPSHOT_CURSOR_VERSION,
         provider: "codex".to_string(),
         canonical_path: canonical_path.to_string_lossy().into_owned(),
-        accepted_len: u64::try_from(outcome.accepted_len)
+        accepted_len: u64::try_from(next_accepted_len)
             .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
         accepted_digest: full_digest,
+        accepted_source_line: outcome.accepted_source_line,
+        question_reply_proofs: outcome.question_reply_proofs,
         checkpoint: outcome.checkpoint,
         lineage: None,
     })?;
@@ -8901,12 +9138,16 @@ mod tests {
                 json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-2","item":{"type":"UserMessage","id":"reply-item","content":[{"type":"text","text":format!("{}\n", async_question_reply())}]}}}),
             ],
         );
-        let messages = match load_session_snapshot(&path_text, Some(&cursor)).unwrap() {
+        let (messages, mut cursor) = match load_session_snapshot(&path_text, Some(&cursor)).unwrap()
+        {
             SessionSnapshotLoad::Full {
-                reason, messages, ..
+                reason,
+                messages,
+                cursor: Some(cursor),
+                ..
             } => {
                 assert_eq!(reason, "unsafe-backward-reference");
-                messages
+                (messages, cursor)
             }
             _ => panic!("a delayed reply must revalidate its preceding call"),
         };
@@ -8920,6 +9161,402 @@ mod tests {
             answer.data.as_ref().unwrap()["questionReply"]["replies"][0]["toolCallId"],
             "question-1"
         );
+        let mut projected = messages;
+        for index in 0..2 {
+            append_rollout_lines(
+                &path,
+                &[
+                    json!({"timestamp":"2026-07-29T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","id":format!("active-{index}"),"content":[{"type":"output_text","text":format!("active answer {index}")}]}}),
+                ],
+            );
+            match load_session_snapshot(&path_text, Some(&cursor)).unwrap() {
+                SessionSnapshotLoad::Replace {
+                    replace_from,
+                    messages,
+                    cursor: next,
+                    ..
+                } => {
+                    projected.truncate(replace_from);
+                    projected.extend(messages);
+                    cursor = next;
+                }
+                _ => panic!("an accepted reply must not force another full active-task replay"),
+            }
+            assert_snapshot_matches_fresh(&projected, &path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn async_question_reply_snapshot_preserves_rejections_and_temporal_call_order() {
+        for scenario in [
+            "valid",
+            "wrong-title",
+            "duplicate-before",
+            "duplicate-between",
+            "duplicate-after",
+            "wrong-tool",
+            "mixed-content",
+            "dropped-content",
+            "whitespace",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let codex_home = tmp.path().join(".codex");
+            let sessions_dir = codex_home.join("sessions");
+            fs::create_dir_all(&sessions_dir).unwrap();
+            let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+            let mut lines = snapshot_fixture_prefix("reply-proof-order");
+            let mut call = async_question_call();
+            if scenario == "wrong-tool" {
+                call["payload"]["name"] = json!("another_tool");
+            }
+            lines.insert(5, call);
+            let reply = if scenario == "wrong-title" {
+                async_question_reply().replace("Which receiver?", "A different question?")
+            } else if scenario == "whitespace" {
+                format!(" \r\n{}\n\t", async_question_reply())
+            } else {
+                async_question_reply()
+            };
+            lines.push(json!({"timestamp":"2026-07-29T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+            if scenario == "duplicate-before" {
+                lines.push(async_question_call());
+            }
+            let mut raw = json!({"timestamp":"2026-07-29T10:01:01Z","type":"response_item","payload":{"type":"message","role":"user","id":"raw-reply","content":[{"type":"input_text","text":reply}]}});
+            if matches!(scenario, "mixed-content" | "dropped-content") {
+                raw["payload"]["content"].as_array_mut().unwrap().push(
+                    if scenario == "mixed-content" {
+                        json!({"type":"input_image","image_url":"https://example.test/image.png"})
+                    } else {
+                        json!({"type":"unknown_content","payload":"preserve rejection"})
+                    },
+                );
+            }
+            lines.push(raw);
+            if scenario == "duplicate-between" {
+                lines.push(async_question_call());
+            }
+            lines.push(json!({"timestamp":"2026-07-29T10:01:01Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-2","item":{"type":"UserMessage","id":"reply-item","content":[{"type":"text","text":reply}]}}}));
+            if scenario == "duplicate-after" {
+                lines.push(async_question_call());
+            }
+            let path = write_rollout_lines(
+                &sessions_dir,
+                "rollout-2026-07-29T10-00-00-reply-proof-order.jsonl",
+                &lines,
+            );
+            let (mut projected, cursor) =
+                match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+                    SessionSnapshotLoad::Full {
+                        messages,
+                        cursor: Some(cursor),
+                        ..
+                    } => (messages, cursor),
+                    _ => panic!("expected reply-bearing seed"),
+                };
+            let has_reply = projected.iter().any(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("questionReply").is_some())
+            });
+            assert_eq!(
+                has_reply,
+                matches!(scenario, "valid" | "duplicate-after" | "whitespace"),
+                "{scenario}"
+            );
+            append_rollout_lines(
+                &path,
+                &[
+                    json!({"timestamp":"2026-07-29T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"still working"}]}}),
+                ],
+            );
+            match load_session_snapshot(&path.to_string_lossy(), Some(&cursor)).unwrap() {
+                SessionSnapshotLoad::Replace {
+                    replace_from,
+                    messages,
+                    ..
+                } => {
+                    projected.truncate(replace_from);
+                    projected.extend(messages);
+                }
+                _ => panic!(
+                    "accepted {scenario} reply must preserve its prior verdict during replay"
+                ),
+            }
+            assert_snapshot_matches_fresh(&projected, &path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn async_question_reply_snapshot_reuses_paginated_ancestor_correlation() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        let mut base: Vec<Value> = fs::read_to_string(&base_path)
+            .unwrap()
+            .lines()
+            .take(2)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut call = async_question_call();
+        call["ordinal"] = json!(2);
+        base.push(call);
+        write_rollout_lines(
+            base_path.parent().unwrap(),
+            base_path.file_name().unwrap().to_str().unwrap(),
+            &base,
+        );
+        let mut current: Vec<Value> = fs::read_to_string(&current_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        current[0]["payload"]["history_base"]["end_byte_offset"] =
+            json!(fs::metadata(&base_path).unwrap().len());
+        current[0]["payload"]["history_base"]["end_ordinal_exclusive"] = json!(3);
+        for line in &mut current {
+            line["ordinal"] = json!(line["ordinal"].as_u64().unwrap() + 1);
+        }
+        write_rollout_lines(
+            current_path.parent().unwrap(),
+            current_path.file_name().unwrap().to_str().unwrap(),
+            &current,
+        );
+        let mut cursor = match load_session_snapshot(&current_path.to_string_lossy(), None).unwrap()
+        {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("expected paginated seed"),
+        };
+        append_rollout_lines(
+            &current_path,
+            &[
+                json!({"ordinal":6,"type":"event_msg","payload":{"type":"task_started","turn_id":"reply-turn"}}),
+                json!({"ordinal":7,"type":"event_msg","payload":{"type":"item_completed","turn_id":"reply-turn","item":{"type":"UserMessage","id":"paginated-reply","content":[{"type":"text","text":async_question_reply()}]}}}),
+            ],
+        );
+        let mut projected =
+            match load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor)).unwrap() {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(next),
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(reason, "unsafe-backward-reference");
+                    cursor = next;
+                    messages
+                }
+                _ => panic!("new reply must validate the inherited call"),
+            };
+        assert!(projected.iter().any(|message| message
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get("questionReply").is_some())));
+        for index in 0..3 {
+            append_rollout_lines(
+                &current_path,
+                &[assistant_message_line(
+                    "2026-09-03T22:24:00Z",
+                    8 + index,
+                    "active output",
+                )],
+            );
+            LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(|count| count.set(0));
+            match load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor)).unwrap() {
+                SessionSnapshotLoad::Replace {
+                    replace_from,
+                    messages,
+                    cursor: next,
+                    ..
+                } => {
+                    projected.splice(replace_from.., messages);
+                    cursor = next;
+                }
+                _ => panic!("accepted paginated reply must replay only its mutable window"),
+            }
+            assert_eq!(
+                LOGICAL_ROLLOUT_MATERIALIZATION_COUNT.with(std::cell::Cell::get),
+                0
+            );
+            let complete = finalize_loaded_messages(parse_live_rollout(&current_path).unwrap());
+            assert_eq!(message_values(&projected), message_values(&complete));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn async_question_reply_snapshot_rejects_missing_corrupt_and_future_proofs() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let mut lines = snapshot_fixture_prefix("reply-proof-corrupt");
+        lines.insert(5, async_question_call());
+        lines
+            .push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+        let prefix = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        lines.push(json!({"type":"event_msg","payload":{"type":"user_message","message":async_question_reply()}}));
+        let path = write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-07-29T10-00-00-reply-proof-corrupt.jsonl",
+            &lines,
+        );
+        let encoded = match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("expected seed"),
+        };
+        append_rollout_lines(
+            &path,
+            &[assistant_message_line(
+                "2026-07-29T10:02:00Z",
+                100,
+                "new output",
+            )],
+        );
+        for scenario in [
+            "missing",
+            "record",
+            "projection",
+            "duplicate",
+            "before-checkpoint",
+            "after-accepted-line",
+            "future-record",
+            "old-version",
+            "too-many",
+        ] {
+            let mut cursor = decode_snapshot_cursor(&encoded).unwrap();
+            assert_eq!(cursor.question_reply_proofs.len(), 1);
+            match scenario {
+                "missing" => cursor.question_reply_proofs.clear(),
+                "record" => {
+                    cursor.question_reply_proofs[0].record_digest =
+                        digest_bytes(b"different record");
+                }
+                "projection" => {
+                    cursor.question_reply_proofs[0].projection_digest =
+                        Some(digest_bytes(b"different projection"));
+                }
+                "duplicate" => cursor
+                    .question_reply_proofs
+                    .push(cursor.question_reply_proofs[0].clone()),
+                "before-checkpoint" => {
+                    cursor.question_reply_proofs[0].source_line = cursor.checkpoint.source_line;
+                }
+                "after-accepted-line" => {
+                    cursor.question_reply_proofs[0].source_line = cursor.accepted_source_line + 1;
+                }
+                "future-record" => {
+                    cursor.accepted_len = prefix.len() as u64;
+                    cursor.accepted_digest = digest_bytes(prefix.as_bytes());
+                }
+                "old-version" => cursor.version -= 1,
+                "too-many" => {
+                    cursor.question_reply_proofs = vec![
+                        cursor.question_reply_proofs[0].clone();
+                        MAX_QUESTION_REPLY_PROOFS + 1
+                    ];
+                }
+                _ => unreachable!(),
+            }
+            let encoded = encode_snapshot_cursor(&cursor).unwrap();
+            match load_session_snapshot(&path.to_string_lossy(), Some(&encoded)).unwrap() {
+                SessionSnapshotLoad::Full { messages, .. } => {
+                    assert_snapshot_matches_fresh(&messages, &path);
+                }
+                _ => panic!("{scenario} must revalidate the complete source"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn async_question_reply_snapshot_bounds_and_prunes_proofs() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let mut lines = snapshot_fixture_prefix("reply-proof-bound");
+        lines.insert(5, async_question_call());
+        lines
+            .push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}));
+        for _ in 0..=MAX_QUESTION_REPLY_PROOFS {
+            lines.push(json!({"type":"event_msg","payload":{"type":"user_message","message":async_question_reply()}}));
+        }
+        let path = write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-07-29T10-00-00-reply-proof-bound.jsonl",
+            &lines,
+        );
+        let mut cursor = match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("expected seed"),
+        };
+        assert_eq!(
+            decode_snapshot_cursor(&cursor)
+                .unwrap()
+                .question_reply_proofs
+                .len(),
+            MAX_QUESTION_REPLY_PROOFS
+        );
+        assert!(cursor.len() <= 64 * 1024);
+        for terminal in [false, true] {
+            append_rollout_lines(
+                &path,
+                &[if terminal {
+                    json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2"}})
+                } else {
+                    assistant_message_line("2026-07-29T10:02:00Z", 100, "new output")
+                }],
+            );
+            cursor = match load_session_snapshot(&path.to_string_lossy(), Some(&cursor)).unwrap() {
+                SessionSnapshotLoad::Full {
+                    reason,
+                    messages,
+                    cursor: Some(next),
+                    ..
+                } => {
+                    assert_eq!(reason, "unsafe-backward-reference");
+                    assert_snapshot_matches_fresh(&messages, &path);
+                    next
+                }
+                _ => panic!("missing bounded proof must force a full replay"),
+            };
+        }
+        assert!(decode_snapshot_cursor(&cursor)
+            .unwrap()
+            .question_reply_proofs
+            .is_empty());
+        append_rollout_lines(
+            &path,
+            &[assistant_message_line(
+                "2026-07-29T10:03:00Z",
+                101,
+                "after checkpoint",
+            )],
+        );
+        assert!(matches!(
+            load_session_snapshot(&path.to_string_lossy(), Some(&cursor)).unwrap(),
+            SessionSnapshotLoad::Replace { .. }
+        ));
     }
 
     fn write_snapshot_fixture(sessions_dir: &Path, session_id: &str) -> PathBuf {
@@ -8932,6 +9569,218 @@ mod tests {
             .join("\n");
         fs::write(&path, format!("{body}\n")).expect("snapshot fixture should be written");
         path
+    }
+
+    #[test]
+    fn snapshot_replay_capture_accepts_growth_after_immutable_capture() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("capture.jsonl");
+        let old = b"old\n";
+        let captured = b"old\nnew\n{\"partial\":";
+        fs::write(&path, captured).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let capture =
+            CodexReplayCapture::new(captured, old.len(), old.len(), &digest_bytes(old)).unwrap();
+        assert_eq!(
+            capture.accepted_prefix(4).unwrap(),
+            (8, digest_bytes(b"old\nnew\n"))
+        );
+        fs::write(&path, b"old\nnew\n{\"partial\":true}\nnext\n").unwrap();
+        assert!(capture.confirm(&path, &before, 4).unwrap());
+        assert_eq!(capture.bytes, b"new\n{\"partial\":");
+        assert_eq!(capture.accepted_prefix(0).unwrap(), (4, digest_bytes(old)));
+        assert!(capture.accepted_prefix(capture.bytes.len() + 1).is_none());
+    }
+
+    #[test]
+    fn snapshot_replay_capture_rejects_rewrites_of_old_and_new_accepted_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("capture.jsonl");
+        for replacement in [
+            b"OLD\nnew\nmore\n".as_slice(),
+            b"old\nNEW\nmore\n",
+            b"old\n",
+            b"OLD\nnew\n",
+        ] {
+            fs::write(&path, b"old\nnew\n").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                ))
+                .unwrap();
+            let before = fs::metadata(&path).unwrap();
+            let capture =
+                CodexReplayCapture::new(b"old\nnew\n", 4, 4, &digest_bytes(b"old\n")).unwrap();
+            fs::write(&path, replacement).unwrap();
+            assert!(
+                !capture.confirm(&path, &before, 4).unwrap(),
+                "{replacement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_capture_rejects_bad_bounds_and_unterminated_checkpoints() {
+        let bytes = b"old\nnew\n";
+        for (offset, accepted) in [(9, 9), (5, 4), (3, 4), (3, 8)] {
+            assert!(
+                CodexReplayCapture::new(bytes, offset, accepted, &digest_bytes(&bytes[..4]))
+                    .is_err()
+            );
+        }
+        assert!(CodexReplayCapture::new(bytes, 4, 4, &digest_bytes(b"bad\n")).is_err());
+        let capture = CodexReplayCapture::new(bytes, 0, 4, &digest_bytes(b"old\n")).unwrap();
+        assert!(capture.accepted_prefix(3).is_none());
+        let mut oversized = vec![b' '; 64 * 1024 * 1024 + 1];
+        oversized[0] = b'\n';
+        assert!(matches!(
+            CodexReplayCapture::new(&oversized, 0, 0, &digest_bytes(b"")),
+            Err("replay-window-too-large")
+        ));
+        assert_eq!(
+            CodexReplayCapture::new(
+                &oversized,
+                oversized.len(),
+                oversized.len(),
+                &digest_bytes(&oversized)
+            )
+            .unwrap()
+            .bytes,
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replay_capture_partial_canonical_event_catches_up_exactly() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions, "captured-partial");
+        let (mut cached, encoded) =
+            match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("expected complete seed"),
+            };
+        let mut cursor = decode_snapshot_cursor(&encoded).unwrap();
+        assert!(cursor.checkpoint.byte_offset > 0);
+        append_rollout_lines(
+            &path,
+            &[
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+                user_message_line("2026-07-29T10:01:01Z", "second prompt"),
+            ],
+        );
+        let canonical = json!({"timestamp":"2026-07-29T10:01:02Z","type":"event_msg","payload":{"type":"user_message","message":"second prompt"}}).to_string() + "\n";
+        let split = canonical.len() - 10;
+        use std::io::Write as _;
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&canonical.as_bytes()[..split])
+            .unwrap();
+        let (mapped, before) = map_plain_rollout(&path).unwrap();
+        let capture = CodexReplayCapture::new(
+            &mapped,
+            usize::try_from(cursor.checkpoint.byte_offset).unwrap(),
+            usize::try_from(cursor.accepted_len).unwrap(),
+            &cursor.accepted_digest,
+        )
+        .unwrap();
+        let mut outcome = capture.parse(&cursor).unwrap();
+        let (accepted_end, accepted_digest) =
+            capture.accepted_prefix(outcome.accepted_len).unwrap();
+        let bounded = mapped[..accepted_end].to_vec();
+        drop(mapped);
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&canonical.as_bytes()[split..])
+            .unwrap();
+        let complete = fs::read(&path).unwrap();
+        assert!(capture
+            .confirm(&path, &before, outcome.accepted_len)
+            .unwrap());
+        cached.truncate(cursor.checkpoint.replace_from);
+        cached.extend(outcome.messages);
+        fs::write(&path, &bounded).unwrap();
+        assert_snapshot_matches_fresh(&cached, &path);
+        fs::write(&path, &complete).unwrap();
+        outcome.checkpoint.byte_offset += cursor.checkpoint.byte_offset;
+        cursor.accepted_len = u64::try_from(accepted_end).unwrap();
+        cursor.accepted_digest = accepted_digest;
+        cursor.accepted_source_line = outcome.accepted_source_line;
+        cursor.question_reply_proofs = outcome.question_reply_proofs;
+        cursor.checkpoint = outcome.checkpoint;
+        let encoded = encode_snapshot_cursor(&cursor).unwrap();
+        match load_session_snapshot(&path.to_string_lossy(), Some(&encoded)).unwrap() {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                cached.truncate(replace_from);
+                cached.extend(messages);
+            }
+            _ => panic!("completed canonical tail should replace the captured pending user"),
+        }
+        assert_snapshot_matches_fresh(&cached, &path);
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_replay_capture_rejects_append_at_unterminated_complete_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join(".codex");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let path = write_snapshot_fixture(&sessions, "unterminated-checkpoint");
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, &bytes).unwrap();
+        let encoded = match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("expected complete seed"),
+        };
+        assert_eq!(
+            decode_snapshot_cursor(&encoded)
+                .unwrap()
+                .checkpoint
+                .byte_offset,
+            u64::try_from(bytes.len()).unwrap()
+        );
+        append_rollout_lines(
+            &path,
+            &[assistant_message_line(
+                "2026-07-29T10:01:01Z",
+                10,
+                "concatenated",
+            )],
+        );
+        match load_session_snapshot(&path.to_string_lossy(), Some(&encoded)).unwrap() {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "invalid-checkpoint");
+                assert_snapshot_matches_fresh(&messages, &path);
+            }
+            _ => panic!("unterminated checkpoint must not split a concatenated source line"),
+        }
     }
 
     fn message_values(messages: &[ClaudeMessage]) -> Value {
