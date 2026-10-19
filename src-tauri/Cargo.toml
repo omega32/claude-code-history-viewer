@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-history-viewer"
-version = "1.29.4"
+version = "1.29.5"
 description = "Claude Code 대화 기록을 탐색하고 분석하는 데스크톱 애플리케이션"
 authors = ["JaeHyeok Lee"]
 license = "MIT"
@@ -74,7 +74,7 @@ tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 comrak = { version = "0.49.0", default-features = false }
-blake3 = "1.8.2"
+blake3 = { version = "1.8.2", features = ["rayon"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

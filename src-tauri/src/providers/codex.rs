@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 thread_local! {
     static LOGICAL_ROLLOUT_MATERIALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 use crate::commands::session::NativeRenameResult;
@@ -49,6 +50,7 @@ const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
 const STEER_SUBTYPE: &str = "steer";
 const SNAPSHOT_CURSOR_VERSION: u32 = 24;
+const MAX_SNAPSHOT_CURSOR_BYTES: usize = 64 * 1024;
 const MAX_DETACHED_ACTIVE_LANES: usize = 64;
 const MAX_QUESTION_REPLY_PROOFS: usize = 64;
 const SUPPLEMENTAL_HISTORY_MAX_CAPTURED_DECODED_BYTES: usize = 512 * 1024 * 1024;
@@ -160,6 +162,34 @@ struct CodexSnapshotLineageSegment {
     canonical_path: String,
     accepted_len: u64,
     accepted_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoded_proof: Option<CodexCompressedPrefixProof>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexCompressedPrefixProof {
+    encoded_len: u64,
+    bound_digest: String,
+}
+
+struct CodexEncodedIdentity {
+    len: u64,
+    digest: blake3::Hash,
+}
+
+impl CodexEncodedIdentity {
+    fn bind_prefix(&self, accepted_len: u64, accepted_digest: &str) -> CodexCompressedPrefixProof {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"codex-compressed-lineage-prefix-v1\0");
+        hasher.update(&self.len.to_le_bytes());
+        hasher.update(self.digest.as_bytes());
+        hasher.update(&accepted_len.to_le_bytes());
+        hasher.update(accepted_digest.as_bytes());
+        CodexCompressedPrefixProof {
+            encoded_len: self.len,
+            bound_digest: BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes()),
+        }
+    }
 }
 
 struct CodexParseOutcome {
@@ -1888,6 +1918,8 @@ fn read_rollout_bytes(path: &Path) -> Result<RolloutBytes, String> {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".jsonl.zst"));
     if is_compressed {
+        #[cfg(test)]
+        COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(|count| count.set(count.get() + 1));
         return zstd::decode_all(std::io::BufReader::new(file))
             .map(RolloutBytes::Owned)
             .map_err(|e| format!("Failed to decompress rollout: {e}"));
@@ -1895,6 +1927,94 @@ fn read_rollout_bytes(path: &Path) -> Result<RolloutBytes, String> {
     // SAFETY: File is read-only and we only read from the mapping
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
     Ok(RolloutBytes::Mapped(mmap))
+}
+
+struct CodexEncodedReader<R> {
+    inner: R,
+    len: u64,
+    hasher: blake3::Hasher,
+}
+
+impl<R: Read> Read for CodexEncodedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.len = self
+            .len
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("Codex rollout exceeds encoded-byte limit"))?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn read_rollout_bytes_for_lineage(
+    path: &Path,
+) -> Result<(RolloutBytes, Option<CodexEncodedIdentity>), String> {
+    if is_plain_rollout(path) {
+        return read_rollout_bytes(path).map(|bytes| (bytes, None));
+    }
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    let mut reader = CodexEncodedReader {
+        inner: std::io::BufReader::new(file),
+        len: 0,
+        hasher: blake3::Hasher::new(),
+    };
+    #[cfg(test)]
+    COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(|count| count.set(count.get() + 1));
+    // Hash the decoder's actual input: separately reopening the path could
+    // certify different compressed bytes after a concurrent replacement.
+    let decoded = zstd::decode_all(&mut reader)
+        .map_err(|error| format!("Failed to decompress rollout: {error}"))?;
+    let remaining = before.len().saturating_sub(reader.len);
+    let drained = std::io::copy(&mut reader.by_ref().take(remaining), &mut std::io::sink()).is_ok();
+    let identity = fs::metadata(path)
+        .ok()
+        .filter(|after| {
+            drained && reader.len == before.len() && metadata_stayed_stable(&before, after)
+        })
+        .map(|_| CodexEncodedIdentity {
+            len: reader.len,
+            digest: reader.hasher.finalize(),
+        });
+    Ok((RolloutBytes::Owned(decoded), identity))
+}
+
+fn verify_lineage_prefix(
+    path: &Path,
+    segment: &mut CodexSnapshotLineageSegment,
+) -> Result<bool, String> {
+    if !is_plain_rollout(path) {
+        if let Some(proof) = &segment.encoded_proof {
+            let (encoded, _) = map_rollout_bytes(path)?;
+            if proof.encoded_len == encoded.len() as u64 {
+                let identity = CodexEncodedIdentity {
+                    len: encoded.len() as u64,
+                    digest: hash_lineage_bytes(&encoded),
+                };
+                if identity
+                    .bind_prefix(segment.accepted_len, &segment.accepted_digest)
+                    .bound_digest
+                    == proof.bound_digest
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    let (bytes, identity) = read_rollout_bytes_for_lineage(path)?;
+    let Ok(accepted_len) = usize::try_from(segment.accepted_len) else {
+        return Ok(false);
+    };
+    if accepted_len > bytes.len()
+        || BASE64_URL_SAFE_NO_PAD.encode(hash_lineage_bytes(&bytes[..accepted_len]).as_bytes())
+            != segment.accepted_digest
+    {
+        return Ok(false);
+    }
+    segment.encoded_proof = identity
+        .map(|identity| identity.bind_prefix(segment.accepted_len, &segment.accepted_digest));
+    Ok(true)
 }
 
 #[allow(unsafe_code)] // Required for mmap performance optimization
@@ -2946,12 +3066,12 @@ fn append_rollout_lineage(
         .is_some()
         .then(|| fs::metadata(rollout_path).map_err(|error| error.to_string()))
         .transpose()?;
-    let bytes = if let Some(capture) = captured.as_deref_mut() {
+    let (bytes, encoded_identity) = if let Some(capture) = captured.as_deref_mut() {
         let bytes = read_rollout_bytes_bounded(rollout_path, capture.remaining_decoded_bytes)?;
         capture.remaining_decoded_bytes -= bytes.len();
-        bytes
+        (bytes, None)
     } else {
-        read_rollout_bytes(rollout_path)?
+        read_rollout_bytes_for_lineage(rollout_path)?
     };
     let header = parse_rollout_header(&bytes)?.ok_or_else(|| {
         format!(
@@ -2991,11 +3111,16 @@ fn append_rollout_lineage(
         None => bytes.len(),
     };
     output.extend_from_slice(&bytes[..cutoff]);
+    let accepted_len =
+        u64::try_from(cutoff).map_err(|_| "Codex rollout is too large to cursor".to_string())?;
+    let accepted_digest = digest_bytes(&bytes[..cutoff]);
+    let encoded_proof =
+        encoded_identity.map(|identity| identity.bind_prefix(accepted_len, &accepted_digest));
     segments.push(CodexSnapshotLineageSegment {
         canonical_path: rollout_path.to_string_lossy().into_owned(),
-        accepted_len: u64::try_from(cutoff)
-            .map_err(|_| "Codex rollout is too large to cursor".to_string())?,
-        accepted_digest: digest_bytes(&bytes[..cutoff]),
+        accepted_len,
+        accepted_digest,
+        encoded_proof,
     });
     if let (Some(captured), Some(metadata)) = (captured, metadata) {
         captured.carriers.push(CapturedCodexLineageCarrier {
@@ -4499,15 +4624,63 @@ fn digest_bytes(bytes: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(blake3::hash(bytes).as_bytes())
 }
 
+const MIN_PARALLEL_LINEAGE_HASH_BYTES: usize = 8 * 1024 * 1024;
+const LINEAGE_HASH_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+fn hash_lineage_bytes(bytes: &[u8]) -> blake3::Hash {
+    if bytes.len() < MIN_PARALLEL_LINEAGE_HASH_BYTES {
+        return blake3::hash(bytes);
+    }
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let Some(pool) = POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(8);
+        if threads <= 1 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok()
+    }) else {
+        return blake3::hash(bytes);
+    };
+    let mut hasher = blake3::Hasher::new();
+    // Bound parallel page faults to one ordered window instead of scattering
+    // reads across a gigabyte-scale mapping on cold Windows storage.
+    pool.install(|| {
+        for window in bytes.chunks(LINEAGE_HASH_WINDOW_BYTES) {
+            hasher.update_rayon(window);
+        }
+    });
+    hasher.finalize()
+}
+
 fn encode_snapshot_cursor(cursor: &CodexSnapshotCursor) -> Result<String, String> {
-    serde_json::to_vec(cursor)
+    let bytes = serde_json::to_vec(cursor)
+        .map_err(|error| format!("Failed to encode Codex snapshot cursor: {error}"))?;
+    let encoded = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+    if encoded.len() <= MAX_SNAPSHOT_CURSOR_BYTES {
+        return Ok(encoded);
+    }
+    let mut compact = serde_json::to_value(cursor)
+        .map_err(|error| format!("Failed to encode Codex snapshot cursor: {error}"))?;
+    if let Some(lineage) = compact.get_mut("lineage").and_then(Value::as_array_mut) {
+        for segment in lineage {
+            if let Some(segment) = segment.as_object_mut() {
+                segment.remove("encoded_proof");
+            }
+        }
+    }
+    serde_json::to_vec(&compact)
         .map(|bytes| BASE64_URL_SAFE_NO_PAD.encode(bytes))
         .map_err(|error| format!("Failed to encode Codex snapshot cursor: {error}"))
 }
 
 fn decode_snapshot_cursor(encoded: &str) -> Result<CodexSnapshotCursor, String> {
-    const MAX_CURSOR_BYTES: usize = 64 * 1024;
-    if encoded.len() > MAX_CURSOR_BYTES {
+    if encoded.len() > MAX_SNAPSHOT_CURSOR_BYTES {
         return Err("Codex snapshot cursor is too large".to_string());
     }
     let bytes = BASE64_URL_SAFE_NO_PAD
@@ -4588,7 +4761,7 @@ fn is_plain_rollout(path: &Path) -> bool {
 }
 
 #[allow(unsafe_code)] // Required for mmap performance optimization
-fn map_plain_rollout(path: &Path) -> Result<(Mmap, std::fs::Metadata), String> {
+fn map_rollout_bytes(path: &Path) -> Result<(Mmap, std::fs::Metadata), String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     // SAFETY: The file is opened read-only and the mapping is only read.
@@ -4709,7 +4882,7 @@ impl CodexReplayCapture {
         if before.len() > mapped_len || after.len() < mapped_len || after.len() <= before.len() {
             return Ok(false);
         }
-        let (confirmed, confirmation_before) = map_plain_rollout(path)?;
+        let (confirmed, confirmation_before) = map_rollout_bytes(path)?;
         if confirmation_before.len() < after.len()
             || accepted_end > confirmed.len()
             || digest_bytes(&confirmed[..accepted_end]) != expected_digest
@@ -4829,13 +5002,13 @@ fn load_paginated_snapshot(
     let Some(encoded_cursor) = encoded_cursor else {
         return complete_paginated_snapshot(canonical_path, "paginated-lineage".to_string());
     };
-    let cursor = match decode_snapshot_cursor(encoded_cursor) {
+    let mut cursor = match decode_snapshot_cursor(encoded_cursor) {
         Ok(cursor) => cursor,
         Err(_) => {
             return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
         }
     };
-    let Some(lineage) = cursor.lineage.clone() else {
+    let Some(mut lineage) = cursor.lineage.take() else {
         return complete_paginated_snapshot(canonical_path, "incompatible-cursor".to_string());
     };
     if cursor.version != SNAPSHOT_CURSOR_VERSION
@@ -4853,17 +5026,12 @@ fn load_paginated_snapshot(
     }
 
     let mut verified_ancestor_sources = Vec::with_capacity(lineage.len() - 1);
-    for segment in lineage.iter().take(lineage.len() - 1) {
+    let ancestor_count = lineage.len() - 1;
+    for segment in lineage.iter_mut().take(ancestor_count) {
         let segment_path =
             validate_session_path(Path::new(&segment.canonical_path), &segment.canonical_path)?;
         let before = fs::metadata(&segment_path).map_err(|error| error.to_string())?;
-        let bytes = read_rollout_bytes(&segment_path)?;
-        let Ok(accepted_len) = usize::try_from(segment.accepted_len) else {
-            return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
-        };
-        if accepted_len > bytes.len()
-            || digest_bytes(&bytes[..accepted_len]) != segment.accepted_digest
-        {
+        if !verify_lineage_prefix(&segment_path, segment)? {
             return complete_paginated_snapshot(
                 canonical_path,
                 "lineage-prefix-mismatch".to_string(),
@@ -4879,7 +5047,7 @@ fn load_paginated_snapshot(
         verified_ancestor_sources.push((segment_path, after));
     }
 
-    let (mmap, before) = map_plain_rollout(canonical_path)?;
+    let (mmap, before) = map_rollout_bytes(canonical_path)?;
     let Ok(accepted_len) = usize::try_from(cursor.accepted_len) else {
         return complete_paginated_snapshot(canonical_path, "invalid-cursor".to_string());
     };
@@ -4918,8 +5086,9 @@ fn load_paginated_snapshot(
                 "source-changed-during-read".to_string(),
             );
         }
+        cursor.lineage = Some(lineage);
         return Ok(SessionSnapshotLoad::Unchanged {
-            cursor: encoded_cursor.to_string(),
+            cursor: encode_snapshot_cursor(&cursor)?,
         });
     }
 
@@ -4976,8 +5145,9 @@ fn load_paginated_snapshot(
         );
     }
     if next_accepted_len == accepted_len {
+        cursor.lineage = Some(lineage);
         return Ok(SessionSnapshotLoad::Unchanged {
-            cursor: encoded_cursor.to_string(),
+            cursor: encode_snapshot_cursor(&cursor)?,
         });
     }
 
@@ -5044,7 +5214,7 @@ fn complete_snapshot_from_path(
         });
     }
 
-    let (mmap, before) = map_plain_rollout(canonical_path)?;
+    let (mmap, before) = map_rollout_bytes(canonical_path)?;
     let ranges = find_line_ranges(&mmap);
     let state = CodexParserState::initial(canonical_path);
     let checkpoint = CodexParserCheckpoint {
@@ -5139,7 +5309,7 @@ pub(crate) fn load_session_snapshot(
         return complete_snapshot_from_path(&canonical_path, "incompatible-cursor");
     }
 
-    let (mmap, before) = map_plain_rollout(&canonical_path)?;
+    let (mmap, before) = map_rollout_bytes(&canonical_path)?;
     let Ok(accepted_len) = usize::try_from(cursor.accepted_len) else {
         return complete_snapshot_from_path(&canonical_path, "invalid-cursor");
     };
@@ -9689,7 +9859,7 @@ mod tests {
             .unwrap()
             .write_all(&canonical.as_bytes()[..split])
             .unwrap();
-        let (mapped, before) = map_plain_rollout(&path).unwrap();
+        let (mapped, before) = map_rollout_bytes(&path).unwrap();
         let capture = CodexReplayCapture::new(
             &mapped,
             usize::try_from(cursor.checkpoint.byte_offset).unwrap(),
@@ -17597,6 +17767,333 @@ mod tests {
                     .contains("changed! ancestor"));
             }
             _ => panic!("a changed accepted ancestor prefix must use the complete fallback"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_certifies_compressed_ancestors() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        let compressed_path = PathBuf::from(format!("{}.zst", base_path.display()));
+        let encoded = zstd::encode_all(fs::read(&base_path).unwrap().as_slice(), 3).unwrap();
+        fs::write(&compressed_path, &encoded).unwrap();
+        fs::remove_file(&base_path).unwrap();
+        let (mut projected, cursor) =
+            match load_session_snapshot(&current_path.to_string_lossy(), None).unwrap() {
+                SessionSnapshotLoad::Full {
+                    messages,
+                    cursor: Some(cursor),
+                    ..
+                } => (messages, cursor),
+                _ => panic!("compressed ancestry must retain an incremental cursor"),
+            };
+        let decoded: Value =
+            serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(&cursor).unwrap()).unwrap();
+        let proof = &decoded["lineage"][0]["encoded_proof"];
+        assert_eq!(proof["encoded_len"], encoded.len());
+        let segment = &decode_snapshot_cursor(&cursor).unwrap().lineage.unwrap()[0];
+        let expected = CodexEncodedIdentity {
+            len: encoded.len() as u64,
+            digest: blake3::hash(&encoded),
+        }
+        .bind_prefix(segment.accepted_len, &segment.accepted_digest);
+        assert_eq!(proof["bound_digest"], expected.bound_digest);
+        COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(|count| count.set(0));
+        assert!(matches!(
+            load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor)).unwrap(),
+            SessionSnapshotLoad::Unchanged { .. }
+        ));
+        append_rollout_lines(
+            &current_path,
+            &[assistant_message_line(
+                "2026-09-03T22:23:00Z",
+                5,
+                "compressed ancestry append",
+            )],
+        );
+        match load_session_snapshot(&current_path.to_string_lossy(), Some(&cursor)).unwrap() {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                projected.splice(replace_from.., messages);
+            }
+            _ => panic!("an append must reuse compressed ancestry"),
+        }
+        assert_eq!(
+            COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(
+            message_values(&projected),
+            message_values(&finalize_loaded_messages(
+                parse_live_rollout(&current_path).unwrap()
+            ))
+        );
+    }
+
+    fn compressed_paginated_fixture(codex_home: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let (_, base, current) = write_paginated_rollout_pair(codex_home, false);
+        let decoded = fs::read(&base).unwrap();
+        let compressed = PathBuf::from(format!("{}.zst", base.display()));
+        fs::write(
+            &compressed,
+            zstd::encode_all(decoded.as_slice(), 3).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(base).unwrap();
+        (compressed, current, decoded)
+    }
+
+    fn paginated_fixture_cursor(path: &Path) -> String {
+        match load_session_snapshot(&path.to_string_lossy(), None).unwrap() {
+            SessionSnapshotLoad::Full {
+                cursor: Some(cursor),
+                ..
+            } => cursor,
+            _ => panic!("fixture must expose a cursor"),
+        }
+    }
+
+    fn assert_compressed_proof_upgrade(path: &Path, cursor: &str) -> String {
+        COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(|count| count.set(0));
+        let upgraded = match load_session_snapshot(&path.to_string_lossy(), Some(cursor)).unwrap() {
+            SessionSnapshotLoad::Unchanged { cursor } => cursor,
+            _ => panic!("an unchanged decoded prefix must remain incremental"),
+        };
+        assert_eq!(
+            COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(std::cell::Cell::get),
+            1
+        );
+        assert!(
+            decode_snapshot_cursor(&upgraded).unwrap().lineage.unwrap()[0]
+                .encoded_proof
+                .is_some()
+        );
+        COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(|count| count.set(0));
+        assert!(matches!(
+            load_session_snapshot(&path.to_string_lossy(), Some(&upgraded)).unwrap(),
+            SessionSnapshotLoad::Unchanged { .. }
+        ));
+        assert_eq!(
+            COMPRESSED_ROLLOUT_DECOMPRESSION_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        upgraded
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_upgrades_missing_or_invalid_compressed_proofs_on_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_, current, _) = compressed_paginated_fixture(&codex_home);
+        let original = paginated_fixture_cursor(&current);
+        for invalid in [
+            None,
+            Some(CodexCompressedPrefixProof {
+                encoded_len: u64::MAX,
+                bound_digest: "invalid".into(),
+            }),
+        ] {
+            let mut cursor = decode_snapshot_cursor(&original).unwrap();
+            cursor.lineage.as_mut().unwrap()[0].encoded_proof = invalid;
+            assert_compressed_proof_upgrade(&current, &encode_snapshot_cursor(&cursor).unwrap());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_recertifies_recompression_and_post_cutoff_frames() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (compressed, current, decoded) = compressed_paginated_fixture(&codex_home);
+        let cursor = paginated_fixture_cursor(&current);
+        let split = decoded.len() / 2;
+        let mut reframed = zstd::encode_all(&decoded[..split], 3).unwrap();
+        reframed.extend(zstd::encode_all(&decoded[split..], 3).unwrap());
+        fs::write(&compressed, &reframed).unwrap();
+        let cursor = assert_compressed_proof_upgrade(&current, &cursor);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&compressed)
+            .unwrap();
+        file.write_all(&zstd::encode_all(b"excluded post-cutoff frame\n".as_slice(), 3).unwrap())
+            .unwrap();
+        file.write_all(&[0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3])
+            .unwrap();
+        drop(file);
+        assert_compressed_proof_upgrade(&current, &cursor);
+        let messages = finalize_loaded_messages(parse_live_rollout(&current).unwrap());
+        assert!(!serde_json::to_string(&messages)
+            .unwrap()
+            .contains("excluded post-cutoff frame"));
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_rejects_same_size_same_mtime_compressed_prefix_rewrites() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (compressed, current, decoded) = compressed_paginated_fixture(&codex_home);
+        let changed = String::from_utf8(decoded.clone())
+            .unwrap()
+            .replace("retained ancestor", "changed! ancestor");
+        let mut original_encoded = zstd::encode_all(decoded.as_slice(), 3).unwrap();
+        let mut changed_encoded = zstd::encode_all(changed.as_bytes(), 3).unwrap();
+        let padded_len = original_encoded.len().max(changed_encoded.len()) + 64;
+        for encoded in [&mut original_encoded, &mut changed_encoded] {
+            let payload_len = padded_len - encoded.len() - 8;
+            encoded.extend([0x50, 0x2a, 0x4d, 0x18]);
+            encoded.extend((payload_len as u32).to_le_bytes());
+            encoded.resize(padded_len, 0);
+        }
+        fs::write(&compressed, original_encoded).unwrap();
+        let before = fs::metadata(&compressed).unwrap();
+        let cursor = paginated_fixture_cursor(&current);
+        fs::write(&compressed, changed_encoded).unwrap();
+        File::options()
+            .write(true)
+            .open(&compressed)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert!(metadata_stayed_stable(
+            &before,
+            &fs::metadata(&compressed).unwrap()
+        ));
+        match load_session_snapshot(&current.to_string_lossy(), Some(&cursor)).unwrap() {
+            SessionSnapshotLoad::Full {
+                reason, messages, ..
+            } => {
+                assert_eq!(reason, "lineage-prefix-mismatch");
+                assert_eq!(
+                    message_values(&messages),
+                    message_values(&finalize_loaded_messages(
+                        parse_live_rollout(&current).unwrap()
+                    ))
+                );
+                assert!(serde_json::to_string(&messages)
+                    .unwrap()
+                    .contains("changed! ancestor"));
+            }
+            _ => panic!("encoded content must be checked despite identical metadata"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_snapshot_binds_compressed_proofs_to_decoded_cursor_fields() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_, current, _) = compressed_paginated_fixture(&codex_home);
+        let original = paginated_fixture_cursor(&current);
+        for change_length in [true, false] {
+            let mut cursor = decode_snapshot_cursor(&original).unwrap();
+            let ancestor = &mut cursor.lineage.as_mut().unwrap()[0];
+            if change_length {
+                ancestor.accepted_len -= 1;
+            } else {
+                ancestor.accepted_digest = digest_bytes(b"wrong decoded prefix");
+            }
+            match load_session_snapshot(
+                &current.to_string_lossy(),
+                Some(&encode_snapshot_cursor(&cursor).unwrap()),
+            )
+            .unwrap()
+            {
+                SessionSnapshotLoad::Full { reason, .. } => {
+                    assert_eq!(reason, "lineage-prefix-mismatch");
+                }
+                _ => panic!("a compressed proof must not bypass changed decoded fields"),
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_lineage_reader_preserves_decoder_semantics_and_whole_encoded_identity() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl.zst");
+        let first = zstd::encode_all(b"first\n".as_slice(), 3).unwrap();
+        let mut concatenated = first.clone();
+        concatenated.extend(zstd::encode_all(b"second\n".as_slice(), 3).unwrap());
+        let mut skippable = concatenated.clone();
+        skippable.extend([0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 9, 8, 7]);
+        let mut invalid = first.clone();
+        invalid.extend(b"invalid trailing data");
+        for encoded in [first, concatenated, skippable, invalid] {
+            fs::write(&path, &encoded).unwrap();
+            match (
+                read_rollout_bytes(&path),
+                read_rollout_bytes_for_lineage(&path),
+            ) {
+                (Ok(ordinary), Ok((certified, Some(identity)))) => {
+                    assert_eq!(&*ordinary, &*certified);
+                    assert_eq!(identity.len, encoded.len() as u64);
+                    assert_eq!(identity.digest, blake3::hash(&encoded));
+                }
+                (Err(ordinary), Err(certified)) => assert_eq!(ordinary, certified),
+                _ => panic!("proof collection must preserve decoder acceptance"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn compressed_lineage_proofs_do_not_overflow_cursor_budget() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (_, current, _) = compressed_paginated_fixture(&codex_home);
+        let mut cursor = decode_snapshot_cursor(&paginated_fixture_cursor(&current)).unwrap();
+        let proof = cursor.lineage.as_mut().unwrap()[0]
+            .encoded_proof
+            .take()
+            .unwrap();
+        let mandatory_len = encode_snapshot_cursor(&cursor).unwrap().len();
+        let padding = ((MAX_SNAPSHOT_CURSOR_BYTES - mandatory_len) / 4) * 3 - 20;
+        cursor.lineage.as_mut().unwrap()[0]
+            .canonical_path
+            .push_str(&"x".repeat(padding));
+        let mandatory = encode_snapshot_cursor(&cursor).unwrap();
+        assert!(mandatory.len() <= MAX_SNAPSHOT_CURSOR_BYTES);
+        cursor.lineage.as_mut().unwrap()[0].encoded_proof = Some(proof);
+        let encoded = encode_snapshot_cursor(&cursor).unwrap();
+        assert!(encoded.len() <= MAX_SNAPSHOT_CURSOR_BYTES);
+        assert!(
+            decode_snapshot_cursor(&encoded).unwrap().lineage.unwrap()[0]
+                .encoded_proof
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lineage_hash_matches_serial_digest_across_parallel_and_window_boundaries() {
+        let bytes: Vec<u8> = (0..LINEAGE_HASH_WINDOW_BYTES * 2 + 31)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        for len in [
+            0,
+            1,
+            MIN_PARALLEL_LINEAGE_HASH_BYTES - 1,
+            MIN_PARALLEL_LINEAGE_HASH_BYTES,
+            MIN_PARALLEL_LINEAGE_HASH_BYTES + 1,
+            LINEAGE_HASH_WINDOW_BYTES + 17,
+            bytes.len(),
+        ] {
+            assert_eq!(
+                hash_lineage_bytes(&bytes[..len]),
+                blake3::hash(&bytes[..len]),
+                "length {len}"
+            );
         }
     }
 

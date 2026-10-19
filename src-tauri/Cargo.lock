@@ -531,6 +531,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -878,7 +879,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "claude-code-history-viewer"
-version = "1.29.4"
+version = "1.29.5"
 dependencies = [
  "aho-corasick",
  "anyhow",
