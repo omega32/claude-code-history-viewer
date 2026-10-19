@@ -44,7 +44,7 @@ const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const EXTERNAL_AGENT_IMPORTS_FILENAME: &str = "external_agent_session_imports.json";
 const SESSION_METADATA_CACHE_FILENAME: &str = ".claude-code-history-viewer-session-cache.json";
-const SESSION_METADATA_CACHE_VERSION: u32 = 3;
+const SESSION_METADATA_CACHE_VERSION: u32 = 4;
 const AUTHORED_USER_SUBTYPE: &str = "authored_user";
 const INJECTED_CONTEXT_SUBTYPE: &str = "injected_context";
 const HOOK_PROMPT_SUBTYPE: &str = "hook_prompt";
@@ -1815,10 +1815,19 @@ fn session_info_fingerprint(path: &Path) -> Option<SessionInfoFingerprint> {
 }
 
 fn session_metadata_cache_key(base_path: &Path, rollout_path: &Path) -> Option<String> {
-    rollout_path
+    let relative = rollout_path
         .strip_prefix(base_path)
+        .map(Path::to_path_buf)
         .ok()
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .or_else(|| {
+            rollout_path
+                .canonicalize()
+                .ok()?
+                .strip_prefix(base_path.canonicalize().ok()?)
+                .ok()
+                .map(Path::to_path_buf)
+        })?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn probe_cached_session_info(
@@ -2163,6 +2172,8 @@ pub(crate) struct SessionInfo {
     history_mode: Option<String>,
     #[serde(default)]
     history_base: Option<CodexHistoryBase>,
+    #[serde(default)]
+    first_ordinal: Option<u64>,
     pub(crate) cwd: Option<String>,
     /// Provider-qualified source from the rollout's first `session_meta`.
     /// User-facing surfaces are `codex-cli` / `codex-vscode`; structured
@@ -2431,7 +2442,19 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
     let old_cache = load_session_metadata_cache(&base_path);
     let mut next_cache = CodexSessionMetadataCache {
         version: SESSION_METADATA_CACHE_VERSION,
-        entries: HashMap::new(),
+        entries: old_cache
+            .entries
+            .iter()
+            .filter(|(key, _)| {
+                key.strip_prefix("prefix:")
+                    .and_then(|key| key.splitn(3, ':').nth(2))
+                    .is_some_and(|relative| {
+                        let path = base_path.join(relative);
+                        path.is_file() && is_discoverable_rollout(&path)
+                    })
+            })
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect(),
     };
     let roots = [
         (base_path.join("sessions"), false),
@@ -2623,6 +2646,7 @@ pub(crate) fn load_session_metadata_by_path(
     {
         return Ok(None);
     }
+    let info = logical_session_info(&base_path, info, &mut next_cache, &mut HashSet::new())?;
     let project_path = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
     let title_index = load_native_title_index(&base_path_string);
     let session = session_from_info(info, &project_path, &title_index);
@@ -2648,7 +2672,7 @@ pub(crate) fn load_session_metadata_by_id(
     let base_path = PathBuf::from(&base_path_string);
 
     if let Some(selection) = load_sqlite_rollout_selections(&base_path).get(session_id) {
-        let selected_path = normalize_sqlite_rollout_path(&selection.rollout_path);
+        let selected_path = resolve_sqlite_rollout_path(&selection.rollout_path);
         if selected_path.is_file() {
             if let Ok(Some(listing)) =
                 load_session_metadata_by_path(&selected_path.to_string_lossy())
@@ -2830,9 +2854,11 @@ pub(crate) fn load_session_subagent_relations(
     }
     for (session_id, mut pages) in paginated {
         if let Some(selection) = selections.get(&session_id) {
-            if let Some(index) = pages.iter().position(|candidate| {
-                rollout_paths_match(&candidate.rollout_path, &selection.rollout_path)
-            }) {
+            let selected_path = resolve_sqlite_rollout_path(&selection.rollout_path);
+            if let Some(index) = pages
+                .iter()
+                .position(|candidate| rollout_paths_match(&candidate.rollout_path, &selected_path))
+            {
                 current.push(pages.swap_remove(index));
                 continue;
             }
@@ -5828,6 +5854,28 @@ fn normalize_sqlite_rollout_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn resolve_sqlite_rollout_path(path: &Path) -> PathBuf {
+    let path = normalize_sqlite_rollout_path(path);
+    if !is_plain_rollout(&path) && is_rollout_jsonl(&path) {
+        let plain = path.with_extension("");
+        if fs::symlink_metadata(&plain).is_ok() {
+            return plain;
+        }
+    }
+    // Cold compression retains SQLite's plain path. Resolve only that exact
+    // carrier's twin; a missing selected page must never revive an older page.
+    if is_plain_rollout(&path)
+        && fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        let compressed = path.with_extension("jsonl.zst");
+        if compressed.is_file() {
+            return compressed;
+        }
+    }
+    path
+}
+
 fn rollout_paths_match(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -5871,8 +5919,9 @@ fn select_current_session_infos(
 
     for (thread_id, mut pages) in paginated {
         if let Some(selection) = selections.get(&thread_id) {
+            let selected_path = resolve_sqlite_rollout_path(&selection.rollout_path);
             if let Some(index) = pages.iter().position(|(info, _)| {
-                rollout_paths_match(Path::new(&info.file_path), &selection.rollout_path)
+                rollout_paths_match(Path::new(&info.file_path), &selected_path)
             }) {
                 legacy.push(pages.swap_remove(index));
                 continue;
@@ -5888,20 +5937,119 @@ fn select_current_session_infos(
             legacy.push(selected);
         }
     }
+    let mut cache = load_session_metadata_cache(base_path);
     legacy
+        .into_iter()
+        .filter_map(|(info, archived)| {
+            logical_session_info(base_path, info, &mut cache, &mut HashSet::new())
+                .ok()
+                .map(|info| (info, archived))
+        })
+        .collect()
+}
+
+fn bounded_session_info(
+    base_path: &Path,
+    path: &Path,
+    bound: &CodexHistoryBase,
+    cache: &mut CodexSessionMetadataCache,
+) -> Result<SessionInfo, String> {
+    let relative = session_metadata_cache_key(base_path, path)
+        .ok_or("Codex metadata ancestor is outside its storage root")?;
+    let key = format!(
+        "prefix:{}:{}:{relative}",
+        bound.end_byte_offset, bound.end_ordinal_exclusive
+    );
+    let before = session_info_fingerprint(path);
+    if let Some(hit) = cache.entries.get(&key) {
+        if Some(hit.fingerprint) == before {
+            let mut info = hit.info.clone();
+            info.file_path = path.to_string_lossy().into_owned();
+            return Ok(info);
+        }
+    }
+    let bytes = read_rollout_bytes(path)?;
+    let header =
+        parse_rollout_header(&bytes)?.ok_or("Codex metadata ancestor has no session_meta")?;
+    let identity =
+        rollout_file_identity(path).ok_or("Codex metadata ancestor has no physical id")?;
+    let cutoff = validate_history_cutoff(&identity.rollout_id, &bytes, bound)?;
+    let mut info = extract_session_info_from_bytes(path, &bytes[..cutoff])?;
+    info.session_id = header.session_id;
+    info.history_mode = header.history_mode;
+    info.history_base = header.history_base;
+    info.first_ordinal = header.first_ordinal;
+    let after = session_info_fingerprint(path);
+    if before.is_none() || before != after {
+        return Err("Codex metadata ancestor changed while reading".to_string());
+    }
+    let entry = CachedSessionInfo {
+        fingerprint: after.ok_or("Codex metadata ancestor has no fingerprint")?,
+        info: info.clone(),
+    };
+    merge_session_metadata_cache_entry(base_path, path, key.clone(), entry.clone());
+    cache.entries.insert(key, entry);
+    Ok(info)
+}
+
+fn logical_session_info(
+    base_path: &Path,
+    mut info: SessionInfo,
+    cache: &mut CodexSessionMetadataCache,
+    seen: &mut HashSet<String>,
+) -> Result<SessionInfo, String> {
+    if info.history_mode.as_deref() != Some("paginated") {
+        return Ok(info);
+    }
+    let identity = rollout_file_identity(Path::new(&info.file_path))
+        .ok_or("Codex metadata carrier has no physical id")?;
+    if identity.thread_id != info.session_id {
+        return Err("Codex metadata carrier disagrees with session_meta".to_string());
+    }
+    if seen.len() >= 128 || !seen.insert(identity.rollout_id) {
+        return Err(
+            "Codex metadata lineage contains a cycle or exceeds its depth limit".to_string(),
+        );
+    }
+    let Some(bound) = info.history_base.as_ref() else {
+        return Ok(info);
+    };
+    if info.first_ordinal != Some(bound.end_ordinal_exclusive) {
+        return Err("Codex metadata continuation starts at an inconsistent ordinal".to_string());
+    }
+    let ancestor_path =
+        normalize_sqlite_rollout_path(&find_rollout_path_by_id(base_path, &bound.thread_id)?);
+    let ancestor = bounded_session_info(base_path, &ancestor_path, bound, cache)?;
+    if ancestor.history_mode.as_deref() != Some("paginated") {
+        return Err("Codex metadata lineage contains a non-paginated rollout".to_string());
+    }
+    let ancestor = logical_session_info(base_path, ancestor, cache, seen)?;
+    info.message_count = info
+        .message_count
+        .checked_add(ancestor.message_count)
+        .ok_or("Codex metadata message count overflow")?;
+    if !ancestor.first_message_time.is_empty() {
+        info.first_message_time = ancestor.first_message_time;
+    }
+    if info.last_message_time.is_empty() {
+        info.last_message_time = ancestor.last_message_time;
+    }
+    info.has_tool_use |= ancestor.has_tool_use;
+    Ok(info)
 }
 
 fn is_current_paginated_rollout(base_path: &Path, info: &SessionInfo) -> bool {
     let candidate_path = Path::new(&info.file_path);
     let selections = load_sqlite_rollout_selections(base_path);
     if let Some(selection) = selections.get(&info.session_id) {
-        if selection.rollout_path.is_file()
-            && read_rollout_header(&selection.rollout_path)
+        let selected_path = resolve_sqlite_rollout_path(&selection.rollout_path);
+        if selected_path.is_file()
+            && read_rollout_header(&selected_path)
                 .ok()
                 .flatten()
                 .is_some_and(|header| header.session_id == info.session_id)
         {
-            return rollout_paths_match(candidate_path, &selection.rollout_path);
+            return rollout_paths_match(candidate_path, &selected_path);
         }
         if selection.history_mode.as_deref() == Some("paginated") {
             return false;
@@ -6143,16 +6291,24 @@ fn load_session_index_names(base_path: &str) -> HashMap<String, IndexedName> {
 
 #[allow(unsafe_code)] // Required for mmap performance optimization
 pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, String> {
+    let mmap = read_rollout_bytes(rollout_path)?;
+    extract_session_info_from_bytes(rollout_path, &mmap)
+}
+
+fn extract_session_info_from_bytes(
+    rollout_path: &Path,
+    mmap: &[u8],
+) -> Result<SessionInfo, String> {
     #[cfg(test)]
     SESSION_INFO_PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
-    let mmap = read_rollout_bytes(rollout_path)?;
-    let ranges = find_line_ranges(&mmap);
+    let ranges = find_line_ranges(mmap);
 
     let mut session_id = String::new();
     let rollout_id = rollout_file_identity(rollout_path).map(|identity| identity.rollout_id);
     let mut meta_seen = false;
     let mut history_mode = None;
     let mut history_base = None;
+    let mut first_ordinal = None;
     let mut cwd = None;
     let mut source = None;
     let mut forked_from_id = None;
@@ -6184,6 +6340,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
             // the source cwd (issue #451).
             "session_meta" if !meta_seen => {
                 meta_seen = true;
+                first_ordinal = val.get("ordinal").and_then(Value::as_u64);
                 if let Some(payload) = val.get("payload") {
                     session_id = payload
                         .get("id")
@@ -6319,6 +6476,7 @@ pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, S
         rollout_id,
         history_mode,
         history_base,
+        first_ordinal,
         cwd,
         entrypoint: codex_entrypoint(source.as_ref()),
         forked_from_id,
@@ -17591,6 +17749,11 @@ mod tests {
         let sessions = load_all_sessions().expect("paginated listing should succeed");
         assert_eq!(sessions.len(), 1, "one logical thread must have one row");
         assert_eq!(sessions[0].session.actual_session_id, thread_id);
+        assert_eq!(sessions[0].session.message_count, 2);
+        assert_eq!(
+            sessions[0].session.first_message_time,
+            "2026-09-03T19:40:00Z"
+        );
         assert!(rollout_paths_match(
             Path::new(&sessions[0].session.file_path),
             &current_path
@@ -18401,6 +18564,108 @@ mod tests {
                 .expect("newer stale carrier lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_metadata_preserves_compressed_sqlite_selection_and_bounded_counts() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (thread_id, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        create_paginated_state_db(&codex_home, &thread_id, &current_path);
+        let compressed = current_path.with_extension("jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::encode_all(fs::read(&current_path).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&current_path).unwrap();
+
+        let cold = load_all_sessions().unwrap();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].session.message_count, 2);
+        assert_eq!(cold[0].session.first_message_time, "2026-09-03T19:40:00Z");
+        assert!(rollout_paths_match(
+            Path::new(&cold[0].session.file_path),
+            &compressed
+        ));
+        let parses = SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst);
+        let warm = load_all_sessions().unwrap();
+        assert_eq!(warm[0].session.message_count, 2);
+        assert_eq!(SESSION_INFO_PARSE_COUNT.load(Ordering::SeqCst), parses);
+        let targeted = load_session_metadata_by_id(&thread_id).unwrap().unwrap();
+        assert_eq!(targeted.session.message_count, 2);
+        assert!(load_session_metadata_by_path(&base_path.to_string_lossy())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            scan_projects_from_path(&codex_home.to_string_lossy()).unwrap()[0].message_count,
+            2
+        );
+        assert_eq!(
+            load_sessions("codex://C:/Repo", false).unwrap()[0].message_count,
+            2
+        );
+        assert_eq!(
+            load_messages(&compressed.to_string_lossy()).unwrap().len(),
+            load_messages(&targeted.session.file_path).unwrap().len()
+        );
+        fs::write(
+            &current_path,
+            zstd::decode_all(fs::read(&compressed).unwrap().as_slice()).unwrap(),
+        )
+        .unwrap();
+        let conn = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = ?2",
+            rusqlite::params![compressed.to_string_lossy(), thread_id],
+        )
+        .unwrap();
+        let materialized = load_all_sessions().unwrap();
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].session.message_count, 2);
+        assert!(rollout_paths_match(
+            Path::new(&materialized[0].session.file_path),
+            &current_path
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn paginated_metadata_refreshes_ancestor_proofs_without_counting_excluded_tools() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let (thread_id, base_path, current_path) = write_paginated_rollout_pair(&codex_home, false);
+        create_paginated_state_db(&codex_home, &thread_id, &current_path);
+        append_rollout_lines(
+            &base_path,
+            &[json!({
+                "timestamp": "2099-01-01T00:00:00Z", "ordinal": 3,
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": "shell", "arguments": "{}"}
+            })],
+        );
+        let first = load_all_sessions().unwrap();
+        assert_eq!(first[0].session.message_count, 2);
+        assert!(!first[0].session.has_tool_use);
+        assert_eq!(first[0].session.last_message_time, "2026-09-03T22:22:00Z");
+        let previous = fs::metadata(&base_path).unwrap().modified().unwrap();
+        let changed = fs::read_to_string(&base_path)
+            .unwrap()
+            .replace("2026-09-03T19:40:00Z", "2026-09-03T19:39:59Z");
+        fs::write(&base_path, changed).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&base_path)
+            .unwrap()
+            .set_modified(previous + std::time::Duration::from_secs(2))
+            .unwrap();
+        let targeted = load_session_metadata_by_id(&thread_id).unwrap().unwrap();
+        assert_eq!(targeted.session.first_message_time, "2026-09-03T19:39:59Z");
+        assert_eq!(targeted.session.message_count, 2);
+        assert!(!targeted.session.has_tool_use);
     }
 
     #[test]
