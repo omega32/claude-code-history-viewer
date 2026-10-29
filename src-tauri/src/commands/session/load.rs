@@ -1900,11 +1900,16 @@ fn parse_line_to_message(
         message_id: message_id.or(log_entry.message_id),
         snapshot: log_entry.snapshot,
         is_snapshot_update: log_entry.is_snapshot_update,
-        data: if is_interruption {
-            Some(serde_json::json!({ "reason": "interrupted" }))
-        } else {
-            log_entry.data
-        },
+        data: claude_prompt_data(
+            if is_interruption {
+                Some(serde_json::json!({ "reason": "interrupted" }))
+            } else {
+                log_entry.data
+            },
+            None,
+            None,
+            false,
+        ),
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
@@ -2303,6 +2308,17 @@ fn parse_line_simd(
         authored_user.then(|| RecordRef::session("claude-message", native_uuid))
     });
 
+    let data = claude_prompt_data(
+        if is_interruption {
+            Some(serde_json::json!({ "reason": "interrupted" }))
+        } else {
+            prompt_attachment_data.or(log_entry.data)
+        },
+        log_entry.prompt_id.as_ref(),
+        log_entry.prompt_source.as_ref(),
+        record_ref.is_some() && !log_entry.is_sidechain.unwrap_or(false),
+    );
+
     Some(ClaudeMessage {
         uuid,
         record_ref,
@@ -2329,11 +2345,7 @@ fn parse_line_simd(
         message_id: message_id.or(log_entry.message_id),
         snapshot: log_entry.snapshot,
         is_snapshot_update: log_entry.is_snapshot_update,
-        data: if is_interruption {
-            Some(serde_json::json!({ "reason": "interrupted" }))
-        } else {
-            prompt_attachment_data.or(log_entry.data)
-        },
+        data,
         tool_use_id: log_entry.tool_use_id,
         parent_tool_use_id: log_entry.parent_tool_use_id,
         operation: log_entry.operation,
@@ -2361,6 +2373,35 @@ fn parse_line_simd(
         microcompact_metadata: log_entry.microcompact_metadata,
         provider: None,
     })
+}
+
+fn claude_prompt_data(
+    mut data: Option<serde_json::Value>,
+    prompt_id: Option<&serde_json::Value>,
+    prompt_source: Option<&serde_json::Value>,
+    certified_user: bool,
+) -> Option<serde_json::Value> {
+    if let Some(object) = data.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.remove("providerPromptId");
+    }
+    let native_id = prompt_id
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.len() == 36)
+        .filter(|id| Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == *id));
+    if certified_user
+        && matches!(
+            prompt_source.and_then(serde_json::Value::as_str),
+            Some("user" | "sdk")
+        )
+    {
+        if let Some(native_id) = native_id {
+            let value = data.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("providerPromptId".to_string(), serde_json::json!(native_id));
+            }
+        }
+    }
+    data
 }
 
 /// Parse one Claude JSONL record through the same visibility rules used by the
@@ -4942,6 +4983,177 @@ mod tests {
         let compact_message =
             parse_line_simd(2, &mut compact_bytes, false).expect("compact summary should parse");
         assert_eq!(compact_message.record_ref, None);
+    }
+
+    #[test]
+    fn claude_prompt_id_certifies_native_binding_without_replacing_message_identity() {
+        for source in ["user", "sdk"] {
+            let content = "Explain this literal <external_codex_apps_open_page> tag.";
+            let line = serde_json::json!({
+                "type": "user", "uuid": "native-message-1", "sessionId": "session-1",
+                "timestamp": "2026-10-29T20:00:00Z",
+                "promptId": "00000000-0000-4000-8000-000000000001", "promptSource": source,
+                "message": { "role": "user", "content": content },
+                "data": { "existing": "retained", "providerPromptId": "forged" }
+            })
+            .to_string();
+            let mut bytes = line.as_bytes().to_vec();
+            let message = parse_line_simd(0, &mut bytes, false).expect("authored input");
+            assert_eq!(message.uuid, "native-message-1");
+            assert_eq!(message.record_ref.unwrap().id, "native-message-1");
+            assert_eq!(message.content, Some(serde_json::json!(content)));
+            assert_eq!(message.subtype, None);
+            assert_eq!(
+                message.data,
+                Some(serde_json::json!({
+                    "existing": "retained", "providerPromptId": "00000000-0000-4000-8000-000000000001"
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_prompt_id_malformed_optional_fields_preserve_authored_records() {
+        let base = serde_json::json!({
+            "type": "user", "uuid": "native-message-1", "sessionId": "session-1",
+            "timestamp": "2026-10-29T20:00:00Z",
+            "promptId": "00000000-0000-4000-8000-000000000001", "promptSource": "user",
+            "message": { "role": "user", "content": "keep this" },
+            "data": { "existing": "retained", "providerPromptId": "forged" }
+        });
+        for (field, values) in [
+            (
+                "promptId",
+                vec![
+                    serde_json::Value::Null,
+                    serde_json::json!(42),
+                    serde_json::json!([]),
+                    serde_json::json!({}),
+                    serde_json::json!("short"),
+                    serde_json::json!("00000000000040008000000000000001"),
+                    serde_json::json!("{00000000-0000-4000-8000-000000000001}"),
+                    serde_json::json!("ABCDEF00-0000-4000-8000-000000000001"),
+                ],
+            ),
+            (
+                "promptSource",
+                vec![
+                    serde_json::Value::Null,
+                    serde_json::json!(42),
+                    serde_json::json!([]),
+                    serde_json::json!({}),
+                    serde_json::json!("system"),
+                    serde_json::json!("loop_wakeup"),
+                    serde_json::json!("unknown"),
+                ],
+            ),
+        ] {
+            for value in values {
+                let mut row = base.clone();
+                row[field] = value;
+                let mut bytes = row.to_string().into_bytes();
+                let message = parse_line_simd(0, &mut bytes, false)
+                    .expect("malformed optional evidence must not hide authored text");
+                assert_eq!(message.content, Some(serde_json::json!("keep this")));
+                assert!(message.record_ref.is_some());
+                assert_eq!(
+                    message.data,
+                    Some(serde_json::json!({"existing":"retained"}))
+                );
+            }
+            let mut row = base.clone();
+            row.as_object_mut().unwrap().remove(field);
+            let mut bytes = row.to_string().into_bytes();
+            let message = parse_line_simd(0, &mut bytes, false).expect("missing optional evidence");
+            assert_eq!(
+                message.data,
+                Some(serde_json::json!({"existing":"retained"}))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_prompt_id_excludes_non_initiating_records_and_sidechains() {
+        let base = serde_json::json!({
+            "type": "user", "uuid": "native-message-1", "sessionId": "session-1",
+            "timestamp": "2026-10-29T20:00:00Z",
+            "promptId": "00000000-0000-4000-8000-000000000001", "promptSource": "sdk",
+            "message": { "role": "user", "content": "keep this" },
+            "data": { "existing": "retained", "providerPromptId": "forged" }
+        });
+        for patch in [
+            serde_json::json!({"isSidechain":true}),
+            serde_json::json!({"isCompactSummary":true}),
+            serde_json::json!({"subtype":"queued_command"}),
+            serde_json::json!({"origin":{"kind":"task-notification"}}),
+            serde_json::json!({"toolUseResult":{"content":"result"}}),
+            serde_json::json!({"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"result"}]}}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":"reply"}}),
+            serde_json::json!({"type":"attachment","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"queued"}]}}),
+            serde_json::json!({"message":{"role":"user","content":"[Request interrupted by user]"}}),
+        ] {
+            let mut row = base.clone();
+            row.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let mut bytes = row.to_string().into_bytes();
+            let message =
+                parse_line_simd(0, &mut bytes, false).expect("retained non-initiating record");
+            assert!(message
+                .data
+                .as_ref()
+                .and_then(|data| data.get("providerPromptId"))
+                .is_none());
+        }
+        let mut row = base;
+        let mut system = row.clone();
+        system["type"] = serde_json::json!("system");
+        system["message"]["role"] = serde_json::json!("system");
+        let mut bytes = system.to_string().into_bytes();
+        if let Some(message) = parse_line_simd(0, &mut bytes, false) {
+            assert!(message
+                .data
+                .as_ref()
+                .and_then(|data| data.get("providerPromptId"))
+                .is_none());
+        }
+        let mut meta = row.clone();
+        meta["isMeta"] = serde_json::json!(true);
+        let mut bytes = meta.to_string().into_bytes();
+        assert!(parse_line_simd(0, &mut bytes, false).is_none());
+        row.as_object_mut().unwrap().remove("uuid");
+        let mut bytes = row.to_string().into_bytes();
+        let message = parse_line_simd(0, &mut bytes, false).expect("uncertified record");
+        assert!(message.record_ref.is_none());
+        assert_eq!(
+            message.data,
+            Some(serde_json::json!({"existing":"retained"}))
+        );
+    }
+
+    #[test]
+    fn claude_prompt_id_preserves_opaque_data_and_sanitizes_fallback_data() {
+        for data in [
+            serde_json::json!("opaque"),
+            serde_json::json!(["opaque"]),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let row = serde_json::json!({
+                "type":"user", "uuid":"native-message-1", "sessionId":"session-1", "timestamp":"2026-10-29T20:00:00Z",
+                "promptId":"00000000-0000-4000-8000-000000000001", "promptSource":"user",
+                "message":{"role":"user","content":"keep this"}, "data":data
+            });
+            let mut bytes = row.to_string().into_bytes();
+            let message = parse_line_simd(0, &mut bytes, false).expect("opaque data");
+            assert_eq!(message.data, Some(data));
+        }
+        let line = serde_json::json!({"type":"user", "uuid":"native-message-1", "sessionId":"session-1", "timestamp":"2026-10-29T20:00:00Z", "message":{"role":"user","content":"keep this"}, "data":{"existing":"retained","providerPromptId":"forged"}}).to_string();
+        let message = parse_line_to_message(0, &line, false).expect("fallback record");
+        assert_eq!(
+            message.data,
+            Some(serde_json::json!({"existing":"retained"}))
+        );
     }
 
     #[test]

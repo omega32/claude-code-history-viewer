@@ -4108,6 +4108,8 @@ mod tests {
     /// Verify try from raw log entry user message.
     fn test_try_from_raw_log_entry_user_message() {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: Some("test-uuid".to_string()),
             parent_uuid: Some("parent-uuid".to_string()),
             session_id: Some("session-123".to_string()),
@@ -4167,6 +4169,8 @@ mod tests {
     /// Verify try from raw log entry assistant message.
     fn test_try_from_raw_log_entry_assistant_message() {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: Some("assistant-uuid".to_string()),
             parent_uuid: None,
             session_id: Some("session-123".to_string()),
@@ -4237,6 +4241,8 @@ mod tests {
     /// Verify try from raw log entry summary fails.
     fn test_try_from_raw_log_entry_summary_fails() {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: None,
             parent_uuid: None,
             session_id: None,
@@ -4284,6 +4290,8 @@ mod tests {
     /// Verify try from raw log entry missing session and timestamp fails.
     fn test_try_from_raw_log_entry_missing_session_and_timestamp_fails() {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: Some("uuid".to_string()),
             parent_uuid: None,
             session_id: None,
@@ -4338,6 +4346,8 @@ mod tests {
     /// Verify try from raw log entry with only timestamp.
     fn test_try_from_raw_log_entry_with_only_timestamp() {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: None,
             parent_uuid: None,
             session_id: None,
@@ -6046,6 +6056,8 @@ mod tests {
         usage: TokenUsage,
     ) -> ClaudeMessage {
         let raw = RawLogEntry {
+            prompt_id: None,
+            prompt_source: None,
             uuid: Some(uuid.to_string()),
             parent_uuid: None,
             session_id: Some(session_id.to_string()),

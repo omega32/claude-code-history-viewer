@@ -222,6 +222,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "codex-session-subagents-v1",
             "codex-subagent-activity-v1",
             "stable-record-ref-v1",
+            "claude-prompt-id-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
             "hermes-backup-v1",
@@ -2477,6 +2478,7 @@ mod tests {
                 "codex-session-subagents-v1",
                 "codex-subagent-activity-v1",
                 "stable-record-ref-v1",
+                "claude-prompt-id-v1",
                 "supplemental-history-v1",
                 "claude-session-archive-v1",
                 "hermes-backup-v1"

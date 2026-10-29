@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-const SNAPSHOT_CURSOR_VERSION: u32 = 2;
+const SNAPSHOT_CURSOR_VERSION: u32 = 3;
 
 /// Detect Claude Code installation
 pub fn detect() -> Option<ProviderInfo> {
@@ -658,6 +658,88 @@ mod tests {
             SessionSnapshotLoad::Full { messages, .. } => messages,
             _ => panic!("initial load must be complete"),
         }
+    }
+
+    #[test]
+    fn prompt_id_full_and_incremental_normalization_preserve_native_bindings() {
+        let prompt_id = "00000000-0000-4000-8000-000000000001";
+        let authored = |uuid: &str, parent: Option<&str>, text: &str| {
+            let mut row: Value = serde_json::from_str(&user(uuid, parent, text)).unwrap();
+            row["promptId"] = serde_json::json!(prompt_id);
+            row["promptSource"] = serde_json::json!("user");
+            row.to_string()
+        };
+        let mut file = write_lines(&[
+            authored("u1", None, "one"),
+            assistant("a1", "u1", serde_json::json!("answer one")),
+            authored("u2", Some("a1"), "two"),
+            assistant("a2", "u2", serde_json::json!("answer two")),
+        ]);
+        let path = file.path().to_string_lossy().into_owned();
+        let (initial, cursor) = match load_session_snapshot(&path, None).expect("initial") {
+            SessionSnapshotLoad::Full {
+                messages,
+                cursor: Some(cursor),
+                ..
+            } => (messages, cursor),
+            _ => panic!("initial full snapshot"),
+        };
+        let bound: Vec<_> = initial
+            .iter()
+            .filter(|message| {
+                message
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("providerPromptId"))
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(bound.len(), 2);
+        assert_ne!(bound[0].record_ref, bound[1].record_ref);
+        assert_eq!(
+            bound[0].data.as_ref().unwrap()["providerPromptId"],
+            prompt_id
+        );
+        assert_eq!(
+            bound[1].data.as_ref().unwrap()["providerPromptId"],
+            prompt_id
+        );
+
+        let mut old = decode_snapshot_cursor(&cursor).expect("decode cursor");
+        old.version = 2;
+        match load_session_snapshot(&path, Some(&encode_snapshot_cursor(&old).unwrap()))
+            .expect("old cursor")
+        {
+            SessionSnapshotLoad::Full {
+                messages, reason, ..
+            } => {
+                assert_eq!(reason, "incompatible-cursor");
+                assert_eq!(
+                    serde_json::to_value(messages).unwrap(),
+                    serde_json::to_value(&initial).unwrap()
+                );
+            }
+            _ => panic!("pre-prompt-proof cursors require a full projection"),
+        }
+
+        writeln!(file, "{}", authored("u3", Some("a2"), "three")).unwrap();
+        file.flush().unwrap();
+        let mut applied = initial;
+        match load_session_snapshot(&path, Some(&cursor)).expect("append") {
+            SessionSnapshotLoad::Replace {
+                replace_from,
+                messages,
+                ..
+            } => {
+                applied.truncate(replace_from);
+                applied.extend(messages);
+            }
+            _ => panic!("safe append must preserve incremental projection"),
+        }
+        assert_eq!(
+            serde_json::to_value(applied).unwrap(),
+            serde_json::to_value(load_complete_messages(file.path()).unwrap()).unwrap()
+        );
     }
 
     #[test]

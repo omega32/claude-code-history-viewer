@@ -102,6 +102,11 @@ pub struct MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawLogEntry {
     pub uuid: Option<String>,
+    // These optional proof fields stay untyped so malformed native metadata cannot erase authored text.
+    #[serde(rename = "promptId", skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<serde_json::Value>,
+    #[serde(rename = "promptSource", skip_serializing_if = "Option::is_none")]
+    pub prompt_source: Option<serde_json::Value>,
     #[serde(rename = "parentUuid")]
     pub parent_uuid: Option<String>,
     #[serde(rename = "sessionId")]
