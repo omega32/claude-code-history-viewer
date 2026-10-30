@@ -52,8 +52,6 @@ use walkdir::WalkDir;
 
 mod prompt_candidates;
 pub use prompt_candidates::run_dump_session_prompt_candidates;
-#[cfg(test)]
-pub(crate) use prompt_candidates::{prototype_select_candidates, prototype_valid_record_ref};
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
@@ -233,7 +231,10 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "supplemental-history-v1",
             "claude-session-archive-v1",
             "hermes-backup-v1",
-        ],
+        ]
+        .into_iter()
+        .chain(cfg!(windows).then_some("codex-prompt-state-cache-v1"))
+        .collect(),
     };
     emit_json(args, &caps)
 }
@@ -2478,20 +2479,21 @@ mod tests {
         let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(value["api_version"], HEADLESS_API_VERSION);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(
-            value["features"],
-            json!([
-                "image-artifacts-v1",
-                "codex-session-subagents-v1",
-                "codex-subagent-activity-v1",
-                "stable-record-ref-v1",
-                "claude-prompt-id-v1",
-                "prompt-candidates-v1",
-                "supplemental-history-v1",
-                "claude-session-archive-v1",
-                "hermes-backup-v1"
-            ])
-        );
+        let expected_features = vec![
+            "image-artifacts-v1",
+            "codex-session-subagents-v1",
+            "codex-subagent-activity-v1",
+            "stable-record-ref-v1",
+            "claude-prompt-id-v1",
+            "prompt-candidates-v1",
+            "supplemental-history-v1",
+            "claude-session-archive-v1",
+            "hermes-backup-v1",
+        ]
+        .into_iter()
+        .chain(cfg!(windows).then_some("codex-prompt-state-cache-v1"))
+        .collect::<Vec<_>>();
+        assert_eq!(value["features"], json!(expected_features));
         assert_eq!(
             value["commands"],
             json!([

@@ -1,6 +1,12 @@
+use super::super::{
+    is_canonical_session_id, is_plain_rollout, metadata_stayed_stable, parse_rollout_header,
+};
 use super::*;
+use crate::utils::is_symlink_or_reparse;
 use serde_json::json;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Component;
 use std::time::Instant;
 
 #[derive(Deserialize)]

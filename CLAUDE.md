@@ -37,7 +37,9 @@ The headless dump contract stamps provider-generated terminal cancellation as `s
 
 ### Prompt candidate transport
 
-The additive `prompt-candidates-v1` feature and `--dump-session-prompt-candidates` command return exact normalized Codex/Claude initiating candidates for one to eight explicit task UUIDs after complete ordinary loading and all-record reference collision checks. Preserve unreferenced/duplicate candidates and sidechain metadata; cleanup and final selection remain consumer-owned. Strict options, validator parity, create-new output and performance scope are owned by `specs/2026-10-30-prompt-candidate-transport/`. Ordinary dumps and provider replay remain unchanged.
+By default, the additive `prompt-candidates-v1` feature and `--dump-session-prompt-candidates` command return exact normalized Codex/Claude initiating candidates for one to eight explicit task UUIDs after complete ordinary loading and all-record reference collision checks. Preserve unreferenced/duplicate candidates and sidechain metadata; cleanup and final selection remain consumer-owned. Strict options, validator parity, create-new output and performance scope are owned by `specs/2026-10-30-prompt-candidate-transport/`. Ordinary dumps and provider replay remain unchanged.
+
+On Windows, `codex-prompt-state-cache-v1` advertises the optional bare `--prompt-state-cache` flag for Codex candidate reads across one-shot processes. The bounded complete engine state is current-user DPAPI protected with inner integrity, current executable/package/epoch/profile/path binding and fresh native prefix/lineage proof before reuse. Cache and maintenance failures preserve the ordinary full result; default reads and normalized arrays stay compatible. `CCHV_PROMPT_STATE_CACHE_DIR` is an absolute dedicated cache-only override, separate from `CODEX_HOME`; unsupported platforms use the full path without persistence. This is at-rest protection, not executable attestation against malicious same-user processes. The owning contract, limits, isolated tests and whole-command acceptance live in `specs/2026-10-30-codex-prompt-state-cache/`.
 
 ### Codex image artifact normalization
 

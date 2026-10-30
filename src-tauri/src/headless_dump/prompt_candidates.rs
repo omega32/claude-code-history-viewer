@@ -1,17 +1,22 @@
 use super::{block_on, emit_read_only_audit_json, resolve_session_path};
 use crate::cli_args::extract_flag_value;
 use crate::commands::multi_provider::load_provider_messages;
+#[cfg(test)]
 use crate::models::ClaudeMessage;
+use crate::prompt_candidates::select_candidates;
+#[cfg(test)]
+use crate::prompt_candidates::valid_record_ref;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const COMMAND: &str = "--dump-session-prompt-candidates";
-const USAGE: &str = "Usage: --dump-session-prompt-candidates <absolute-carrier-path|canonical-session-uuid> --provider <codex|claude> --task-id <canonical-uuid> [--task-id <canonical-uuid> ...] [--format json] [--output <new-file>]";
+const USAGE: &str = "Usage: --dump-session-prompt-candidates <absolute-carrier-path|canonical-session-uuid> --provider <codex|claude> --task-id <canonical-uuid> [--task-id <canonical-uuid> ...] [--prompt-state-cache] [--format json] [--output <new-file>]";
 
 struct Options {
     session: String,
     provider: String,
     task_ids: HashSet<String>,
+    prompt_state_cache: bool,
 }
 
 impl Options {
@@ -19,9 +24,18 @@ impl Options {
         let mut singletons = HashMap::new();
         let mut task_ids = HashSet::new();
         let mut index = 1;
+        let mut prompt_state_cache = false;
         while let Some(argument) = args.get(index) {
             if argument.len() > 32_768 || argument.chars().any(char::is_control) {
                 return Err("Invalid bounded argument");
+            }
+            if argument == "--prompt-state-cache" {
+                if prompt_state_cache {
+                    return Err("Repeated prompt state cache flag");
+                }
+                prompt_state_cache = true;
+                index += 1;
+                continue;
             }
             let flag = argument.split('=').next().unwrap_or_default();
             if !matches!(
@@ -53,6 +67,9 @@ impl Options {
         if !matches!(provider.as_str(), "codex" | "claude") {
             return Err("Unsupported prompt-candidate provider");
         }
+        if prompt_state_cache && provider != "codex" {
+            return Err("Prompt state caching requires Codex");
+        }
         if task_ids.is_empty() {
             return Err("Missing task UUID");
         }
@@ -66,6 +83,7 @@ impl Options {
             session,
             provider,
             task_ids,
+            prompt_state_cache,
         })
     }
 }
@@ -85,7 +103,11 @@ pub fn run_dump_session_prompt_candidates(args: &[String]) -> i32 {
     };
     let result = block_on(async {
         let path = resolve_session_path(&options.provider, &options.session).await?;
-        load_provider_messages(options.provider.clone(), path).await
+        if options.prompt_state_cache {
+            crate::providers::codex::load_prompt_candidates_with_state(&path, &options.task_ids)
+        } else {
+            load_provider_messages(options.provider.clone(), path).await
+        }
     });
     match result {
         Ok(messages) => emit_read_only_audit_json(
@@ -99,101 +121,54 @@ pub fn run_dump_session_prompt_candidates(args: &[String]) -> i32 {
     }
 }
 
-fn valid_record_ref(record: &crate::models::RecordRef) -> bool {
-    let mut parts = record.scheme.split('-');
-    record.version == 1
-        && record.scope == "session"
-        && record.scheme.len() <= 64
-        && record
-            .scheme
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_lowercase)
-        && parts.all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        })
-        && record.id.encode_utf16().count() <= 512
-        && record
-            .id
-            .chars()
-            .any(|character| !ecmascript_trim_character(character))
-        && !record
-            .id
-            .chars()
-            .any(|character| character <= '\u{001f}' || character == '\u{007f}')
-}
-
-// Rust's whitespace set differs from JavaScript trim (notably BOM and NEL).
-fn ecmascript_trim_character(character: char) -> bool {
-    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
-}
-
-fn select_candidates(
-    mut messages: Vec<ClaudeMessage>,
-    provider: &str,
-    task_ids: &HashSet<String>,
-) -> Vec<ClaudeMessage> {
-    let mut counts = HashMap::new();
-    for record in messages
-        .iter()
-        .filter_map(|message| message.record_ref.as_ref())
-        .filter(|record| valid_record_ref(record))
-    {
-        *counts
-            .entry((record.scheme.clone(), record.id.clone()))
-            .or_insert(0usize) += 1;
-    }
-    // Omitted records still invalidate a candidate's identity in the full dump.
-    for message in &mut messages {
-        if message.record_ref.as_ref().is_some_and(|record| {
-            valid_record_ref(record)
-                && counts
-                    .get(&(record.scheme.clone(), record.id.clone()))
-                    .is_some_and(|count| *count > 1)
-        }) {
-            message.record_ref = None;
-        }
-    }
-    messages
-        .into_iter()
-        .filter(|message| {
-            message.message_type == "user"
-                && (provider != "codex" || message.subtype.as_deref() == Some("authored_user"))
-                && message
-                    .data
-                    .as_ref()
-                    .and_then(|data| {
-                        data.get(if provider == "codex" {
-                            "providerTurnId"
-                        } else {
-                            "providerPromptId"
-                        })
-                    })
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|task_id| task_ids.contains(task_id))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn prototype_select_candidates(
-    messages: Vec<ClaudeMessage>,
-    task_ids: &HashSet<String>,
-) -> Vec<ClaudeMessage> {
-    select_candidates(messages, "codex", task_ids)
-}
-
-#[cfg(test)]
-pub(crate) fn prototype_valid_record_ref(record: &crate::models::RecordRef) -> bool {
-    valid_record_ref(record)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_state_cache_option_is_a_single_bare_codex_flag() {
+        let input = args(&[
+            "app",
+            COMMAND,
+            "019f5acd-6b03-7653-ae71-6321002ca8d4",
+            "--provider",
+            "codex",
+            "--task-id",
+            "01a18a3e-1c77-7423-9393-9e7424dbf380",
+            "--prompt-state-cache",
+        ]);
+        assert!(Options::parse(&input).is_ok());
+        for invalid in [
+            input
+                .iter()
+                .cloned()
+                .chain(["--prompt-state-cache".to_string()])
+                .collect::<Vec<_>>(),
+            input
+                .iter()
+                .map(|value| {
+                    if value == "codex" {
+                        "claude".to_string()
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect(),
+            input
+                .iter()
+                .map(|value| {
+                    if value == "--prompt-state-cache" {
+                        "--prompt-state-cache=true".to_string()
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect(),
+            input.iter().cloned().chain(["true".to_string()]).collect(),
+        ] {
+            assert!(Options::parse(&invalid).is_err());
+        }
+    }
     use crate::headless_dump::run_dump_session;
     use serde_json::{json, Value};
     use tempfile::TempDir;

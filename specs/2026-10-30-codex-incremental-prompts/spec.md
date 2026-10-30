@@ -1,5 +1,7 @@
 # Codex incremental prompt prototype
 
+Status: historical development slice completed at e646a11. The [production state-cache follow-up](../2026-10-30-codex-prompt-state-cache/spec.md) promotes the shared engine after this acceptance; the finite development probe remains test-only with its original exact libtest name preserved. The original scope and measurements below describe this prototype slice, not a ban on that separately authorized follow-up.
+
 Implement a bounded in-memory Codex-only development prototype that seeds the existing complete provider normalizer once, retains its safe checkpoint, complete structural initiating candidates with original references, and a sparse reversible original-reference ledger for every normalized record carrying a reference. Reuse the existing snapshot/parser state machine and exact accepted-prefix/lineage checks. Do not create another parser, tag cleaner, production command, capability, saved cache, worker, daemon, provider prompt or Notifier integration.
 
 All native code and hooks are compiled only under `cfg(test)`. The probe is one explicitly invoked ignored unit test in the optimized isolated library-test executable, not a default application target or feature. Package version 1.31.0 remains unchanged: this is development-only tooling and specification work, with no shipped runtime behavior change.

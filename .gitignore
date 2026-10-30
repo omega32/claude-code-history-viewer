@@ -87,6 +87,8 @@ debug.log*
 #   .claude/settings.json — shared harness config
 
 PLAN.md
+# Keep the required production cache plan visible on case-insensitive checkouts.
+!specs/2026-10-30-codex-prompt-state-cache/plan.md
 scratch/
 
 # Playwright MCP artifacts

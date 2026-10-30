@@ -14,6 +14,7 @@ pub mod export;
 pub mod headless_dump;
 pub mod models;
 pub mod profile_paths;
+pub(crate) mod prompt_candidates;
 pub mod providers;
 pub mod utils;
 pub mod wsl;

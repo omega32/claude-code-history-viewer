@@ -1,17 +1,17 @@
 use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
-#[cfg(not(test))]
-use crate::commands::multi_provider::finalize_loaded_messages as finalize_snapshot_messages;
+
+#[path = "codex_prompt_state.rs"]
+mod prompt_state;
 
 #[cfg(test)]
 #[path = "codex_prompt_prototype.rs"]
 mod prompt_prototype;
 
-#[cfg(test)]
 fn finalize_snapshot_messages(
     messages: Vec<crate::models::ClaudeMessage>,
 ) -> Vec<crate::models::ClaudeMessage> {
-    prompt_prototype::capture_before_finalization(&messages);
+    prompt_state::capture_before_finalization(&messages);
     finalize_loaded_messages(messages)
 }
 
@@ -8317,6 +8317,13 @@ fn build_codex_message(
     );
     msg.tool_use = tool_use;
     msg
+}
+
+pub(crate) fn load_prompt_candidates_with_state(
+    session_path: &str,
+    task_ids: &HashSet<String>,
+) -> Result<Vec<ClaudeMessage>, String> {
+    prompt_state::load_cached_candidates(Path::new(session_path), task_ids)
 }
 
 #[cfg(test)]

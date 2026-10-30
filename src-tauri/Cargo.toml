@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-history-viewer"
-version = "1.31.0"
+version = "1.32.0"
 description = "Claude Code 대화 기록을 탐색하고 분석하는 데스크톱 애플리케이션"
 authors = ["JaeHyeok Lee"]
 license = "MIT"
@@ -25,6 +25,7 @@ tauri-build = { version = "2.6.2", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
+zeroize = "1.8"
 log = "0.4"
 tauri = { version = "2.11.2", features = [] }
 tauri-plugin-log = "2.8.0"
@@ -78,6 +79,7 @@ blake3 = { version = "1.8.2", features = ["rayon"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Core testing utilities
