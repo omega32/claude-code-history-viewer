@@ -4,6 +4,10 @@ use crate::commands::multi_provider::finalize_loaded_messages;
 #[path = "codex_prompt_state.rs"]
 mod prompt_state;
 
+#[path = "codex_session_source.rs"]
+mod session_source;
+pub(crate) use session_source::{load as load_session_source, CodexSessionSource};
+
 #[cfg(test)]
 #[path = "codex_prompt_prototype.rs"]
 mod prompt_prototype;
@@ -2534,16 +2538,10 @@ pub(crate) fn load_all_sessions() -> Result<Vec<CodexSessionListing>, String> {
     Ok(sessions)
 }
 
-/// Load one Codex listing row from an exact live rollout path without walking
-/// any other rollout. Lexical and canonical confinement plus archive provenance
-/// are validated against the active/archive roots, while the exact provider path
-/// is retained for cache identity and serialized parity with `load_all_sessions`.
-pub(crate) fn load_session_metadata_by_path(
+fn exact_rollout_path_provenance(
+    base_path: &Path,
     session_path: &str,
-) -> Result<Option<CodexSessionListing>, String> {
-    let base_path_string = get_base_path().ok_or("Codex base path not found")?;
-    crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
-    let base_path = PathBuf::from(&base_path_string);
+) -> Result<Option<bool>, String> {
     let rollout_path = Path::new(session_path);
     if !rollout_path.is_absolute() {
         return Err("Codex session path must be a non-empty absolute path".to_string());
@@ -2643,6 +2641,23 @@ pub(crate) fn load_session_metadata_by_path(
     if !is_discoverable_rollout(rollout_path) {
         return Ok(None);
     }
+    Ok(Some(is_archived))
+}
+
+/// Load one Codex listing row from an exact live rollout path without walking
+/// any other rollout. Lexical and canonical confinement plus archive provenance
+/// are validated against the active/archive roots, while the exact provider path
+/// is retained for cache identity and serialized parity with `load_all_sessions`.
+pub(crate) fn load_session_metadata_by_path(
+    session_path: &str,
+) -> Result<Option<CodexSessionListing>, String> {
+    let base_path_string = get_base_path().ok_or("Codex base path not found")?;
+    crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
+    let base_path = PathBuf::from(&base_path_string);
+    let Some(is_archived) = exact_rollout_path_provenance(&base_path, session_path)? else {
+        return Ok(None);
+    };
+    let rollout_path = Path::new(session_path);
     let old_cache = load_session_metadata_cache(&base_path);
     let mut next_cache = old_cache.clone();
     next_cache.version = SESSION_METADATA_CACHE_VERSION;
@@ -2685,8 +2700,7 @@ pub(crate) fn load_session_metadata_by_id(
     crate::utils::require_absolute_path(&base_path_string, "Codex base path")?;
     let base_path = PathBuf::from(&base_path_string);
 
-    if let Some(selection) = load_sqlite_rollout_selections(&base_path).get(session_id) {
-        let selected_path = resolve_sqlite_rollout_path(&selection.rollout_path);
+    if let Some((selection, selected_path)) = indexed_rollout_selection(&base_path, session_id) {
         if selected_path.is_file() {
             if let Ok(Some(listing)) =
                 load_session_metadata_by_path(&selected_path.to_string_lossy())
@@ -5888,6 +5902,15 @@ fn resolve_sqlite_rollout_path(path: &Path) -> PathBuf {
         }
     }
     path
+}
+
+fn indexed_rollout_selection(
+    base_path: &Path,
+    session_id: &str,
+) -> Option<(SqliteRolloutSelection, PathBuf)> {
+    let selection = load_sqlite_rollout_selections(base_path).remove(session_id)?;
+    let path = resolve_sqlite_rollout_path(&selection.rollout_path);
+    Some((selection, path))
 }
 
 fn rollout_paths_match(left: &Path, right: &Path) -> bool {

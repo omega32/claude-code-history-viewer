@@ -52,6 +52,8 @@ use walkdir::WalkDir;
 
 mod prompt_candidates;
 pub use prompt_candidates::run_dump_session_prompt_candidates;
+mod session_source;
+pub use session_source::run_session_source;
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
@@ -215,6 +217,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "list-backup-sessions",
             "hermes-backup-sources",
             "session-metadata",
+            "session-source",
             "hide-session",
             "archive-session",
             "unarchive-session",
@@ -228,6 +231,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "stable-record-ref-v1",
             "claude-prompt-id-v1",
             "prompt-candidates-v1",
+            "codex-session-source-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
             "hermes-backup-v1",
@@ -2486,6 +2490,7 @@ mod tests {
             "stable-record-ref-v1",
             "claude-prompt-id-v1",
             "prompt-candidates-v1",
+            "codex-session-source-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
             "hermes-backup-v1",
@@ -2508,6 +2513,7 @@ mod tests {
                 "list-backup-sessions",
                 "hermes-backup-sources",
                 "session-metadata",
+                "session-source",
                 "hide-session",
                 "archive-session",
                 "unarchive-session",
