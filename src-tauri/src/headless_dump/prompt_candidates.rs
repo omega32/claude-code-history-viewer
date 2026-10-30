@@ -179,6 +179,19 @@ fn select_candidates(
 }
 
 #[cfg(test)]
+pub(crate) fn prototype_select_candidates(
+    messages: Vec<ClaudeMessage>,
+    task_ids: &HashSet<String>,
+) -> Vec<ClaudeMessage> {
+    select_candidates(messages, "codex", task_ids)
+}
+
+#[cfg(test)]
+pub(crate) fn prototype_valid_record_ref(record: &crate::models::RecordRef) -> bool {
+    valid_record_ref(record)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::headless_dump::run_dump_session;

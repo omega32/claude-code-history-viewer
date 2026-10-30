@@ -1,5 +1,19 @@
 use super::{ProviderInfo, SessionSnapshotLoad};
 use crate::commands::multi_provider::finalize_loaded_messages;
+#[cfg(not(test))]
+use crate::commands::multi_provider::finalize_loaded_messages as finalize_snapshot_messages;
+
+#[cfg(test)]
+#[path = "codex_prompt_prototype.rs"]
+mod prompt_prototype;
+
+#[cfg(test)]
+fn finalize_snapshot_messages(
+    messages: Vec<crate::models::ClaudeMessage>,
+) -> Vec<crate::models::ClaudeMessage> {
+    prompt_prototype::capture_before_finalization(&messages);
+    finalize_loaded_messages(messages)
+}
 
 #[path = "codex_subagent_activity.rs"]
 mod subagent_activity;
@@ -4971,7 +4985,7 @@ fn complete_paginated_snapshot(
             "Codex paginated rollout unexpectedly referenced an earlier prefix".to_string()
         })?;
     let original_len = outcome.messages.len();
-    let messages = finalize_loaded_messages(outcome.messages);
+    let messages = finalize_snapshot_messages(outcome.messages);
     let cursor = if messages.len() == original_len && is_plain_rollout(canonical_path) {
         let accepted_len = outcome
             .accepted_len
@@ -5189,7 +5203,7 @@ fn load_paginated_snapshot(
         .map_err(|_| "Codex paginated checkpoint is too large to cursor".to_string())?;
     let cursor_replace_from = outcome.checkpoint.replace_from;
     let original_len = outcome.messages.len();
-    let messages = finalize_loaded_messages(outcome.messages);
+    let messages = finalize_snapshot_messages(outcome.messages);
     if messages.len() != original_len {
         return complete_paginated_snapshot(
             canonical_path,
@@ -5234,7 +5248,7 @@ fn complete_snapshot_from_path(
     if !is_plain_rollout(canonical_path) {
         return Ok(SessionSnapshotLoad::Full {
             reason,
-            messages: finalize_loaded_messages(parse_rollout_file(canonical_path)?),
+            messages: finalize_snapshot_messages(parse_rollout_file(canonical_path)?),
             cursor: None,
             cursor_replace_from: None,
         });
@@ -5254,7 +5268,7 @@ fn complete_snapshot_from_path(
         .map_err(|()| "Codex complete parse unexpectedly crossed its prefix".to_string())?;
     let after = fs::metadata(canonical_path).map_err(|error| error.to_string())?;
     let original_len = outcome.messages.len();
-    let messages = finalize_loaded_messages(outcome.messages);
+    let messages = finalize_snapshot_messages(outcome.messages);
     let cursor =
         if messages.len() == original_len && source_stayed_stable(&before, &after, mmap.len()) {
             Some(cursor_for(
@@ -5397,7 +5411,7 @@ pub(crate) fn load_session_snapshot(
         .ok_or_else(|| "Codex checkpoint exceeds its carrier".to_string())?;
     let cursor_replace_from = outcome.checkpoint.replace_from;
     let original_len = outcome.messages.len();
-    let messages = finalize_loaded_messages(outcome.messages);
+    let messages = finalize_snapshot_messages(outcome.messages);
     if messages.len() != original_len {
         return complete_snapshot_from_path(&canonical_path, "post-normalization-count-changed");
     }

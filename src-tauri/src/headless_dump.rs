@@ -52,6 +52,8 @@ use walkdir::WalkDir;
 
 mod prompt_candidates;
 pub use prompt_candidates::run_dump_session_prompt_candidates;
+#[cfg(test)]
+pub(crate) use prompt_candidates::{prototype_select_candidates, prototype_valid_record_ref};
 
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
