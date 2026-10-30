@@ -50,6 +50,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
+mod prompt_candidates;
+pub use prompt_candidates::run_dump_session_prompt_candidates;
+
 /// Contract version of the headless JSON surface. Bump on a breaking change to
 /// the commands or their output shapes so callers can assert compatibility.
 const HEADLESS_API_VERSION: u32 = 1;
@@ -202,6 +205,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
         version: env!("CARGO_PKG_VERSION"),
         commands: vec![
             "dump-session",
+            "dump-session-prompt-candidates",
             "dump-session-snapshot",
             "dump-session-history",
             "dump-session-subagent-activity",
@@ -223,6 +227,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "codex-subagent-activity-v1",
             "stable-record-ref-v1",
             "claude-prompt-id-v1",
+            "prompt-candidates-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
             "hermes-backup-v1",
@@ -2479,6 +2484,7 @@ mod tests {
                 "codex-subagent-activity-v1",
                 "stable-record-ref-v1",
                 "claude-prompt-id-v1",
+                "prompt-candidates-v1",
                 "supplemental-history-v1",
                 "claude-session-archive-v1",
                 "hermes-backup-v1"
@@ -2488,6 +2494,7 @@ mod tests {
             value["commands"],
             json!([
                 "dump-session",
+                "dump-session-prompt-candidates",
                 "dump-session-snapshot",
                 "dump-session-history",
                 "dump-session-subagent-activity",

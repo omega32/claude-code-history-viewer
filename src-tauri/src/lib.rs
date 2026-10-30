@@ -98,6 +98,12 @@ pub fn run() {
     // with no display.
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|argument| {
+            argument == "--dump-session-prompt-candidates"
+                || argument.starts_with("--dump-session-prompt-candidates=")
+        }) {
+            std::process::exit(headless_dump::run_dump_session_prompt_candidates(&args));
+        }
         if args
             .iter()
             .any(|a| a == "--export" || a.starts_with("--export="))
