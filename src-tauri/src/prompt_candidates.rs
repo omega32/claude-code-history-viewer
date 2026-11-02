@@ -1,6 +1,10 @@
 use crate::models::ClaudeMessage;
 use std::collections::{HashMap, HashSet};
 
+// Advance for result-affecting native prompt changes, not unrelated releases.
+// The owning contract is specs/2026-11-02-prompt-semantics-revision/spec.md.
+pub(crate) const PROMPT_SEMANTICS_REVISION: &str = "1";
+
 pub(crate) fn valid_record_ref(record: &crate::models::RecordRef) -> bool {
     let mut parts = record.scheme.split('-');
     record.version == 1

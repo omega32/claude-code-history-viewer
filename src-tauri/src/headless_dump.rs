@@ -193,6 +193,7 @@ struct Capabilities {
     api_version: u32,
     /// The base app version (crate version), for diagnostics.
     version: &'static str,
+    prompt_semantics_revision: &'static str,
     /// Headless commands this build supports (flag names without the `--`).
     commands: Vec<&'static str>,
     /// Additive normalized-data contracts consumers may use when present.
@@ -205,6 +206,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
     let caps = Capabilities {
         api_version: HEADLESS_API_VERSION,
         version: env!("CARGO_PKG_VERSION"),
+        prompt_semantics_revision: crate::prompt_candidates::PROMPT_SEMANTICS_REVISION,
         commands: vec![
             "dump-session",
             "dump-session-prompt-candidates",
@@ -231,6 +233,7 @@ pub fn run_capabilities(args: &[String]) -> i32 {
             "stable-record-ref-v1",
             "claude-prompt-id-v1",
             "prompt-candidates-v1",
+            "prompt-semantics-revision-v1",
             "codex-session-source-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
@@ -2490,6 +2493,7 @@ mod tests {
             "stable-record-ref-v1",
             "claude-prompt-id-v1",
             "prompt-candidates-v1",
+            "prompt-semantics-revision-v1",
             "codex-session-source-v1",
             "supplemental-history-v1",
             "claude-session-archive-v1",
@@ -2521,6 +2525,36 @@ mod tests {
                 "capabilities"
             ])
         );
+    }
+
+    #[test]
+    fn capabilities_prompt_semantics_revision_is_an_explicit_bounded_epoch() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("semantics.json");
+        assert_eq!(
+            run_capabilities(&args(&[
+                "viewer",
+                "--capabilities",
+                "--output",
+                output.to_str().unwrap(),
+            ])),
+            0
+        );
+        let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let revision = value["prompt_semantics_revision"]
+            .as_str()
+            .expect("explicit string epoch");
+        assert_eq!(revision, "1");
+        assert!((1..=9).contains(&revision.len()));
+        assert!(revision.as_bytes()[0].is_ascii_digit() && revision.as_bytes()[0] != b'0');
+        assert!(revision.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(value["api_version"], HEADLESS_API_VERSION);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_ne!(revision, value["version"].as_str().unwrap());
+        assert!(value["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("prompt-semantics-revision-v1")));
     }
 
     #[test]

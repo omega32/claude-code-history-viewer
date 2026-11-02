@@ -90,6 +90,7 @@ PLAN.md
 # Keep the required feature plans visible on case-insensitive checkouts.
 !specs/2026-10-30-codex-prompt-state-cache/plan.md
 !specs/2026-10-30-codex-session-source/plan.md
+!specs/2026-11-02-prompt-semantics-revision/plan.md
 scratch/
 
 # Playwright MCP artifacts
